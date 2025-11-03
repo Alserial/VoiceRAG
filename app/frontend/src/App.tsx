@@ -98,6 +98,11 @@ function App() {
                 <p>{t("app.footer")}</p>
             </footer>
 
+            {/* Version number - small and unobtrusive */}
+            <div className="fixed bottom-2 right-2 text-xs text-gray-600 opacity-80">
+                v2.1.0
+            </div>
+
             <GroundingFileView groundingFile={selectedFile} onClosed={() => setSelectedFile(null)} />
         </div>
     );

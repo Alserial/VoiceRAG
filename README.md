@@ -14,6 +14,10 @@ This repo contains an example of how to implement RAG support in applications th
 * [Deploying the app](#deploying-the-app)
 * [Development server](#development-server)
 * [Guidance](#guidance)
+  * [Costs](#costs)
+  * [Security](#security)
+  * [Customization and Adding Data](#customization-and-adding-data)
+  * [Notes](#notes)
 * [Resources](#resources)
 * [Getting help](#getting-help)
 
@@ -168,6 +172,14 @@ either by deleting the resource group in the Portal or running `azd down`.
 ### Security
 
 This template uses [Managed Identity](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview) to eliminate the need for developers to manage these credentials. Applications can use managed identities to obtain Microsoft Entra tokens without having to manage any credentials.To ensure best practices in your repo we recommend anyone creating solutions based on our templates ensure that the [Github secret scanning](https://docs.github.com/code-security/secret-scanning/about-secret-scanning) setting is enabled in your repos.
+
+### Customization and Adding Data
+
+Once you have deployed the application, you may want to customize it or add your own data:
+
+* **Adding new documents**: See the [Uploading Data Guide](docs/uploading_data.md) for detailed instructions on how to upload new PDF, Markdown, or other documents to your knowledge base.
+* **Customizing deployment**: See [Customizing the Deployment](docs/customizing_deploy.md) for options like changing the voice choice or using existing Azure services.
+* **Using existing services**: See [Using Existing Services](docs/existing_services.md) to connect to your existing Azure OpenAI and AI Search services.
 
 ### Notes
 
