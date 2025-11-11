@@ -53,10 +53,10 @@ async def create_app():
            - Use the 'report_grounding' tool to report the source of information
            - Keep your answer short and focused on the found information
         3. If you don't find relevant information in the knowledge base:
-           - Answer the question using your general knowledge as a helpful AI assistant
-           - Provide a helpful and accurate response
-           - Do NOT say "I don't know" or "not in the knowledge base"
-           - Be conversational and helpful
+           - Politely inform the user that the information is not available in the knowledge base
+           - Say something like "I don't have information about that in my knowledge base"
+           - Do NOT use your general knowledge to answer questions outside the knowledge base
+           - Do NOT make up or infer information
         4. Always respond in English, even if the user speaks in another language or has an accent.
     """.strip()
 

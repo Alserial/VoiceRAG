@@ -68,7 +68,10 @@ export default function useRealTime({
             type: "session.update",
             session: {
                 turn_detection: {
-                    type: "server_vad"
+                    type: "server_vad",
+                    threshold: 0.5,              // Voice detection threshold (0.0-1.0)
+                    prefix_padding_ms: 300,      // Audio before speech starts (ms)
+                    silence_duration_ms: 1000    // Silence duration to end turn (increased from default 500ms)
                 }
             }
         };
