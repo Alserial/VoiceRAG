@@ -15,6 +15,9 @@ export type SessionUpdateCommand = {
     session: {
         turn_detection?: {
             type: "server_vad" | "none";
+            threshold?: number;
+            prefix_padding_ms?: number;
+            silence_duration_ms?: number;
         };
         input_audio_transcription?: {
             model: "whisper-1";

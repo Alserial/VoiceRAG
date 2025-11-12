@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { Recorder } from "@/components/audio/recorder";
 
-const BUFFER_SIZE = 4800;
+const BUFFER_SIZE = 9600; // Increased from 4800 to reduce audio crackling (0.2 seconds at 24kHz)
 
 type Parameters = {
     onAudioRecorded: (base64: string) => void;
