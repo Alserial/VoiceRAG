@@ -485,7 +485,7 @@ logger.info("Teams message received", extra={
 - [Azure Bot Service Documentation](https://learn.microsoft.com/en-us/azure/bot-service/)
 - [Teams Bot Framework Documentation](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/what-are-bots)
 - [Adaptive Cards](https://adaptivecards.io/)
-- [VoiceRAG Project Repository](https://github.com/your-repo/voicerag)
+- [VoiceRAG Project Repository](https://github.com/your-repo/voicerag)  
 
 ## Support
 For issues or questions:

@@ -17,5 +17,24 @@
     "groundingFiles": {
         "title": "Fichiers d'ancrage",
         "description": "Fichiers utilisés pour ancrer les réponses."
+    },
+    "quote": {
+        "title": "Demander un devis",
+        "description": "Fournissez les détails minimaux nécessaires avant d'envoyer le devis à Salesforce.",
+        "customerName": "Nom du client",
+        "contactInfo": "Informations de contact",
+        "emailAddress": "Adresse e-mail",
+        "productPackage": "Produit ou forfait",
+        "quantity": "Quantité",
+        "startDate": "Date de début prévue",
+        "notes": "Notes",
+        "notesPlaceholder": "Tout ce que nous devrions savoir avant de préparer le devis",
+        "submit": "Envoyer le devis",
+        "submitting": "Envoi...",
+        "successLabel": "Lien du dernier devis",
+        "error": "Impossible d'envoyer le devis pour le moment.",
+        "loadingProducts": "Chargement des produits...",
+        "selectProduct": "Sélectionner un produit",
+        "productPlaceholder": "Entrez le nom du produit"
     }
 }

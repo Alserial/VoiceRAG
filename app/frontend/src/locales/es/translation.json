@@ -17,5 +17,24 @@
     "groundingFiles": {
         "title": "Archivos de fundamentación",
         "description": "Archivos utilizados para fundamentar las respuestas."
+    },
+    "quote": {
+        "title": "Solicitar cotización",
+        "description": "Proporcione los detalles mínimos necesarios antes de enviar la cotización a Salesforce.",
+        "customerName": "Nombre del cliente",
+        "contactInfo": "Información de contacto",
+        "emailAddress": "Dirección de correo electrónico",
+        "productPackage": "Producto o paquete",
+        "quantity": "Cantidad",
+        "startDate": "Fecha de inicio esperada",
+        "notes": "Notas",
+        "notesPlaceholder": "Cualquier cosa que debamos saber antes de preparar la cotización",
+        "submit": "Enviar cotización",
+        "submitting": "Enviando...",
+        "successLabel": "Enlace de cotización más reciente",
+        "error": "No se puede enviar la cotización en este momento.",
+        "loadingProducts": "Cargando productos...",
+        "selectProduct": "Seleccionar un producto",
+        "productPlaceholder": "Ingrese el nombre del producto"
     }
 }

@@ -14,6 +14,7 @@ import useAudioPlayer from "@/hooks/useAudioPlayer";
 import { GroundingFile, ToolResult } from "./types";
 
 import logo from "./assets/logo.svg";
+import QuoteRequestForm from "@/components/quote/QuoteRequestForm";
 
 function App() {
     const [isRecording, setIsRecording] = useState(false);
@@ -92,6 +93,9 @@ function App() {
                     <StatusMessage isRecording={isRecording} />
                 </div>
                 <GroundingFiles files={groundingFiles} onSelected={setSelectedFile} />
+                <div className="mt-8 w-full px-4 pb-12">
+                    <QuoteRequestForm />
+                </div>
             </main>
 
             <footer className="py-4 text-center">

@@ -17,5 +17,25 @@
     "groundingFiles": {
         "title": "Grounding files",
         "description": "Files used to ground the answers."
+    },
+    "quote": {
+        "title": "Request a quote",
+        "description": "Provide the minimum details we need before sending the quote to Salesforce.",
+        "customerName": "Customer name",
+        "contactInfo": "Contact information",
+        "emailAddress": "Email address",
+        "productPackage": "Product or package",
+        "quantity": "Quantity",
+        "startDate": "Expected start date",
+        "notes": "Notes",
+        "notesPlaceholder": "Anything we should know before preparing the quote",
+        "submit": "Send quote",
+        "submitting": "Sending...",
+        "successLabel": "Latest quote link",
+        "error": "Unable to submit the quote right now.",
+        "loadingProducts": "Loading products...",
+        "selectProduct": "Select a product",
+        "productPlaceholder": "Enter product name",
+        "noProductsAvailable": "No products available. Please enter product name manually."
     }
 }

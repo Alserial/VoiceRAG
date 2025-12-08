@@ -17,5 +17,24 @@
     "groundingFiles": {
         "title": "グラウンディング ファイル",
         "description": "回答をグラウンディングするために使用されるファイル。"
+    },
+    "quote": {
+        "title": "見積もりをリクエスト",
+        "description": "Salesforce に見積もりを送信する前に必要な最小限の詳細を提供してください。",
+        "customerName": "顧客名",
+        "contactInfo": "連絡先情報",
+        "emailAddress": "メールアドレス",
+        "productPackage": "製品またはパッケージ",
+        "quantity": "数量",
+        "startDate": "予想開始日",
+        "notes": "備考",
+        "notesPlaceholder": "見積もりを準備する前に知っておくべきこと",
+        "submit": "見積もりを送信",
+        "submitting": "送信中...",
+        "successLabel": "最新の見積もりリンク",
+        "error": "現在、見積もりを送信できません。",
+        "loadingProducts": "製品を読み込み中...",
+        "selectProduct": "製品を選択",
+        "productPlaceholder": "製品名を入力"
     }
 }
