@@ -14,7 +14,6 @@ import useAudioPlayer from "@/hooks/useAudioPlayer";
 import { GroundingFile, ToolResult } from "./types";
 
 import logo from "./assets/logo.svg";
-import QuoteRequestForm from "@/components/quote/QuoteRequestForm";
 import QuoteConfirmation, { QuoteData } from "@/components/quote/QuoteConfirmation";
 
 function App() {
@@ -23,8 +22,9 @@ function App() {
     const [selectedFile, setSelectedFile] = useState<GroundingFile | null>(null);
     const [quoteData, setQuoteData] = useState<QuoteData | null>(null);
 
-    const handleQuoteConfirm = useCallback(async () => {
-        if (!quoteData) return;
+    const handleQuoteConfirm = useCallback(async (updatedQuote?: QuoteData) => {
+        const payload = updatedQuote ?? quoteData;
+        if (!payload) return;
 
         try {
             const response = await fetch("/api/quotes/confirm", {
@@ -32,7 +32,7 @@ function App() {
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ quote_data: quoteData }),
+                body: JSON.stringify({ quote_data: payload }),
             });
 
             if (!response.ok) {
@@ -162,9 +162,6 @@ function App() {
                     <StatusMessage isRecording={isRecording} />
                 </div>
                 <GroundingFiles files={groundingFiles} onSelected={setSelectedFile} />
-                <div className="mt-8 w-full px-4 pb-12">
-                    <QuoteRequestForm />
-                </div>
             </main>
 
             <footer className="py-4 text-center">
@@ -180,7 +177,7 @@ function App() {
             
             {quoteData && (
                 <QuoteConfirmation
-                    quoteData={quoteData}
+                    initialQuoteData={quoteData}
                     onConfirm={handleQuoteConfirm}
                     onCancel={handleQuoteCancel}
                 />

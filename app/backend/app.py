@@ -52,13 +52,14 @@ async def create_app():
             IMPORTANT: Always respond in English only, keep replies short (ideally one sentence), and never read file names or keys aloud.
             
             ROLE OF 'extract_quote_info' (state evaluator):
-            - It may be called multiple times; it can return empty or partial info.
-            - It returns structured state only: {"extracted": {...}, "missing_fields": [...], "is_complete": bool, "products_available": [...]}.
+            - Called multiple times; may return empty/partial info.
+            - Returns structured state only: {"extracted": {...}, "missing_fields": [...], "is_complete": bool, "products_available": [...]}.
             - It never asks the user anything; you decide what to ask based on missing_fields.
             
             WHEN TO CALL THE TOOL:
             - If the user mentions anything about quotes/pricing (quote, quotation, price estimate, price, cost, pricing, estimate, get/need/want a quote), immediately call 'extract_quote_info'. Do not ask questions before the first call.
             - After each user reply, call the tool again to re-evaluate state until is_complete = true.
+            - If the user says they want to change/update a specific field (e.g., email/contact info/product/quantity/start date/notes), gather that field only, then call the tool again. Do NOT re-ask already known fields unless the user says they also need to change them.
             
             HOW TO USE THE RESULT:
             - If is_complete = false: Ask only for the missing_fields, one at a time, very concise.

@@ -6,27 +6,28 @@ export type QuoteData = {
     customer_name: string;
     contact_info: string;
     product_package: string;
-    quantity: number;
-    expected_start_date?: string;
-    notes?: string;
+    quantity: number | null;
+    expected_start_date?: string | null;
+    notes?: string | null;
 };
 
 type QuoteConfirmationProps = {
-    quoteData: QuoteData;
-    onConfirm: () => Promise<void>;
+    initialQuoteData: QuoteData;
+    onConfirm: (data?: QuoteData) => Promise<void>;
     onCancel: () => void;
 };
 
-export default function QuoteConfirmation({ quoteData, onConfirm, onCancel }: QuoteConfirmationProps) {
+export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCancel }: QuoteConfirmationProps) {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isSuccess, setIsSuccess] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [quoteData, setQuoteData] = useState<QuoteData>(initialQuoteData);
 
     const handleConfirm = async () => {
         setIsSubmitting(true);
         setError(null);
         try {
-            await onConfirm();
+            await onConfirm(quoteData);
             setIsSuccess(true);
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to send quote");
@@ -73,40 +74,69 @@ export default function QuoteConfirmation({ quoteData, onConfirm, onCancel }: Qu
                 <div className="space-y-4 mb-6">
                     <div className="border-b pb-3">
                         <label className="text-sm font-medium text-gray-500">Customer Name</label>
-                        <p className="text-lg text-gray-900">{quoteData.customer_name}</p>
+                        <input
+                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            value={quoteData.customer_name}
+                            onChange={e => setQuoteData(prev => ({ ...prev, customer_name: e.target.value }))}
+                        />
                     </div>
 
                     <div className="border-b pb-3">
-                        <label className="text-sm font-medium text-gray-500">Contact Information</label>
-                        <p className="text-lg text-gray-900 flex items-center gap-2">
-                            <Mail className="h-4 w-4" />
-                            {quoteData.contact_info}
-                        </p>
+                        <label className="text-sm font-medium text-gray-500">Contact Information (Email)</label>
+                        <div className="flex items-center gap-2">
+                            <Mail className="h-4 w-4 text-gray-500" />
+                            <input
+                                className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                value={quoteData.contact_info}
+                                onChange={e => setQuoteData(prev => ({ ...prev, contact_info: e.target.value }))}
+                            />
+                        </div>
                     </div>
 
                     <div className="border-b pb-3">
                         <label className="text-sm font-medium text-gray-500">Product/Package</label>
-                        <p className="text-lg text-gray-900">{quoteData.product_package}</p>
+                        <input
+                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            value={quoteData.product_package}
+                            onChange={e => setQuoteData(prev => ({ ...prev, product_package: e.target.value }))}
+                        />
                     </div>
 
                     <div className="border-b pb-3">
                         <label className="text-sm font-medium text-gray-500">Quantity</label>
-                        <p className="text-lg text-gray-900">{quoteData.quantity}</p>
+                        <input
+                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            type="number"
+                            min={1}
+                            value={quoteData.quantity ?? ""}
+                            onChange={e =>
+                                setQuoteData(prev => ({
+                                    ...prev,
+                                    quantity: e.target.value === "" ? null : Number(e.target.value),
+                                }))
+                            }
+                        />
                     </div>
 
-                    {quoteData.expected_start_date && (
-                        <div className="border-b pb-3">
-                            <label className="text-sm font-medium text-gray-500">Expected Start Date</label>
-                            <p className="text-lg text-gray-900">{quoteData.expected_start_date}</p>
-                        </div>
-                    )}
+                    <div className="border-b pb-3">
+                        <label className="text-sm font-medium text-gray-500">Expected Start Date</label>
+                        <input
+                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            placeholder="YYYY-MM-DD"
+                            value={quoteData.expected_start_date ?? ""}
+                            onChange={e => setQuoteData(prev => ({ ...prev, expected_start_date: e.target.value }))}
+                        />
+                    </div>
 
-                    {quoteData.notes && (
-                        <div className="border-b pb-3">
-                            <label className="text-sm font-medium text-gray-500">Notes</label>
-                            <p className="text-lg text-gray-900">{quoteData.notes}</p>
-                        </div>
-                    )}
+                    <div className="border-b pb-3">
+                        <label className="text-sm font-medium text-gray-500">Notes</label>
+                        <textarea
+                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            rows={3}
+                            value={quoteData.notes ?? ""}
+                            onChange={e => setQuoteData(prev => ({ ...prev, notes: e.target.value }))}
+                        />
+                    </div>
                 </div>
 
                 {error && (

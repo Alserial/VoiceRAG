@@ -5,12 +5,45 @@ Detects quote requests and extracts information from conversation history.
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 from difflib import SequenceMatcher
 
 from rtmt import RTMiddleTier, Tool, ToolResult, ToolResultDirection
 
 logger = logging.getLogger("voicerag")
+
+# Email normalization constants
+_WORD_MAP = [
+    # at
+    (r"\b(at|@|艾特|小老鼠|at-sign|atsign)\b", "@"),
+    # dot / point
+    (r"\b(dot|point|period|句号|点|點)\b", "."),
+    # underscore
+    (r"\b(underscore|under\s*score|下划线|下劃線)\b", "_"),
+    # hyphen/dash
+    (r"\b(dash|hyphen|minus|横杠|横杆|短横)\b", "-"),
+    # plus
+    (r"\b(plus|加号|加號)\b", "+"),
+]
+
+_DOMAIN_FIX = {
+    "gamil.com": "gmail.com",
+    "gmial.com": "gmail.com",
+    "gmail.con": "gmail.com",
+    "hotmial.com": "hotmail.com",
+    "outllok.com": "outlook.com",
+}
+
+_TRAILING_PUNCT = ".,;:!?)）]}'\"，。；：！？"
+
+_EMAIL_REGEX = re.compile(r"^[a-z0-9][a-z0-9._%+\-]*@[a-z0-9.\-]+\.[a-z]{2,}$", re.I)
+
+# 宽松抽取：允许 @ 左右有空格、dot 左右有空格
+_EMAIL_FIND_REGEX = re.compile(
+    r"([a-z0-9][a-z0-9._%+\-\s]*\s*@\s*[a-z0-9.\-\s]+\s*\.\s*[a-z]{2,})",
+    re.I
+)
 
 _quote_extraction_tool_schema = {
     "type": "function",
@@ -24,6 +57,92 @@ _quote_extraction_tool_schema = {
         "additionalProperties": False
     }
 }
+
+
+def _apply_word_map(s: str) -> str:
+    """Apply word mapping to convert spoken words to email symbols."""
+    out = s
+    for pattern, repl in _WORD_MAP:
+        out = re.sub(pattern, repl, out, flags=re.I)
+    return out
+
+
+def _strip_trailing_punct(s: str) -> str:
+    """Remove trailing punctuation from string."""
+    while s and s[-1] in _TRAILING_PUNCT:
+        s = s[:-1]
+    return s
+
+
+def _normalize_one(candidate: str) -> str:
+    """Normalize a single email candidate."""
+    s = candidate.strip().lower()
+    s = _strip_trailing_punct(s)
+    s = _apply_word_map(s)
+    s = re.sub(r"\s+", "", s)  # remove all whitespace
+    s = _strip_trailing_punct(s)
+    
+    if "@" not in s:
+        return s
+    
+    local, domain = s.split("@", 1)
+    
+    # 1) 合并 local 中的拆字分隔：k-e-n-a-n / k_e_n_a_n / k.e.n.a.n
+    # 只有当它看起来像"很多单字符被分隔"才做合并，避免误伤正常邮箱
+    if re.fullmatch(r"[a-z0-9](?:[-_.][a-z0-9]){3,}", local):
+        local = re.sub(r"[-_.]", "", local)
+    
+    # 2) 处理多段 "-单字符" 的情况：K-E-N-A-N-2-5-2-9-0.44604 => kenan25290.44604
+    # 仅在出现多段 "-单字符" 的情况下移除连字符
+    if re.search(r"(?:^|[^a-z0-9])[a-z0-9](?:-[a-z0-9]){2,}", local):
+        local = local.replace("-", "")
+    
+    # domain: 清理重复点、去首尾点
+    domain = re.sub(r"\.{2,}", ".", domain).strip(".")
+    
+    # 修复缺少 dot 的常见 TLD 粘连：gmailcom -> gmail.com
+    domain = re.sub(r"([a-z0-9])com$", r"\1.com", domain)
+    domain = re.sub(r"([a-z0-9])net$", r"\1.net", domain)
+    domain = re.sub(r"([a-z0-9])org$", r"\1.org", domain)
+    
+    # 常见拼写纠错
+    domain = _DOMAIN_FIX.get(domain, domain)
+    
+    return f"{local}@{domain}"
+
+
+def normalize_email(raw: str) -> Optional[str]:
+    """
+    Return a cleaned/normalized email or None if cannot get a valid email.
+    
+    Handles various voice transcription issues:
+    - Converts "at" to "@", "dot" to ".", etc.
+    - Fixes common domain typos (gamil.com -> gmail.com)
+    - Removes hyphens from character-separated names (K-E-N-A-N -> kenan)
+    - Cleans whitespace and punctuation
+    """
+    if not raw or not raw.strip():
+        return None
+    
+    text = raw.strip().lower()
+    text = _apply_word_map(text)
+    text = _strip_trailing_punct(text)
+    
+    # 先尝试从文本中抓取候选 email 段
+    candidates = [m.group(1) for m in _EMAIL_FIND_REGEX.finditer(text)]
+    if not candidates:
+        candidates = [text]
+    
+    # 逐个清洗并验证，返回第一个合法的
+    for cand in candidates:
+        norm = _normalize_one(cand)
+        norm = re.sub(r"\.{2,}", ".", norm)
+        norm = _strip_trailing_punct(norm)
+        
+        if _EMAIL_REGEX.match(norm):
+            return norm
+    
+    return None
 
 
 def _similarity(a: str, b: str) -> float:
@@ -239,6 +358,19 @@ Example format:
             # Ensure keys exist even if model omits them
             for key in ["customer_name", "contact_info", "product_package", "quantity", "expected_start_date", "notes"]:
                 extracted_data.setdefault(key, None)
+            
+            # Normalize email address if contact_info is provided
+            if extracted_data.get("contact_info"):
+                original_contact = extracted_data["contact_info"]
+                normalized_email = normalize_email(str(original_contact))
+                if normalized_email:
+                    if normalized_email != original_contact:
+                        logger.info("Normalized email: '%s' -> '%s'", original_contact, normalized_email)
+                    extracted_data["contact_info"] = normalized_email
+                else:
+                    # If normalization fails but contact_info looks like it might be an email, log warning
+                    if "@" in str(original_contact) or any(word in str(original_contact).lower() for word in ["at", "dot", "gmail", "hotmail", "outlook"]):
+                        logger.warning("Could not normalize email from: '%s'", original_contact)
         except Exception as e:
             logger.error("Error calling OpenAI API: %s", str(e))
             import traceback
