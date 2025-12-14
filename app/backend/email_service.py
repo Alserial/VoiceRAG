@@ -4,9 +4,11 @@ Supports multiple email providers: Azure Communication Services, SMTP, and Sales
 """
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 import aiohttp
 import requests
@@ -431,4 +433,280 @@ View your quote at: {quote_url}
 
 This is an automated message from VoiceRAG System.
     """.strip()
+
+
+async def send_conversation_email(
+    to_email: str,
+    conversation_file: str,
+    session_id: str
+) -> bool:
+    """
+    Send conversation log file via email.
+    
+    Args:
+        to_email: Recipient email address
+        conversation_file: Path to the conversation file
+        session_id: Session ID for the conversation
+        
+    Returns:
+        True if email sent successfully, False otherwise
+    """
+    email_service = os.environ.get("EMAIL_SERVICE", "smtp").lower()
+    
+    if email_service == "azure":
+        return await _send_conversation_azure_email(to_email, conversation_file, session_id)
+    elif email_service == "smtp":
+        return await _send_conversation_smtp_email(to_email, conversation_file, session_id)
+    elif email_service == "salesforce":
+        return await _send_conversation_salesforce_email(to_email, conversation_file, session_id)
+    else:
+        logger.warning("Unknown email service: %s. Email not sent.", email_service)
+        return False
+
+
+async def _send_conversation_smtp_email(
+    to_email: str,
+    conversation_file: str,
+    session_id: str
+) -> bool:
+    """Send conversation email with attachment using SMTP."""
+    import smtplib
+    import asyncio
+    
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    smtp_use_tls = os.environ.get("SMTP_USE_TLS", "true").lower() == "true"
+    from_email = os.environ.get("EMAIL_FROM", smtp_user)
+    from_name = os.environ.get("EMAIL_FROM_NAME", "VoiceRAG System")
+    
+    if not all([smtp_host, smtp_user, smtp_password]):
+        logger.warning("SMTP not configured. Email not sent.")
+        return False
+    
+    try:
+        filepath = Path(conversation_file)
+        if not filepath.exists():
+            logger.error("Conversation file not found: %s", conversation_file)
+            return False
+        
+        # Prepare email
+        msg = MIMEMultipart()
+        msg["From"] = f"{from_name} <{from_email}>"
+        msg["To"] = to_email
+        msg["Subject"] = f"VoiceRAG Conversation Log - Session {session_id[:8]}"
+        
+        # Add text body
+        body = f"""
+This email contains the conversation log from VoiceRAG session {session_id[:8]}.
+
+The conversation file is attached to this email.
+
+This is an automated message from VoiceRAG System.
+        """.strip()
+        msg.attach(MIMEText(body, "plain"))
+        
+        # Add attachment
+        with open(filepath, "rb") as f:
+            attachment = MIMEApplication(f.read(), _subtype="txt")
+            attachment.add_header(
+                "Content-Disposition",
+                "attachment",
+                filename=filepath.name
+            )
+            msg.attach(attachment)
+        
+        # Send email in thread pool to avoid blocking
+        def send_sync():
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                if smtp_use_tls:
+                    server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+        
+        await asyncio.get_event_loop().run_in_executor(None, send_sync)
+        logger.info("Conversation email sent successfully via SMTP to %s", to_email)
+        return True
+        
+    except Exception as e:
+        logger.error("Error sending conversation email via SMTP: %s", str(e))
+        return False
+
+
+async def _send_conversation_azure_email(
+    to_email: str,
+    conversation_file: str,
+    session_id: str
+) -> bool:
+    """Send conversation email with attachment using Azure Communication Services."""
+    connection_string = os.environ.get("AZURE_COMMUNICATION_CONNECTION_STRING")
+    from_email = os.environ.get("AZURE_COMMUNICATION_EMAIL_FROM")
+    
+    if not connection_string or not from_email:
+        logger.warning("Azure Communication Services not configured. Email not sent.")
+        return False
+    
+    try:
+        filepath = Path(conversation_file)
+        if not filepath.exists():
+            logger.error("Conversation file not found: %s", conversation_file)
+            return False
+        
+        # Read file content
+        file_content = filepath.read_bytes()
+        file_name = filepath.name
+        
+        # Extract endpoint and access key from connection string
+        parts = connection_string.split(";")
+        endpoint = None
+        access_key = None
+        
+        for part in parts:
+            if part.startswith("endpoint="):
+                endpoint = part.split("=", 1)[1]
+            elif part.startswith("accesskey="):
+                access_key = part.split("=", 1)[1]
+        
+        if not endpoint or not access_key:
+            logger.error("Invalid Azure Communication Services connection string format")
+            return False
+        
+        # Prepare email content
+        subject = f"VoiceRAG Conversation Log - Session {session_id[:8]}"
+        text_content = f"""
+This email contains the conversation log from VoiceRAG session {session_id[:8]}.
+
+The conversation file is attached to this email.
+
+This is an automated message from VoiceRAG System.
+        """.strip()
+        
+        # Azure Communication Services Email API with attachment
+        url = f"{endpoint}/emails:send"
+        headers = {
+            "Content-Type": "application/json",
+            "Ocp-Apim-Subscription-Key": access_key
+        }
+        
+        import base64
+        file_base64 = base64.b64encode(file_content).decode("utf-8")
+        
+        payload = {
+            "senderAddress": from_email,
+            "content": {
+                "subject": subject,
+                "plainText": text_content
+            },
+            "recipients": {
+                "to": [{"address": to_email}]
+            },
+            "attachments": [
+                {
+                    "name": file_name,
+                    "contentType": "text/plain",
+                    "contentInBase64": file_base64
+                }
+            ]
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                if response.status in [200, 202]:
+                    logger.info("Conversation email sent successfully via Azure Communication Services to %s", to_email)
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error("Failed to send conversation email via Azure: %s - %s", response.status, error_text)
+                    return False
+                    
+    except Exception as e:
+        logger.error("Error sending conversation email via Azure Communication Services: %s", str(e))
+        return False
+
+
+async def _send_conversation_salesforce_email(
+    to_email: str,
+    conversation_file: str,
+    session_id: str
+) -> bool:
+    """Send conversation email using Salesforce API."""
+    try:
+        from salesforce_service import get_salesforce_service
+        import asyncio
+        import requests
+        import base64
+        
+        sf_service = get_salesforce_service()
+        if not sf_service.is_available() or not sf_service.sf:
+            logger.warning("Salesforce not available. Email not sent.")
+            return False
+        
+        filepath = Path(conversation_file)
+        if not filepath.exists():
+            logger.error("Conversation file not found: %s", conversation_file)
+            return False
+        
+        # Read file content
+        file_content = filepath.read_bytes()
+        file_base64 = base64.b64encode(file_content).decode("utf-8")
+        
+        subject = f"VoiceRAG Conversation Log - Session {session_id[:8]}"
+        text_body = f"""
+This email contains the conversation log from VoiceRAG session {session_id[:8]}.
+
+The conversation file is attached to this email.
+
+This is an automated message from VoiceRAG System.
+        """.strip()
+        
+        # Get instance_url
+        base_url = sf_service.sf.base_url
+        instance_url = base_url.split("/services")[0]
+        
+        if not instance_url or not instance_url.startswith("http"):
+            sf_instance = sf_service.sf.sf_instance
+            if sf_instance:
+                instance_url = f"https://{sf_instance}"
+            else:
+                logger.error("Cannot determine Salesforce instance URL")
+                return False
+        
+        # Note: Salesforce emailSimple API doesn't support attachments directly
+        # We'll include the file content in the email body instead
+        email_body = f"{text_body}\n\n--- Conversation File Content ---\n\n{filepath.read_text(encoding='utf-8')}"
+        
+        email_endpoint = f"{instance_url}/services/data/v58.0/actions/standard/emailSimple"
+        
+        payload = {
+            "inputs": [{
+                "emailBody": email_body,
+                "emailAddresses": to_email,
+                "emailSubject": subject,
+                "senderType": "CurrentUser"
+            }]
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {sf_service.sf.session_id}",
+            "Content-Type": "application/json"
+        }
+        
+        def _post_email():
+            return requests.post(email_endpoint, json=payload, headers=headers, timeout=10)
+        
+        response = await asyncio.get_event_loop().run_in_executor(None, _post_email)
+        
+        if response.status_code in [200, 201]:
+            logger.info("Conversation email sent successfully via Salesforce REST API to %s", to_email)
+            return True
+        else:
+            error_text = response.text[:500] if response.text else "Unknown error"
+            logger.error("Failed to send conversation email via Salesforce REST API: %s - %s", 
+                        response.status_code, error_text)
+            return False
+            
+    except Exception as e:
+        logger.error("Error sending conversation email via Salesforce: %s", str(e))
+        return False
 
