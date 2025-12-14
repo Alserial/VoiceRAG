@@ -95,7 +95,16 @@ function App() {
             if (message.tool_name === "extract_quote_info") {
                 if (result.is_complete && result.extracted) {
                     console.log("Setting quote data (complete):", result.extracted);
-                    setQuoteData(result.extracted as QuoteData);
+                    // Ensure all fields are included, even optional ones
+                    const extracted = result.extracted;
+                    setQuoteData({
+                        customer_name: extracted.customer_name || "",
+                        contact_info: extracted.contact_info || "",
+                        product_package: extracted.product_package || "",
+                        quantity: extracted.quantity ?? null,
+                        expected_start_date: extracted.expected_start_date ?? null,
+                        notes: extracted.notes ?? null,
+                    });
                 } else {
                     console.log("Quote info incomplete; missing fields:", result.missing_fields);
                 }
