@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -15,11 +15,58 @@ import { GroundingFile, ToolResult } from "./types";
 
 import logo from "./assets/logo.svg";
 import QuoteRequestForm from "@/components/quote/QuoteRequestForm";
+import QuoteConfirmation, { QuoteData } from "@/components/quote/QuoteConfirmation";
 
 function App() {
     const [isRecording, setIsRecording] = useState(false);
     const [groundingFiles, setGroundingFiles] = useState<GroundingFile[]>([]);
     const [selectedFile, setSelectedFile] = useState<GroundingFile | null>(null);
+    const [quoteData, setQuoteData] = useState<QuoteData | null>(null);
+
+    const handleQuoteConfirm = useCallback(async () => {
+        if (!quoteData) return;
+
+        try {
+            const response = await fetch("/api/quotes/confirm", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ quote_data: quoteData }),
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.error || "Failed to send quote");
+            }
+
+            const result = await response.json();
+            console.log("Quote sent successfully:", result);
+        } catch (error) {
+            console.error("Error confirming quote:", error);
+            throw error;
+        }
+    }, [quoteData]);
+
+    const handleQuoteCancel = useCallback(() => {
+        setQuoteData(null);
+    }, []);
+
+    // Listen for voice confirmation
+    const checkVoiceConfirmation = useCallback((transcript: string) => {
+        const confirmKeywords = ["confirm", "yes", "send", "ok", "okay", "proceed", "go ahead"];
+        const cancelKeywords = ["cancel", "no", "stop", "wait"];
+        
+        const lowerTranscript = transcript.toLowerCase();
+        
+        if (confirmKeywords.some(keyword => lowerTranscript.includes(keyword))) {
+            if (quoteData) {
+                handleQuoteConfirm();
+            }
+        } else if (cancelKeywords.some(keyword => lowerTranscript.includes(keyword))) {
+            handleQuoteCancel();
+        }
+    }, [quoteData, handleQuoteConfirm, handleQuoteCancel]);
 
     const { startSession, addUserAudio, inputAudioBufferClear } = useRealTime({
         enableInputAudioTranscription: true,  // Enable input audio transcription to capture user input
@@ -33,14 +80,31 @@ function App() {
         onReceivedInputAudioBufferSpeechStarted: () => {
             stopAudioPlayer();
         },
+        onReceivedInputAudioTranscriptionCompleted: message => {
+            // Check for voice confirmation when quote is pending
+            if (quoteData && message.transcript) {
+                checkVoiceConfirmation(message.transcript);
+            }
+        },
         onReceivedExtensionMiddleTierToolResponse: message => {
+            console.log("Received tool response:", message);
             const result: ToolResult = JSON.parse(message.tool_result);
+            console.log("Parsed tool result:", result);
 
-            const files: GroundingFile[] = result.sources.map(x => {
-                return { id: x.chunk_id, name: x.title, content: x.chunk };
-            });
+            // Handle quote extraction result
+            if (message.tool_name === "extract_quote_info" && result.status === "complete" && result.quote_data) {
+                console.log("Setting quote data:", result.quote_data);
+                setQuoteData(result.quote_data);
+                return;
+            }
 
-            setGroundingFiles(prev => [...prev, ...files]);
+            // Handle grounding files (search results)
+            if (result.sources) {
+                const files: GroundingFile[] = result.sources.map(x => {
+                    return { id: x.chunk_id, name: x.title, content: x.chunk };
+                });
+                setGroundingFiles(prev => [...prev, ...files]);
+            }
         }
     });
 
@@ -109,6 +173,14 @@ function App() {
             </div>
 
             <GroundingFileView groundingFile={selectedFile} onClosed={() => setSelectedFile(null)} />
+            
+            {quoteData && (
+                <QuoteConfirmation
+                    quoteData={quoteData}
+                    onConfirm={handleQuoteConfirm}
+                    onCancel={handleQuoteCancel}
+                />
+            )}
         </div>
     );
 }

@@ -69,6 +69,7 @@ class RTMiddleTier:
     _tools_pending = {}
     _token_provider = None
     _conversation_logs = {}  # Store conversation logs per session
+    _quote_triggered = {}    # Track quote trigger per session to avoid duplicates
 
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
         self.endpoint = endpoint
@@ -137,6 +138,7 @@ class RTMiddleTier:
                                     "content": transcript,
                                     "timestamp": datetime.now().isoformat()
                                 })
+                                await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
                 
                 case "conversation.item.input_audio_transcription.completed":
                     # Record user input transcription
@@ -180,6 +182,7 @@ class RTMiddleTier:
                                 "content": transcript,
                                 "timestamp": datetime.now().isoformat()
                             })
+                            await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
                         else:
                             logger.warning("User input transcription message received but no transcript found. Message keys: %s", list(message.keys()))
                             logger.debug("Full message: %s", json.dumps(message)[:500])
@@ -193,10 +196,27 @@ class RTMiddleTier:
                 case "response.output_item.done":
                     if "item" in message and message["item"]["type"] == "function_call":
                         item = message["item"]
+                        tool_name = item["name"]
+                        logger.info("Tool called: %s, call_id: %s, args: %s", tool_name, item.get("call_id"), item.get("arguments", "")[:200])
                         tool_call = self._tools_pending[message["item"]["call_id"]]
-                        tool = self.tools[item["name"]]
+                        tool = self.tools[tool_name]
                         args = item["arguments"]
-                        result = await tool.target(json.loads(args))
+                        # Pass session_id to tools that need it
+                        session_id = getattr(client_ws, "session_id", None)
+                        if session_id:
+                            self._current_session_id = session_id
+                        # Check if tool target accepts session_id parameter
+                        import inspect
+                        try:
+                            sig = inspect.signature(tool.target)
+                            if "session_id" in sig.parameters:
+                                result = await tool.target(json.loads(args), session_id=session_id)
+                            else:
+                                result = await tool.target(json.loads(args))
+                        except (TypeError, ValueError) as e:
+                            # If signature inspection fails, try without session_id
+                            logger.debug("Tool signature inspection failed: %s, trying without session_id", str(e))
+                            result = await tool.target(json.loads(args))
                         await server_ws.send_json({
                             "type": "conversation.item.create",
                             "item": {
@@ -206,8 +226,8 @@ class RTMiddleTier:
                             }
                         })
                         if result.destination == ToolResultDirection.TO_CLIENT:
-                            # TODO: this will break clients that don't know about this extra message, rewrite 
-                            # this to be a regular text message with a special marker of some sort
+                            # Send tool result to client for display
+                            logger.info("Sending tool result to client: tool_name=%s", item["name"])
                             await client_ws.send_json({
                                 "type": "extension.middle_tier_tool_response",
                                 "previous_item_id": tool_call.previous_id,
@@ -345,6 +365,66 @@ class RTMiddleTier:
         await ws.prepare(request)
         await self._forward_messages(ws)
         return ws
+
+    async def _invoke_tool(self, tool_name: str, args: Any, session_id: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse):
+        """Invoke a tool manually and forward the result to client or server."""
+        try:
+            if tool_name not in self.tools:
+                logger.warning("Tool %s not found", tool_name)
+                return
+
+            tool = self.tools[tool_name]
+            # Pass session_id if the tool accepts it
+            import inspect
+            result = None
+            try:
+                sig = inspect.signature(tool.target)
+                if "session_id" in sig.parameters:
+                    result = await tool.target(args, session_id=session_id)
+                else:
+                    result = await tool.target(args)
+            except Exception as e:
+                logger.error("Error invoking tool %s: %s", tool_name, str(e))
+                return
+
+            if result is None:
+                return
+
+            if result.destination == ToolResultDirection.TO_SERVER:
+                await server_ws.send_json({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": f"manual_{tool_name}",
+                        "output": result.to_text()
+                    }
+                })
+            elif result.destination == ToolResultDirection.TO_CLIENT:
+                result_text = result.to_text()
+                logger.info("Sending tool result to client: tool_name=%s, result_length=%d, preview: %s", 
+                           tool_name, len(result_text), result_text[:200])
+                await client_ws.send_json({
+                    "type": "extension.middle_tier_tool_response",
+                    "previous_item_id": None,
+                    "tool_name": tool_name,
+                    "tool_result": result_text
+                })
+                logger.info("Tool result sent to client successfully for tool: %s", tool_name)
+        except Exception as e:
+            logger.error("Error forwarding tool result: %s", str(e))
+
+    async def _maybe_trigger_quote_tool(self, session_id: str, transcript: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse):
+        """Trigger quote extraction tool based on keywords, only once per session."""
+        # TEMPORARILY DISABLED: Let the model auto-tool-call instead to avoid duplicate invocations
+        # The model with tool_choice=auto will automatically call extract_quote_info when it detects quote requests
+        # keywords = ["quote", "quotation", "price", "pricing", "estimate", "estimate", "need a quote", "get a quote"]
+        # text = transcript.lower()
+        # if any(k in text for k in keywords):
+        #     if session_id not in self._quote_triggered or not self._quote_triggered[session_id]:
+        #         self._quote_triggered[session_id] = True
+        #         logger.info("Keyword detected for quote, invoking tool for session %s", session_id)
+        #         await self._invoke_tool("extract_quote_info", {}, session_id, client_ws, server_ws)
+        pass  # Disabled manual trigger - relying on model auto tool-call
     
     async def _save_and_send_conversation(self, session_id: str):
         """Save conversation to file and send via email."""

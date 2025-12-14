@@ -130,10 +130,28 @@ export default function useRealTime({
                 onReceivedInputAudioTranscriptionCompleted?.(message as ResponseInputAudioTranscriptionCompleted);
                 break;
             case "extension.middle_tier_tool_response":
+                console.log("Received extension.middle_tier_tool_response:", message);
                 onReceivedExtensionMiddleTierToolResponse?.(message as ExtensionMiddleTierToolResponse);
                 break;
             case "error":
                 onReceivedError?.(message);
+                break;
+            case "conversation.item.created":
+                // Check if this is a function_call that we need to track
+                if (message.item && message.item.type === "function_call") {
+                    console.log("Function call detected:", message.item.name, message);
+                }
+                // Don't break, let it fall through to default for now
+                break;
+            default:
+                // Log unhandled message types for debugging (but filter out common ones)
+                const commonTypes = ["session.created", "session.updated", "input_audio_buffer.speech_stopped", 
+                                     "input_audio_buffer.committed", "response.output_item.added"];
+                if (message.type && !commonTypes.includes(message.type) && 
+                    !message.type.startsWith("response.") && 
+                    !message.type.startsWith("input_audio_buffer.")) {
+                    console.log("Unhandled message type:", message.type, message);
+                }
                 break;
         }
     };

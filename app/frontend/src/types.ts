@@ -36,6 +36,12 @@ export type InputAudioBufferClearCommand = {
 
 export type Message = {
     type: string;
+    item?: {
+        type: string;
+        name?: string;
+        [key: string]: any;
+    };
+    [key: string]: any;
 };
 
 export type ResponseAudioDelta = {
@@ -73,5 +79,17 @@ export type ExtensionMiddleTierToolResponse = {
 };
 
 export type ToolResult = {
-    sources: { chunk_id: string; title: string; chunk: string }[];
+    sources?: { chunk_id: string; title: string; chunk: string }[];
+    status?: "complete" | "incomplete";
+    quote_data?: {
+        customer_name: string;
+        contact_info: string;
+        product_package: string;
+        quantity: number;
+        expected_start_date?: string;
+        notes?: string;
+    };
+    message?: string;
+    questions?: string[];
+    missing_fields?: string[];
 };
