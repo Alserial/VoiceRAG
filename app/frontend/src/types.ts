@@ -80,16 +80,15 @@ export type ExtensionMiddleTierToolResponse = {
 
 export type ToolResult = {
     sources?: { chunk_id: string; title: string; chunk: string }[];
-    status?: "complete" | "incomplete";
-    quote_data?: {
+    extracted?: {
         customer_name: string;
         contact_info: string;
         product_package: string;
-        quantity: number;
+        quantity: number | null;
         expected_start_date?: string;
         notes?: string;
     };
-    message?: string;
-    questions?: string[];
     missing_fields?: string[];
+    is_complete?: boolean;
+    products_available?: string[];
 };

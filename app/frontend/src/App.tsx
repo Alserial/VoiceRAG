@@ -91,10 +91,14 @@ function App() {
             const result: ToolResult = JSON.parse(message.tool_result);
             console.log("Parsed tool result:", result);
 
-            // Handle quote extraction result
-            if (message.tool_name === "extract_quote_info" && result.status === "complete" && result.quote_data) {
-                console.log("Setting quote data:", result.quote_data);
-                setQuoteData(result.quote_data);
+            // Handle quote extraction state
+            if (message.tool_name === "extract_quote_info") {
+                if (result.is_complete && result.extracted) {
+                    console.log("Setting quote data (complete):", result.extracted);
+                    setQuoteData(result.extracted as QuoteData);
+                } else {
+                    console.log("Quote info incomplete; missing fields:", result.missing_fields);
+                }
                 return;
             }
 

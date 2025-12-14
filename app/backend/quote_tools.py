@@ -81,37 +81,43 @@ async def _extract_quote_info_tool(
     args: Any
 ) -> ToolResult:
     """
-    Extract quote information from conversation history and return what's needed.
-    
-    This tool:
-    1. Gets conversation history
-    2. Uses LLM to extract quote information
-    3. Matches product names to available products
-    4. Returns extracted info or questions to ask
+    Quote state evaluator:
+    - Can be called multiple times.
+    - Accepts empty / partial context.
+    - Returns structured state only (no user-facing text).
     """
     logger.info("extract_quote_info tool called with session_id=%s, args=%s", session_id, args)
     try:
-        # Get conversation history
+        # Get conversation history (allow empty)
         logger.info("Checking conversation logs. Available sessions: %s", list(rtmt._conversation_logs.keys()))
-        if session_id not in rtmt._conversation_logs:
-            logger.warning("Session %s not found in conversation logs", session_id)
-            return ToolResult(
-                json.dumps({"error": "No conversation history found", "status": "error"}),
-                ToolResultDirection.TO_SERVER
-            )
-        
-        conversation = rtmt._conversation_logs[session_id]
+        conversation = rtmt._conversation_logs.get(session_id, {"messages": []})
         messages = conversation.get("messages", [])
         logger.info("Found %d messages in conversation for session %s", len(messages), session_id)
         
-        if not messages:
-            logger.warning("No messages found in conversation for session %s", session_id)
-            return ToolResult(
-                json.dumps({"error": "Empty conversation", "status": "error"}),
-                ToolResultDirection.TO_SERVER
-            )
+        # Default extracted structure (allow empty)
+        extracted_data: Dict[str, Any] = {
+            "customer_name": None,
+            "contact_info": None,
+            "product_package": None,
+            "quantity": None,
+            "expected_start_date": None,
+            "notes": None,
+        }
         
-        # Build conversation text for LLM
+        # If no messages yet, return current state without error
+        if not messages:
+            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
+            missing_fields = required_fields.copy()
+            result = {
+                "extracted": extracted_data,
+                "missing_fields": missing_fields,
+                "products_available": [],
+                "is_complete": False,
+            }
+            logger.info("No conversation yet; returning initial state: %s", json.dumps(result))
+            return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
+        
+        # Build conversation text for LLM (last 10 messages)
         conversation_text = "\n".join([
             f"{msg['role'].upper()}: {msg['content']}"
             for msg in messages[-10:]  # Last 10 messages
@@ -136,13 +142,11 @@ async def _extract_quote_info_tool(
                 logger.error("Error fetching products: %s", str(e))
         
         # Use LLM to extract information from conversation
-        # We'll use the OpenAI API to extract structured data
         from openai import AzureOpenAI
         from azure.core.credentials import AzureKeyCredential
         from azure.identity import DefaultAzureCredential
         
         openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-        # Prefer a dedicated extraction deployment; fallback to general text deployment, then gpt-4o-mini
         openai_deployment = (
             os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
             or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
@@ -154,10 +158,15 @@ async def _extract_quote_info_tool(
         
         if not openai_endpoint or not openai_deployment:
             logger.error("OpenAI configuration not available: endpoint=%s, deployment=%s", openai_endpoint, openai_deployment)
-            return ToolResult(
-                json.dumps({"error": "OpenAI configuration not available", "status": "error"}),
-                ToolResultDirection.TO_SERVER
-            )
+            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
+            missing_fields = required_fields.copy()
+            result = {
+                "extracted": extracted_data,
+                "missing_fields": missing_fields,
+                "products_available": [],
+                "is_complete": False,
+            }
+            return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
         
         # Use the same credential approach as the main app
         if llm_key:
@@ -227,11 +236,22 @@ Example format:
             logger.info("OpenAI API call successful, response received. Model used: %s", response.model if hasattr(response, 'model') else openai_deployment)
             extracted_data = json.loads(response.choices[0].message.content)
             logger.info("Extracted data parsed successfully: %s", json.dumps(extracted_data)[:300])
+            # Ensure keys exist even if model omits them
+            for key in ["customer_name", "contact_info", "product_package", "quantity", "expected_start_date", "notes"]:
+                extracted_data.setdefault(key, None)
         except Exception as e:
             logger.error("Error calling OpenAI API: %s", str(e))
             import traceback
             logger.error("Traceback: %s", traceback.format_exc())
-            raise
+            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
+            missing_fields = required_fields.copy()
+            result = {
+                "extracted": extracted_data,
+                "missing_fields": missing_fields,
+                "products_available": product_names,
+                "is_complete": False,
+            }
+            return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
         
         # Match product name if provided
         if extracted_data.get("product_package") and products:
@@ -250,61 +270,45 @@ Example format:
             if not extracted_data.get(field)
         ]
         
-        # Prepare response
+        # Prepare response (state only)
         result = {
             "extracted": extracted_data,
             "missing_fields": missing_fields,
-            "products_available": product_names
+            "products_available": product_names,
+            "is_complete": len(missing_fields) == 0,
         }
         
-        logger.info("Quote extraction result: missing_fields=%s, extracted_data=%s", missing_fields, json.dumps(extracted_data)[:200])
+        logger.info("Quote extraction result: missing_fields=%s, is_complete=%s, extracted_data=%s", missing_fields, result["is_complete"], json.dumps(extracted_data)[:200])
         
-        # If information is complete, send to client for display and confirmation
-        if not missing_fields:
-            result["status"] = "complete"
-            result["message"] = "I have all the information. Please review and confirm to send the quote."
-            result["quote_data"] = extracted_data
-            result_text = json.dumps(result)
-            logger.info("extract_quote_info SUCCESS - Quote information complete, sending to client. Result length: %d", len(result_text))
-            logger.info("extract_quote_info SUCCESS, returning: %s", result_text[:500])
-            # Send to client for display
-            return ToolResult(
-                result_text,
-                ToolResultDirection.TO_CLIENT
-            )
+        result_text = json.dumps(result)
+        if result["is_complete"]:
+            logger.info("extract_quote_info SUCCESS - complete. Result length: %d", len(result_text))
+            logger.info("extract_quote_info returning: %s", result_text[:500])
+            return ToolResult(result_text, ToolResultDirection.TO_CLIENT)
         else:
-            result["status"] = "incomplete"
-            # Generate questions for missing fields
-            questions = []
-            if "customer_name" in missing_fields:
-                questions.append("What is your name?")
-            if "contact_info" in missing_fields:
-                questions.append("What is your email address?")
-            if "product_package" in missing_fields:
-                if product_names:
-                    questions.append(f"Which product are you interested in? Available products: {', '.join(product_names[:5])}")
-                else:
-                    questions.append("Which product are you interested in?")
-            if "quantity" in missing_fields:
-                questions.append("What quantity do you need?")
-            
-            result["questions"] = questions
-            result["message"] = "I need some additional information: " + " ".join(questions)
-            result_text = json.dumps(result)
-            logger.info("extract_quote_info SUCCESS - Quote information incomplete, sending to server. Missing: %s", missing_fields)
-            logger.info("extract_quote_info SUCCESS, returning: %s", result_text[:500])
-            # Send to server for LLM to ask questions
-            return ToolResult(
-                result_text,
-                ToolResultDirection.TO_SERVER
-            )
+            logger.info("extract_quote_info SUCCESS - incomplete. Result length: %d", len(result_text))
+            logger.info("extract_quote_info returning: %s", result_text[:500])
+            return ToolResult(result_text, ToolResultDirection.TO_SERVER)
         
     except Exception as e:
         logger.exception("extract_quote_info FAILED: %s", str(e))
         import traceback
         logger.error("Full traceback: %s", traceback.format_exc())
+        fallback = {
+            "extracted": {
+                "customer_name": None,
+                "contact_info": None,
+                "product_package": None,
+                "quantity": None,
+                "expected_start_date": None,
+                "notes": None,
+            },
+            "missing_fields": ["customer_name", "contact_info", "product_package", "quantity"],
+            "products_available": [],
+            "is_complete": False,
+        }
         return ToolResult(
-            json.dumps({"error": str(e), "status": "error"}),
+            json.dumps(fallback),
             ToolResultDirection.TO_SERVER
         )
 

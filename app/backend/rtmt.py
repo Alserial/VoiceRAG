@@ -222,7 +222,8 @@ class RTMiddleTier:
                             "item": {
                                 "type": "function_call_output",
                                 "call_id": item["call_id"],
-                                "output": result.to_text() if result.destination == ToolResultDirection.TO_SERVER else ""
+                                # Always return output to the LLM so it can drive the next turn
+                                "output": result.to_text()
                             }
                         })
                         if result.destination == ToolResultDirection.TO_CLIENT:
@@ -401,6 +402,15 @@ class RTMiddleTier:
                 })
             elif result.destination == ToolResultDirection.TO_CLIENT:
                 result_text = result.to_text()
+                # Also forward to LLM so it has the same state (keeps loop consistent)
+                await server_ws.send_json({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": f"manual_{tool_name}",
+                        "output": result_text
+                    }
+                })
                 logger.info("Sending tool result to client: tool_name=%s, result_length=%d, preview: %s", 
                            tool_name, len(result_text), result_text[:200])
                 await client_ws.send_json({
