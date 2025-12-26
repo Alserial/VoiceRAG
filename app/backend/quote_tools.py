@@ -166,7 +166,7 @@ def _find_best_product_match(user_input: str, products: List[Dict[str, str]]) ->
     
     best_match = None
     best_score = 0.0
-    threshold = 0.3  # Minimum similarity threshold
+    threshold = 0.6  # Minimum similarity threshold (increased from 0.3 for better accuracy)
     
     user_lower = user_input.lower().strip()
     
@@ -175,12 +175,21 @@ def _find_best_product_match(user_input: str, products: List[Dict[str, str]]) ->
         if not product_name:
             continue
             
+        product_lower = product_name.lower()
+        
+        # Exact match (case-insensitive)
+        if user_lower == product_lower:
+            logger.info("Exact product match found: '%s'", product_name)
+            return product_name
+            
         # Calculate similarity
-        score = _similarity(user_lower, product_name.lower())
+        score = _similarity(user_lower, product_lower)
         
         # Check if user input contains product name or vice versa
-        if user_lower in product_name.lower() or product_name.lower() in user_lower:
-            score = max(score, 0.7)  # Boost score for substring matches
+        # Only boost if it's a meaningful substring match (not just single character)
+        if len(user_lower) >= 3 and len(product_lower) >= 3:
+            if user_lower in product_lower or product_lower in user_lower:
+                score = max(score, 0.75)  # Boost score for substring matches
         
         if score > best_score:
             best_score = score
@@ -190,7 +199,7 @@ def _find_best_product_match(user_input: str, products: List[Dict[str, str]]) ->
         logger.info("Matched product '%s' to '%s' with score %.2f", user_input, best_match, best_score)
         return best_match
     
-    logger.info("No good product match found for '%s' (best score: %.2f)", user_input, best_score)
+    logger.info("No good product match found for '%s' (best score: %.2f, threshold: %.2f)", user_input, best_score, threshold)
     return None
 
 
@@ -214,18 +223,18 @@ async def _extract_quote_info_tool(
         logger.info("Found %d messages in conversation for session %s", len(messages), session_id)
         
         # Default extracted structure (allow empty)
+        # Support multiple quote items: quote_items is an array of {product_package, quantity}
         extracted_data: Dict[str, Any] = {
             "customer_name": None,
             "contact_info": None,
-            "product_package": None,
-            "quantity": None,
+            "quote_items": [],  # Array of {product_package, quantity}
             "expected_start_date": None,
             "notes": None,
         }
         
         # If no messages yet, return current state without error
         if not messages:
-            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
+            required_fields = ["customer_name", "contact_info", "quote_items"]
             missing_fields = required_fields.copy()
             result = {
                 "extracted": extracted_data,
@@ -277,8 +286,7 @@ async def _extract_quote_info_tool(
         
         if not openai_endpoint or not openai_deployment:
             logger.error("OpenAI configuration not available: endpoint=%s, deployment=%s", openai_endpoint, openai_deployment)
-            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
-            missing_fields = required_fields.copy()
+            missing_fields = ["customer_name", "contact_info", "quote_items"]
             result = {
                 "extracted": extracted_data,
                 "missing_fields": missing_fields,
@@ -297,13 +305,15 @@ async def _extract_quote_info_tool(
         product_names = [p["name"] for p in products] if products else []
         product_list_text = ", ".join(product_names) if product_names else "No products available"
         
-        # Create extraction prompt
+        # Create extraction prompt - support multiple products
         extraction_prompt = f"""Extract quote information from the following conversation. 
 Return a JSON object with the following fields:
 - customer_name: Customer's name (if mentioned)
 - contact_info: Email address or phone number (if mentioned)
-- product_package: Product name mentioned by user (if any)
-- quantity: Quantity or number of items (if mentioned, as a number)
+- quote_items: Array of items, each with {{"product_package": "product name", "quantity": number}}. 
+  Support multiple products - if user mentions multiple products, include all of them.
+  Example: [{{"product_package": "Product A", "quantity": 10}}, {{"product_package": "Product B", "quantity": 5}}]
+  If only one product is mentioned, return array with one item: [{{"product_package": "Product A", "quantity": 10}}]
 - expected_start_date: Expected start date in format YYYY-MM-DD or dd/mm/yyyy (if mentioned)
 - notes: Any additional notes or requirements mentioned
 
@@ -312,13 +322,21 @@ Available products: {product_list_text}
 Conversation:
 {conversation_text}
 
-Return ONLY a valid JSON object, no other text. If a field is not found, use null for that field.
-Example format:
+Return ONLY a valid JSON object, no other text. If a field is not found, use null for that field (use [] for quote_items if no products mentioned).
+Example format (single product):
 {{
   "customer_name": "John Doe",
   "contact_info": "john@example.com",
-  "product_package": null,
-  "quantity": 10,
+  "quote_items": [{{"product_package": "Product A", "quantity": 10}}],
+  "expected_start_date": null,
+  "notes": "Need fast delivery"
+}}
+
+Example format (multiple products):
+{{
+  "customer_name": "John Doe",
+  "contact_info": "john@example.com",
+  "quote_items": [{{"product_package": "Product A", "quantity": 10}}, {{"product_package": "Product B", "quantity": 5}}],
   "expected_start_date": null,
   "notes": "Need fast delivery"
 }}"""
@@ -356,8 +374,35 @@ Example format:
             extracted_data = json.loads(response.choices[0].message.content)
             logger.info("Extracted data parsed successfully: %s", json.dumps(extracted_data)[:300])
             # Ensure keys exist even if model omits them
-            for key in ["customer_name", "contact_info", "product_package", "quantity", "expected_start_date", "notes"]:
-                extracted_data.setdefault(key, None)
+            extracted_data.setdefault("customer_name", None)
+            extracted_data.setdefault("contact_info", None)
+            extracted_data.setdefault("quote_items", [])
+            extracted_data.setdefault("expected_start_date", None)
+            extracted_data.setdefault("notes", None)
+            
+            # Convert legacy format (product_package + quantity) to quote_items format if needed
+            if "product_package" in extracted_data and extracted_data["product_package"] and "quote_items" not in extracted_data:
+                # Legacy format detected, convert to new format
+                if extracted_data.get("quantity"):
+                    extracted_data["quote_items"] = [{
+                        "product_package": extracted_data["product_package"],
+                        "quantity": extracted_data["quantity"]
+                    }]
+                extracted_data.pop("product_package", None)
+                extracted_data.pop("quantity", None)
+            elif "product_package" in extracted_data and extracted_data.get("product_package") and not extracted_data.get("quote_items"):
+                # If quote_items is empty but product_package exists, convert it
+                if extracted_data.get("quantity"):
+                    extracted_data["quote_items"] = [{
+                        "product_package": extracted_data["product_package"],
+                        "quantity": extracted_data["quantity"]
+                    }]
+                extracted_data.pop("product_package", None)
+                extracted_data.pop("quantity", None)
+            
+            # Ensure quote_items is a list
+            if not isinstance(extracted_data.get("quote_items"), list):
+                extracted_data["quote_items"] = []
             
             # Normalize email address if contact_info is provided
             if extracted_data.get("contact_info"):
@@ -375,8 +420,7 @@ Example format:
             logger.error("Error calling OpenAI API: %s", str(e))
             import traceback
             logger.error("Traceback: %s", traceback.format_exc())
-            required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
-            missing_fields = required_fields.copy()
+            missing_fields = ["customer_name", "contact_info", "quote_items"]
             result = {
                 "extracted": extracted_data,
                 "missing_fields": missing_fields,
@@ -385,22 +429,74 @@ Example format:
             }
             return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
         
-        # Match product name if provided
-        if extracted_data.get("product_package") and products:
-            user_product = extracted_data["product_package"]
-            matched_product = _find_best_product_match(user_product, products)
-            if matched_product:
-                extracted_data["product_package"] = matched_product
-                extracted_data["product_matched"] = True
-            else:
-                extracted_data["product_matched"] = False
+        # Match product names for all quote items
+        quote_items = extracted_data.get("quote_items", [])
+        if quote_items and products:
+            matched_items = []
+            for item in quote_items:
+                if not isinstance(item, dict):
+                    continue
+                user_product = item.get("product_package")
+                quantity = item.get("quantity")
+                if user_product and products:
+                    matched_product = _find_best_product_match(user_product, products)
+                    if matched_product:
+                        matched_items.append({
+                            "product_package": matched_product,
+                            "quantity": quantity or 1
+                        })
+                        logger.info("Product matched: '%s' -> '%s'", user_product, matched_product)
+                    else:
+                        # If no good match found, keep original but mark it
+                        logger.warning("Product '%s' does not match any available products. Available products: %s", 
+                                     user_product, product_names)
+                        matched_items.append({
+                            "product_package": user_product,  # Keep original for now
+                            "quantity": quantity or 1,
+                            "matched": False
+                        })
+                elif user_product:
+                    # Product without quantity
+                    matched_items.append({
+                        "product_package": user_product,
+                        "quantity": 1
+                    })
+            extracted_data["quote_items"] = matched_items
+        
+        # Auto-register user to Salesforce when we have name and contact info
+        # This ensures the user is already in Salesforce before creating quotes
+        customer_name = extracted_data.get("customer_name")
+        contact_info = extracted_data.get("contact_info")
+        if customer_name and contact_info and sf_service.is_available():
+            try:
+                # Register user asynchronously (don't block the response)
+                # This ensures user is in Salesforce for future quote operations
+                account_id = sf_service.create_or_get_account(customer_name, contact_info)
+                if account_id:
+                    contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+                    logger.info("Auto-registered user to Salesforce: %s (Account: %s, Contact: %s)", 
+                               customer_name, account_id, contact_id or "N/A")
+                else:
+                    logger.warning("Failed to auto-register user to Salesforce: %s", customer_name)
+            except Exception as e:
+                # Don't fail the quote extraction if registration fails
+                logger.warning("Error auto-registering user to Salesforce: %s", str(e))
         
         # Determine what information is missing
-        required_fields = ["customer_name", "contact_info", "product_package", "quantity"]
-        missing_fields = [
-            field for field in required_fields
-            if not extracted_data.get(field)
+        missing_fields = []
+        if not extracted_data.get("customer_name"):
+            missing_fields.append("customer_name")
+        if not extracted_data.get("contact_info"):
+            missing_fields.append("contact_info")
+        
+        # Check quote_items: must have at least one item with both product_package and quantity
+        quote_items = extracted_data.get("quote_items", [])
+        valid_items = [
+            item for item in quote_items 
+            if isinstance(item, dict) and item.get("product_package") and item.get("quantity")
         ]
+        if not valid_items:
+            missing_fields.append("quote_items")
         
         # Prepare response (state only)
         result = {
@@ -430,12 +526,11 @@ Example format:
             "extracted": {
                 "customer_name": None,
                 "contact_info": None,
-                "product_package": None,
-                "quantity": None,
+                "quote_items": [],
                 "expected_start_date": None,
                 "notes": None,
             },
-            "missing_fields": ["customer_name", "contact_info", "product_package", "quantity"],
+            "missing_fields": ["customer_name", "contact_info", "quote_items"],
             "products_available": [],
             "is_complete": False,
         }
@@ -443,6 +538,150 @@ Example format:
             json.dumps(fallback),
             ToolResultDirection.TO_SERVER
         )
+
+
+_user_registration_tool_schema = {
+    "type": "function",
+    "name": "extract_user_info",
+    "description": "Extract user registration information (name and email) from the conversation. Use this tool when the user provides their name and email address for registration.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False
+    }
+}
+
+
+async def _extract_user_info_tool(
+    rtmt: RTMiddleTier,
+    session_id: str,
+    args: Any
+) -> ToolResult:
+    """
+    Extract user registration information (name and email) from conversation.
+    
+    Returns structured state: {"extracted": {"customer_name": ..., "contact_info": ...}, "is_complete": bool}
+    """
+    logger.info("extract_user_info tool called with session_id=%s", session_id)
+    try:
+        conversation = rtmt._conversation_logs.get(session_id, {"messages": []})
+        messages = conversation.get("messages", [])
+        
+        if not messages:
+            result = {
+                "extracted": {
+                    "customer_name": None,
+                    "contact_info": None,
+                },
+                "is_complete": False,
+            }
+            return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
+        
+        conversation_text = "\n".join([
+            f"{msg['role'].upper()}: {msg['content']}"
+            for msg in messages[-10:]
+        ])
+        
+        # Use LLM to extract user information
+        from openai import AzureOpenAI
+        from azure.core.credentials import AzureKeyCredential
+        from azure.identity import DefaultAzureCredential
+        
+        openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        openai_deployment = (
+            os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+            or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            or "gpt-4o-mini"
+        )
+        llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        
+        if not openai_endpoint or not openai_deployment:
+            result = {
+                "extracted": {"customer_name": None, "contact_info": None},
+                "is_complete": False,
+            }
+            return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
+        
+        if llm_key:
+            credential = AzureKeyCredential(llm_key)
+        else:
+            credential = DefaultAzureCredential()
+        
+        extraction_prompt = f"""Extract user registration information from the following conversation.
+Return a JSON object with:
+- customer_name: User's name (if mentioned)
+- contact_info: Email address (if mentioned)
+
+Conversation:
+{conversation_text}
+
+Return ONLY a valid JSON object, no other text. If a field is not found, use null.
+Example format:
+{{
+  "customer_name": "John Doe",
+  "contact_info": "john@example.com"
+}}"""
+        
+        if isinstance(credential, AzureKeyCredential):
+            client = AzureOpenAI(
+                api_key=credential.key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint
+            )
+        else:
+            token = credential.get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint
+            )
+        
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that extracts structured information from conversations. Always return valid JSON only."},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        
+        extracted_data = json.loads(response.choices[0].message.content)
+        
+        # Normalize email if provided
+        if extracted_data.get("contact_info"):
+            original_contact = extracted_data["contact_info"]
+            normalized_email = normalize_email(str(original_contact))
+            if normalized_email:
+                extracted_data["contact_info"] = normalized_email
+        
+        is_complete = bool(extracted_data.get("customer_name") and extracted_data.get("contact_info"))
+        
+        result = {
+            "extracted": {
+                "customer_name": extracted_data.get("customer_name"),
+                "contact_info": extracted_data.get("contact_info"),
+            },
+            "is_complete": is_complete,
+        }
+        
+        logger.info("User info extraction result: is_complete=%s, name=%s, email=%s", 
+                   is_complete, extracted_data.get("customer_name"), extracted_data.get("contact_info"))
+        
+        result_text = json.dumps(result)
+        if is_complete:
+            return ToolResult(result_text, ToolResultDirection.TO_CLIENT)
+        else:
+            return ToolResult(result_text, ToolResultDirection.TO_SERVER)
+        
+    except Exception as e:
+        logger.exception("extract_user_info FAILED: %s", str(e))
+        fallback = {
+            "extracted": {"customer_name": None, "contact_info": None},
+            "is_complete": False,
+        }
+        return ToolResult(json.dumps(fallback), ToolResultDirection.TO_SERVER)
 
 
 def attach_quote_extraction_tool(rtmt: RTMiddleTier) -> None:
@@ -465,6 +704,28 @@ def attach_quote_extraction_tool(rtmt: RTMiddleTier) -> None:
     
     rtmt.tools["extract_quote_info"] = Tool(
         schema=_quote_extraction_tool_schema,
+        target=tool_handler
+    )
+
+
+def attach_user_registration_tool(rtmt: RTMiddleTier) -> None:
+    """
+    Attach user registration tool to RTMiddleTier.
+    
+    This tool allows the LLM to extract user name and email for registration.
+    """
+    async def tool_handler(args: Any, session_id: str = None) -> ToolResult:
+        if not session_id:
+            session_id = getattr(rtmt, '_current_session_id', None)
+        if not session_id:
+            return ToolResult(
+                json.dumps({"error": "Session ID not available"}),
+                ToolResultDirection.TO_SERVER
+            )
+        return await _extract_user_info_tool(rtmt, session_id, args)
+    
+    rtmt.tools["extract_user_info"] = Tool(
+        schema=_user_registration_tool_schema,
         target=tool_handler
     )
 

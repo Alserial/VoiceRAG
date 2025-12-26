@@ -70,6 +70,7 @@ class RTMiddleTier:
     _token_provider = None
     _conversation_logs = {}  # Store conversation logs per session
     _quote_triggered = {}    # Track quote trigger per session to avoid duplicates
+    _user_registered = {}    # Track user registration status per session
 
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
         self.endpoint = endpoint
@@ -112,6 +113,8 @@ class RTMiddleTier:
                         "start_time": datetime.now().isoformat(),
                         "messages": []
                     }
+                    # Initialize user registration status
+                    self._user_registered[session_id] = False
                     updated_message = json.dumps(message)
 
                 case "response.output_item.added":

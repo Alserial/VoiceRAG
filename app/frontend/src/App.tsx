@@ -15,12 +15,14 @@ import { GroundingFile, ToolResult } from "./types";
 
 import logo from "./assets/logo.svg";
 import QuoteConfirmation, { QuoteData } from "@/components/quote/QuoteConfirmation";
+import UserRegistrationConfirmation, { UserRegistrationData } from "@/components/user/UserRegistrationConfirmation";
 
 function App() {
     const [isRecording, setIsRecording] = useState(false);
     const [groundingFiles, setGroundingFiles] = useState<GroundingFile[]>([]);
     const [selectedFile, setSelectedFile] = useState<GroundingFile | null>(null);
     const [quoteData, setQuoteData] = useState<QuoteData | null>(null);
+    const [userRegistrationData, setUserRegistrationData] = useState<UserRegistrationData | null>(null);
 
     const handleQuoteConfirm = useCallback(async (updatedQuote?: QuoteData) => {
         const payload = updatedQuote ?? quoteData;
@@ -52,6 +54,38 @@ function App() {
         setQuoteData(null);
     }, []);
 
+    const handleUserRegistrationConfirm = useCallback(async (updatedData?: UserRegistrationData) => {
+        const payload = updatedData ?? userRegistrationData;
+        if (!payload) return;
+
+        try {
+            const response = await fetch("/api/salesforce/register-user", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(payload),
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.error || "Failed to register user");
+            }
+
+            const result = await response.json();
+            console.log("User registered successfully:", result);
+            // Close the dialog after successful registration
+            setUserRegistrationData(null);
+        } catch (error) {
+            console.error("Error registering user:", error);
+            throw error;
+        }
+    }, [userRegistrationData]);
+
+    const handleUserRegistrationCancel = useCallback(() => {
+        setUserRegistrationData(null);
+    }, []);
+
     // Listen for voice confirmation
     const checkVoiceConfirmation = useCallback((transcript: string) => {
         const confirmKeywords = ["confirm", "yes", "send", "ok", "okay", "proceed", "go ahead"];
@@ -59,14 +93,28 @@ function App() {
         
         const lowerTranscript = transcript.toLowerCase();
         
+        // Check for quote confirmation
         if (confirmKeywords.some(keyword => lowerTranscript.includes(keyword))) {
             if (quoteData) {
                 handleQuoteConfirm();
+                return;
+            }
+            // Check for user registration confirmation
+            if (userRegistrationData) {
+                handleUserRegistrationConfirm();
+                return;
             }
         } else if (cancelKeywords.some(keyword => lowerTranscript.includes(keyword))) {
-            handleQuoteCancel();
+            if (quoteData) {
+                handleQuoteCancel();
+                return;
+            }
+            if (userRegistrationData) {
+                handleUserRegistrationCancel();
+                return;
+            }
         }
-    }, [quoteData, handleQuoteConfirm, handleQuoteCancel]);
+    }, [quoteData, userRegistrationData, handleQuoteConfirm, handleQuoteCancel, handleUserRegistrationConfirm, handleUserRegistrationCancel]);
 
     const { startSession, addUserAudio, inputAudioBufferClear } = useRealTime({
         enableInputAudioTranscription: true,  // Enable input audio transcription to capture user input
@@ -81,8 +129,8 @@ function App() {
             stopAudioPlayer();
         },
         onReceivedInputAudioTranscriptionCompleted: message => {
-            // Check for voice confirmation when quote is pending
-            if (quoteData && message.transcript) {
+            // Check for voice confirmation when quote or user registration is pending
+            if (message.transcript && (quoteData || userRegistrationData)) {
                 checkVoiceConfirmation(message.transcript);
             }
         },
@@ -90,6 +138,21 @@ function App() {
             console.log("Received tool response:", message);
             const result: ToolResult = JSON.parse(message.tool_result);
             console.log("Parsed tool result:", result);
+
+            // Handle user registration
+            if (message.tool_name === "extract_user_info") {
+                if (result.is_complete && result.extracted) {
+                    console.log("Setting user registration data (complete):", result.extracted);
+                    const extracted = result.extracted;
+                    setUserRegistrationData({
+                        customer_name: extracted.customer_name || "",
+                        contact_info: extracted.contact_info || "",
+                    });
+                } else {
+                    console.log("User info incomplete");
+                }
+                return;
+            }
 
             // Handle quote extraction state
             if (message.tool_name === "extract_quote_info") {
@@ -189,6 +252,14 @@ function App() {
                     initialQuoteData={quoteData}
                     onConfirm={handleQuoteConfirm}
                     onCancel={handleQuoteCancel}
+                />
+            )}
+
+            {userRegistrationData && (
+                <UserRegistrationConfirmation
+                    initialUserData={userRegistrationData}
+                    onConfirm={handleUserRegistrationConfirm}
+                    onCancel={handleUserRegistrationCancel}
                 />
             )}
         </div>

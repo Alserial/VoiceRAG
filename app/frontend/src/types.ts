@@ -81,10 +81,10 @@ export type ExtensionMiddleTierToolResponse = {
 export type ToolResult = {
     sources?: { chunk_id: string; title: string; chunk: string }[];
     extracted?: {
-        customer_name: string;
-        contact_info: string;
-        product_package: string;
-        quantity: number | null;
+        customer_name?: string;
+        contact_info?: string;
+        product_package?: string;
+        quantity?: number | null;
         expected_start_date?: string;
         notes?: string;
     };
