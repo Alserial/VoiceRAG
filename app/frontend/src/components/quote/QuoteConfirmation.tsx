@@ -15,47 +15,39 @@ type QuoteConfirmationProps = {
     initialQuoteData: QuoteData;
     onConfirm: (data?: QuoteData) => Promise<void>;
     onCancel: () => void;
+    onDataChange?: (data: QuoteData) => void; // Callback to sync data back to parent
 };
 
-export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCancel }: QuoteConfirmationProps) {
+export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCancel, onDataChange }: QuoteConfirmationProps) {
     const [isSubmitting, setIsSubmitting] = useState(false);
-    const [isSuccess, setIsSuccess] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [quoteData, setQuoteData] = useState<QuoteData>(initialQuoteData);
+    
+    // Sync data changes back to parent component
+    const updateQuoteData = (updater: (prev: QuoteData) => QuoteData) => {
+        setQuoteData(prev => {
+            const updated = updater(prev);
+            if (onDataChange) {
+                onDataChange(updated);
+            }
+            return updated;
+        });
+    };
 
     const handleConfirm = async () => {
         setIsSubmitting(true);
         setError(null);
         try {
             await onConfirm(quoteData);
-            setIsSuccess(true);
+            // Don't set isSuccess here - let the parent component handle closing
+            // The parent will call setQuoteData(null) which will close this component
+            // If we set isSuccess here, it might show success page briefly before closing
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to send quote");
         } finally {
             setIsSubmitting(false);
         }
     };
-
-    if (isSuccess) {
-        return (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
-                <div className="bg-white rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
-                    <div className="flex flex-col items-center text-center">
-                        <div className="bg-green-100 rounded-full p-3 mb-4">
-                            <Check className="h-8 w-8 text-green-600" />
-                        </div>
-                        <h2 className="text-2xl font-bold text-gray-900 mb-2">Quote Sent!</h2>
-                        <p className="text-gray-600 mb-4">
-                            Your quote has been sent to <strong>{quoteData.contact_info}</strong>
-                        </p>
-                        <Button onClick={onCancel} className="w-full">
-                            Close
-                        </Button>
-                    </div>
-                </div>
-            </div>
-        );
-    }
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
@@ -77,7 +69,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                         <input
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             value={quoteData.customer_name}
-                            onChange={e => setQuoteData(prev => ({ ...prev, customer_name: e.target.value }))}
+                            onChange={e => updateQuoteData(prev => ({ ...prev, customer_name: e.target.value }))}
                         />
                     </div>
 
@@ -88,7 +80,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                             <input
                                 className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                                 value={quoteData.contact_info}
-                                onChange={e => setQuoteData(prev => ({ ...prev, contact_info: e.target.value }))}
+                                onChange={e => updateQuoteData(prev => ({ ...prev, contact_info: e.target.value }))}
                             />
                         </div>
                     </div>
@@ -98,7 +90,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                         <input
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             value={quoteData.product_package}
-                            onChange={e => setQuoteData(prev => ({ ...prev, product_package: e.target.value }))}
+                            onChange={e => updateQuoteData(prev => ({ ...prev, product_package: e.target.value }))}
                         />
                     </div>
 
@@ -110,7 +102,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                             min={1}
                             value={quoteData.quantity ?? ""}
                             onChange={e =>
-                                setQuoteData(prev => ({
+                                updateQuoteData(prev => ({
                                     ...prev,
                                     quantity: e.target.value === "" ? null : Number(e.target.value),
                                 }))
@@ -124,7 +116,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             placeholder="YYYY-MM-DD"
                             value={quoteData.expected_start_date ?? ""}
-                            onChange={e => setQuoteData(prev => ({ ...prev, expected_start_date: e.target.value }))}
+                            onChange={e => updateQuoteData(prev => ({ ...prev, expected_start_date: e.target.value }))}
                         />
                     </div>
 
@@ -134,7 +126,7 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             rows={3}
                             value={quoteData.notes ?? ""}
-                            onChange={e => setQuoteData(prev => ({ ...prev, notes: e.target.value }))}
+                            onChange={e => updateQuoteData(prev => ({ ...prev, notes: e.target.value }))}
                         />
                     </div>
                 </div>

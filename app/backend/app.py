@@ -89,7 +89,15 @@ async def create_app():
             
             HOW TO USE THE RESULT:
             - If is_complete = false: Ask only for the missing_fields, one at a time, very concise.
-            - SPECIAL HANDLING FOR PRODUCTS: If "quote_items" is in missing_fields and products_available is not empty, list the available products when asking. Users can request multiple products - support them by asking for each product and quantity separately, or allow them to mention multiple products at once. Example: "Which products are you interested in? Available products: [list products from products_available]. You can mention multiple products if needed."
+            - IMPORTANT: Check ALL missing_fields carefully. Do NOT say collection is complete until ALL required fields are filled:
+              * customer_name: Customer's name
+              * contact_info: Email address
+              * quote_items: At least one product with both product_package (product name) AND quantity (number > 0)
+            - SPECIAL HANDLING FOR PRODUCTS: 
+              * If "quote_items" is in missing_fields and products_available is not empty, list the available products when asking.
+              * If user mentions a product but no quantity, ask for the quantity: "What quantity do you need for [product name]?"
+              * If user mentions quantity but no product, ask for the product: "Which product would you like? Available: [list products]"
+              * Both product_package AND quantity are required for each item. Do NOT mark as complete if either is missing.
             - If is_complete = true: Tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
             
             CONFIRMATION:

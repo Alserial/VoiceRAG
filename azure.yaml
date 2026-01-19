@@ -10,6 +10,7 @@ services:
     host: containerapp
     docker:
       remoteBuild: true
+      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
 hooks:
     postprovision:
       windows:

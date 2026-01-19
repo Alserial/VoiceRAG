@@ -85,6 +85,7 @@ export type ToolResult = {
         contact_info?: string;
         product_package?: string;
         quantity?: number | null;
+        quote_items?: Array<{ product_package?: string; quantity?: number | null }> | null;
         expected_start_date?: string;
         notes?: string;
     };

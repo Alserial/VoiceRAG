@@ -19,7 +19,6 @@ export default function UserRegistrationConfirmation({
     onCancel 
 }: UserRegistrationConfirmationProps) {
     const [isSubmitting, setIsSubmitting] = useState(false);
-    const [isSuccess, setIsSuccess] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [userData, setUserData] = useState<UserRegistrationData>(initialUserData);
 
@@ -28,34 +27,15 @@ export default function UserRegistrationConfirmation({
         setError(null);
         try {
             await onConfirm(userData);
-            setIsSuccess(true);
+            // Don't set isSuccess here - let the parent component handle closing
+            // The parent will call setUserRegistrationData(null) which will close this component
+            // If we set isSuccess here, it might show success page briefly before closing
         } catch (err) {
             setError(err instanceof Error ? err.message : "Failed to register user");
         } finally {
             setIsSubmitting(false);
         }
     };
-
-    if (isSuccess) {
-        return (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
-                <div className="bg-white rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
-                    <div className="flex flex-col items-center text-center">
-                        <div className="bg-green-100 rounded-full p-3 mb-4">
-                            <Check className="h-8 w-8 text-green-600" />
-                        </div>
-                        <h2 className="text-2xl font-bold text-gray-900 mb-2">Registration Successful!</h2>
-                        <p className="text-gray-600 mb-4">
-                            Thank you, <strong>{userData.customer_name}</strong>! Your information has been registered. You can now continue with your conversation.
-                        </p>
-                        <Button onClick={onCancel} className="w-full">
-                            Continue
-                        </Button>
-                    </div>
-                </div>
-            </div>
-        );
-    }
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">

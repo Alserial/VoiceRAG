@@ -493,10 +493,14 @@ Example format (multiple products):
         quote_items = extracted_data.get("quote_items", [])
         valid_items = [
             item for item in quote_items 
-            if isinstance(item, dict) and item.get("product_package") and item.get("quantity")
+            if isinstance(item, dict) and 
+               item.get("product_package") and 
+               item.get("quantity") is not None and 
+               item.get("quantity") > 0
         ]
         if not valid_items:
             missing_fields.append("quote_items")
+            logger.info("quote_items validation failed: no valid items found. quote_items=%s", quote_items)
         
         # Prepare response (state only)
         result = {
