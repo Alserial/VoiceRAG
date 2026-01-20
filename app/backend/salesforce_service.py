@@ -375,6 +375,15 @@ class SalesforceService:
                 "Status": "Draft"
             }
             
+            # Set Pricebook2Id if configured (required for Quote Line Items)
+            pricebook_id = os.environ.get("SALESFORCE_DEFAULT_PRICEBOOK_ID")
+            if pricebook_id:
+                try:
+                    quote_data["Pricebook2Id"] = pricebook_id
+                    logger.info("Setting Pricebook2Id on Quote: %s", pricebook_id)
+                except Exception:
+                    logger.warning("Cannot set Pricebook2Id on Quote, will try without it")
+            
             # Try to set AccountId if provided, but handle permission errors gracefully
             if account_id:
                 try:
@@ -457,6 +466,8 @@ class SalesforceService:
             # Create Quote Line Items for each product (optional - only if Pricebook is configured)
             pricebook_id = os.environ.get("SALESFORCE_DEFAULT_PRICEBOOK_ID")
             items_created = 0
+            failed_items = []  # Track items that couldn't be created as line items
+            
             if pricebook_id and quote_items:
                 try:
                     for item in quote_items:
@@ -514,27 +525,130 @@ class SalesforceService:
                                         items_created += 1
                                         logger.info("Created Quote Line Item for product: %s (quantity: %s)", actual_product_name, quantity_item)
                                     else:
-                                        logger.warning("Product '%s' found but no PricebookEntry in pricebook. Skipping this product.", actual_product_name)
+                                        # PricebookEntry doesn't exist, try to create it
+                                        logger.info("Product '%s' found but no PricebookEntry in pricebook. Attempting to create PricebookEntry.", actual_product_name)
+                                        try:
+                                            # Try to get Standard Price from Standard Pricebook (ID: 01s000000000000AAA for most orgs, or query for it)
+                                            standard_pricebook_id = None
+                                            try:
+                                                standard_pricebook_result = self.sf.query(
+                                                    "SELECT Id FROM Pricebook2 WHERE IsStandard = true LIMIT 1"
+                                                )
+                                                if standard_pricebook_result["totalSize"] > 0:
+                                                    standard_pricebook_id = standard_pricebook_result["records"][0]["Id"]
+                                            except:
+                                                pass
+                                            
+                                            # Try to get price from Standard Pricebook
+                                            standard_price = None
+                                            if standard_pricebook_id:
+                                                try:
+                                                    std_entry_result = self.sf.query(
+                                                        f"SELECT UnitPrice FROM PricebookEntry WHERE Product2Id = '{product_id}' AND Pricebook2Id = '{standard_pricebook_id}' AND IsActive = true LIMIT 1"
+                                                    )
+                                                    if std_entry_result["totalSize"] > 0:
+                                                        standard_price = std_entry_result["records"][0]["UnitPrice"]
+                                                except:
+                                                    pass
+                                            
+                                            # If no standard price found, use 0 as default
+                                            if standard_price is None:
+                                                standard_price = 0
+                                                logger.info("No standard price found for product '%s', using default price 0", actual_product_name)
+                                            
+                                            # Create PricebookEntry in the specified pricebook
+                                            new_pricebook_entry_data = {
+                                                "Product2Id": product_id,
+                                                "Pricebook2Id": pricebook_id,
+                                                "UnitPrice": standard_price,
+                                                "IsActive": True
+                                            }
+                                            new_entry_result = self.sf.PricebookEntry.create(new_pricebook_entry_data)
+                                            new_pricebook_entry_id = new_entry_result["id"]
+                                            logger.info("Created new PricebookEntry for product '%s' in pricebook (Price: %s)", actual_product_name, standard_price)
+                                            
+                                            # Now create Quote Line Item with the new PricebookEntry
+                                            line_item_data = {
+                                                "QuoteId": quote_id,
+                                                "PricebookEntryId": new_pricebook_entry_id,
+                                                "Quantity": quantity_item,
+                                                "UnitPrice": standard_price
+                                            }
+                                            self.sf.QuoteLineItem.create(line_item_data)
+                                            items_created += 1
+                                            logger.info("Created Quote Line Item for product: %s (quantity: %s, price: %s)", actual_product_name, quantity_item, standard_price)
+                                        except Exception as create_error:
+                                            logger.warning("Failed to create PricebookEntry for product '%s': %s. Will add to description.", actual_product_name, str(create_error))
+                                            failed_items.append(f"{actual_product_name} (Quantity: {quantity_item})")
                                 except Exception as e:
-                                    # PricebookEntry object might not be available
-                                    logger.warning("PricebookEntry query failed for product '%s': %s. Skipping this product.", product_package_item, str(e))
+                                    # PricebookEntry query failed
+                                    logger.warning("PricebookEntry query failed for product '%s': %s. Will add to description.", product_package_item, str(e))
+                                    failed_items.append(f"{product_package_item} (Quantity: {quantity_item})")
                             else:
-                                logger.warning("Product '%s' not found. Available products: %s. Skipping this product.", 
+                                logger.warning("Product '%s' not found. Will add to description. Available products: %s", 
                                              product_package_item, 
                                              self._get_all_products())
+                                failed_items.append(f"{product_package_item} (Quantity: {quantity_item})")
                         except Exception as e:
-                            logger.warning("Failed to create Quote Line Item for product '%s': %s. Continuing with other products.", product_package_item, str(e))
+                            logger.warning("Failed to create Quote Line Item for product '%s': %s. Will add to description.", product_package_item, str(e))
+                            failed_items.append(f"{product_package_item} (Quantity: {quantity_item})")
                     
                     if items_created > 0:
                         logger.info("Created %d Quote Line Item(s) for Quote %s", items_created, quote_id)
                     else:
-                        logger.warning("No Quote Line Items were created for Quote %s", quote_id)
+                        logger.warning("No Quote Line Items were created for Quote %s. Adding products to description.", quote_id)
                 except Exception as e:
-                    logger.warning("Failed to create Quote Line Items: %s. Quote created without line items.", str(e))
+                    logger.warning("Failed to create Quote Line Items: %s. Will add products to description.", str(e))
+                    # If entire process failed, add all items to failed_items
+                    for item in quote_items:
+                        if isinstance(item, dict) and item.get("product_package"):
+                            failed_items.append(f"{item.get('product_package')} (Quantity: {item.get('quantity', 1)})")
             elif not pricebook_id:
-                logger.info("No Pricebook ID configured. Quote created without line items. This is OK - you can add line items manually in Salesforce.")
+                logger.info("No Pricebook ID configured. Quote created without line items. Adding products to description.")
+                # Add all items to description since we can't create line items
+                for item in quote_items:
+                    if isinstance(item, dict) and item.get("product_package"):
+                        failed_items.append(f"{item.get('product_package')} (Quantity: {item.get('quantity', 1)})")
             elif not quote_items:
                 logger.info("No quote items provided. Quote created without line items.")
+            
+            # If we have failed items or no line items were created, update Quote description with product information
+            if failed_items or (items_created == 0 and quote_items):
+                try:
+                    # Get current Quote to check existing description
+                    current_quote = self.sf.Quote.get(quote_id)
+                    existing_description = current_quote.get("Description", "") or ""
+                    
+                    # Build description with product information
+                    description_parts = []
+                    
+                    # Preserve existing description (notes) if it exists
+                    if existing_description:
+                        description_parts.append(existing_description)
+                    
+                    # Add requested products if we couldn't create line items for them
+                    if failed_items:
+                        if description_parts:
+                            description_parts.append("")  # Add blank line separator
+                        description_parts.append("Requested Products:")
+                        for item in failed_items:
+                            description_parts.append(f"  - {item}")
+                    
+                    # Add expected start date if not already in description
+                    if expected_start_date and "Expected Start Date" not in existing_description:
+                        if description_parts:
+                            description_parts.append("")  # Add blank line separator
+                        description_parts.append(f"Expected Start Date: {expected_start_date}")
+                    
+                    updated_description = "\n".join(description_parts)
+                    
+                    # Only update if we have something to add
+                    if failed_items or (items_created == 0 and quote_items):
+                        update_data = {"Description": updated_description}
+                        self.sf.Quote.update(quote_id, update_data)
+                        logger.info("Updated Quote %s description with product information: %s", quote_id, updated_description[:200])
+                except Exception as e:
+                    logger.warning("Failed to update Quote description with product information: %s", str(e))
             
             # Generate Quote URL
             quote_url = f"{self.instance_url}/lightning/r/Quote/{quote_id}/view"
