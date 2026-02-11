@@ -35,13 +35,13 @@ try:
     # 语音智能 / 识别相关类型（不同 SDK 版本可能略有差异，统一做兼容处理）
     try:
         from azure.communication.callautomation import (  # type: ignore
-            CallMediaRecognizeSpeechOptions,
+            PhoneNumberIdentifier,
             RecognizeInputType,
         )
     except ImportError:
-        CallMediaRecognizeSpeechOptions = None  # type: ignore[assignment]
+        PhoneNumberIdentifier = None  # type: ignore[assignment]
         RecognizeInputType = None  # type: ignore[assignment]
-        logger.info("CallMediaRecognizeSpeechOptions / RecognizeInputType not available; speech Q&A may be limited.")
+        logger.info("PhoneNumberIdentifier / RecognizeInputType not available; speech Q&A may be limited.")
     try:
         # 新版 SDK：使用 AnswerCallOptions + CallIntelligenceOptions，可以在接听时配置认知服务
         from azure.communication.callautomation import AnswerCallOptions, CallIntelligenceOptions  # type: ignore
@@ -244,7 +244,7 @@ async def handle_call_connected_event(event_data: Dict[str, Any]) -> None:
             logger.info("   Updated call status to 'connected'")
             
             # 播放欢迎语音（固定文案 / 之后可换成 GPT 文本）
-            # 注意：识别会在欢迎语播放完成后自动启动（在 handle_play_completed_event 中处理）
+            # 识别在欢迎语播放完成后自动启动（在 handle_play_completed_event 中处理）
             await play_welcome_message(call_connection_id)
         else:
             logger.warning("   Call connection ID not found in active calls")
@@ -334,7 +334,7 @@ async def handle_play_failed_event(event_data: Dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
+async def handle_recognize_completed(event_data: Dict[str, Any]) -> None:
     """
     处理语音识别完成事件：
     1. 从事件里拿到用户说的话（转成的文本）
@@ -419,6 +419,11 @@ async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
         except Exception:
             call_connection_id = None
         await speak_error_message(call_connection_id, debug_tag="recognize-completed-exception")
+
+
+async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
+    """兼容旧调用路径，转发到新的处理函数。"""
+    await handle_recognize_completed(event_data)
 
 
 async def handle_recognize_failed_event(event_data: Dict[str, Any]) -> None:
@@ -692,8 +697,9 @@ async def start_speech_recognition(call_connection_id: str) -> None:
     """
     启动一次语音识别（让 ACS + Speech 听用户说话），结果通过
     Microsoft.Communication.RecognizeCompleted 事件回调。
-    
-    使用正确的 API：call_connection.start_recognizing_media() 直接传参。
+
+    使用 ACS Call Automation 推荐签名：
+    start_recognizing_media(RecognizeInputType.SPEECH, target_participant, ...)
     """
     acs_client = get_acs_client()
     if not acs_client:
@@ -701,128 +707,32 @@ async def start_speech_recognition(call_connection_id: str) -> None:
         return
 
     try:
+        if RecognizeInputType is None or PhoneNumberIdentifier is None:
+            logger.error("❌ SDK missing RecognizeInputType/PhoneNumberIdentifier, cannot start recognition")
+            await speak_error_message(call_connection_id, debug_tag="start-recognize-sdk-missing")
+            return
+
         call_connection = acs_client.get_call_connection(call_connection_id)
-
         call_info = _active_acs_calls.get(call_connection_id, {})
-        caller_id_str = call_info.get("caller_id")
-        caller_info = call_info.get("caller_info", {})
+        caller_phone = call_info.get("caller_id")
 
-        # 优先从当前通话参与者列表中获取识别目标，避免自己手动拼标识符失败
-        caller = None
-        try:
-            participants = call_connection.list_participants()
-            if participants:
-                for participant in participants:
-                    identifier = (
-                        getattr(participant, "identifier", None)
-                        or getattr(participant, "participant", None)
-                        or participant
-                    )
-                    if identifier:
-                        # 过滤掉机器人的 participant，优先找来电方
-                        raw_id = getattr(identifier, "raw_id", "") or getattr(identifier, "rawId", "")
-                        if raw_id and "8:acs:" in str(raw_id).lower():
-                            continue
-                        caller = identifier
-                        logger.info("   Recognition target resolved from list_participants(): %s", identifier)
-                        break
-        except Exception as participant_err:
-            logger.warning("Failed to resolve target from list_participants(): %s", str(participant_err))
-
-        # 如果 list_participants 拿不到，则回退为从来电事件数据构造
-        # 需要将 caller_id 字符串转换为 CommunicationIdentifier 对象
-        try:
-            from azure.communication.callautomation import CommunicationIdentifier, PhoneNumberIdentifier
-            
-            # 优先从 caller_info 构造（如果 SDK 支持）
-            if caller is None and caller_info and isinstance(caller_info, dict):
-                # 尝试从 phoneNumber 构造
-                phone_number = caller_info.get("phoneNumber", {}).get("value")
-                if phone_number:
-                    try:
-                        caller = PhoneNumberIdentifier(phone_number)  # type: ignore[call-arg]
-                        logger.info("   Constructed PhoneNumberIdentifier from phoneNumber: %s", phone_number)
-                    except (TypeError, AttributeError):
-                        pass
-                
-                # 如果 PhoneNumberIdentifier 失败，尝试从 rawId 构造
-                if caller is None:
-                    raw_id = caller_info.get("rawId") or caller_id_str
-                    if raw_id:
-                        try:
-                            # 某些 SDK 版本可能支持 from_raw_id
-                            if hasattr(CommunicationIdentifier, "from_raw_id"):
-                                caller = CommunicationIdentifier.from_raw_id(raw_id)  # type: ignore[attr-defined]
-                            else:
-                                # 如果 SDK 不支持 from_raw_id，尝试直接传字符串
-                                caller = raw_id
-                        except (AttributeError, TypeError):
-                            caller = raw_id
-            
-            # 如果上面都失败了，直接使用 caller_id_str
-            if caller is None:
-                caller = caller_id_str
-                logger.warning("   Using caller_id string directly: %s", caller_id_str)
-                
-        except ImportError as import_err:
-            # 如果无法导入 CommunicationIdentifier，尝试直接传字符串
-            logger.warning("CommunicationIdentifier not available (%s), using caller_id string directly", str(import_err))
-            caller = caller_id_str
-
-        logger.info("🎧 Starting speech recognition for call: %s, target: %s", call_connection_id, caller)
-
-        # 1️⃣ 优先使用 CallMediaRecognizeSpeechOptions（如果在当前 SDK 中可用）
-        if "CallMediaRecognizeSpeechOptions" in globals() and CallMediaRecognizeSpeechOptions is not None:  # type: ignore[name-defined]
-            try:
-                kwargs: Dict[str, Any] = {
-                    "target_participant": caller,
-                }
-                if "RecognizeInputType" in globals() and RecognizeInputType is not None:  # type: ignore[name-defined]
-                    kwargs["input_type"] = RecognizeInputType.SPEECH  # type: ignore[assignment]
-                # 识别语言
-                kwargs["speech_language"] = "en-US"
-
-                options = CallMediaRecognizeSpeechOptions(**kwargs)  # type: ignore[call-arg]
-                logger.info("Using CallMediaRecognizeSpeechOptions to start recognition.")
-
-                try:
-                    call_connection.start_recognizing_media(options)  # type: ignore[arg-type,attr-defined]
-                    logger.info("✅ Speech recognition started (with options, waiting for RecognizeCompleted event)")
-                    return
-                except Exception as start_err:
-                    logger.error("Failed to start recognizing with options: %s", str(start_err))
-                    import traceback
-                    logger.error("Traceback: %s", traceback.format_exc())
-                    # 退回到 kwargs 方式
-            except TypeError as opt_err:
-                logger.error("Failed to construct CallMediaRecognizeSpeechOptions, error=%s", str(opt_err))
-                logger.error("Falling back to kwargs signature for start_recognizing_media().")
-
-        # 2️⃣ 回退：直接使用 kwargs 调用 start_recognizing_media
-        try:
-            kwargs2: Dict[str, Any] = {
-                "target_participant": caller,
-                "speech_language": "en-US",
-                "operation_context": "user-speech",
-            }
-            if "RecognizeInputType" in globals() and RecognizeInputType is not None:  # type: ignore[name-defined]
-                kwargs2["input_type"] = RecognizeInputType.SPEECH  # type: ignore[assignment]
-
-            call_connection.start_recognizing_media(**kwargs2)  # type: ignore[attr-defined]
-            logger.info("✅ Speech recognition started (kwargs, waiting for RecognizeCompleted event)")
-        except TypeError as type_err:
-            logger.error("TypeError in start_recognizing_media, error=%s", str(type_err))
-            logger.error("This might be due to parameter name mismatch. Please check SDK docs.")
-            import traceback
-            logger.error("Traceback: %s", traceback.format_exc())
-            await speak_error_message(call_connection_id, debug_tag="start-recognize-call")
+        if not caller_phone:
+            logger.error("❌ Missing caller phone for call %s", call_connection_id)
+            await speak_error_message(call_connection_id, debug_tag="start-recognize-missing-caller")
             return
-        except Exception as start_err:
-            logger.error("Failed to start recognizing: %s", str(start_err))
-            import traceback
-            logger.error("Traceback: %s", traceback.format_exc())
-            await speak_error_message(call_connection_id, debug_tag="start-recognize-call")
-            return
+
+        caller_identifier = PhoneNumberIdentifier(caller_phone)  # type: ignore[call-arg]
+        logger.info("🎧 Starting speech recognition for call %s, caller=%s", call_connection_id, caller_phone)
+
+        call_connection.start_recognizing_media(
+            RecognizeInputType.SPEECH,
+            caller_identifier,
+            speech_language="en-AU",
+            initial_silence_timeout=5,
+            end_silence_timeout=2,
+            operation_context="listen-user",
+        )
+        logger.info("✅ Speech recognition started (waiting for RecognizeCompleted event)")
 
     except Exception as e:
         logger.error("❌ Error in start_speech_recognition: %s", str(e))
@@ -1017,7 +927,7 @@ async def handle_acs_webhook(request: web.Request) -> web.Response:
             
             # 处理语音识别完成事件（电话 Q&A 的入口）
             elif event_type == "Microsoft.Communication.RecognizeCompleted":
-                await handle_recognize_completed_event(event_data)
+                await handle_recognize_completed(event_data)
 
             # 处理语音识别失败事件
             elif event_type == "Microsoft.Communication.RecognizeFailed":
@@ -1202,6 +1112,5 @@ if __name__ == "__main__":
             logger.info("Please check your ACS_CONNECTION_STRING environment variable")
     
     asyncio.run(main())
-
 
 
