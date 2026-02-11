@@ -118,13 +118,20 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
         
         # 从事件数据中提取来电信息
         from_info = data.get("from", {})
-        caller_id = from_info.get("rawId", from_info.get("phoneNumber", {}).get("value", "unknown"))
         to_info = data.get("to", {})
-        recipient_id = to_info.get("rawId", to_info.get("phoneNumber", {}).get("value", "unknown"))
+        
+        # 提取真正的电话号码（用于语音识别的 target_participant）
+        caller_phone = from_info.get("phoneNumber", {}).get("value")
+        recipient_phone = to_info.get("phoneNumber", {}).get("value")
+        
+        # 也保存 rawId（用于日志/调试）
+        caller_raw_id = from_info.get("rawId", "")
+        recipient_raw_id = to_info.get("rawId", "")
         
         logger.info("📞 Incoming Call:")
-        logger.info("   Caller: %s", caller_id)
-        logger.info("   Recipient: %s", recipient_id)
+        logger.info("   Caller Phone: %s", caller_phone or "unknown")
+        logger.info("   Caller RawId: %s", caller_raw_id or "unknown")
+        logger.info("   Recipient Phone: %s", recipient_phone or "unknown")
         logger.info("   Incoming Call Context: %s...", incoming_call_context[:50] if incoming_call_context else "None")
         
         if not incoming_call_context:
@@ -200,12 +207,14 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
         if answer_result and hasattr(answer_result, 'call_connection_id'):
             call_connection_id = answer_result.call_connection_id
             
-            # 记录活跃通话（保存完整的 caller 信息，用于后续语音识别）
+            # 记录活跃通话（保存真正的电话号码，用于后续语音识别的 target_participant）
             _active_acs_calls[call_connection_id] = {
                 "call_connection_id": call_connection_id,
-                "caller_id": caller_id,
-                "caller_info": from_info,  # 保存完整的 from_info，用于构造 CommunicationIdentifier
-                "recipient_id": recipient_id,
+                "caller_phone": caller_phone,  # 真正的电话号码，如 "+8615397262726"，用于 PhoneNumberIdentifier
+                "caller_raw_id": caller_raw_id,  # rawId 如 "4:+613..."，仅用于日志/调试
+                "caller_info": from_info,  # 保存完整的 from_info，用于兜底
+                "recipient_phone": recipient_phone,
+                "recipient_raw_id": recipient_raw_id,
                 "status": "answered",
                 "started_at": time.time()
             }
@@ -216,7 +225,7 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
             return {
                 "success": True,
                 "call_connection_id": call_connection_id,
-                "caller_id": caller_id,
+                "caller_phone": caller_phone,
                 "message": "Call answered successfully"
             }
         else:
@@ -467,9 +476,12 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
     openai_deployment = (
         os.environ.get("AZURE_OPENAI_DEPLOYMENT")
         or os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
-        or "gpt-4o"
+        or "gpt-4o-mini"
     )
     llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    # 立即输出使用的模型信息
+    logger.info("🤖 GPT Model Configuration - Deployment: %s, Endpoint: %s", openai_deployment, openai_endpoint or "NOT SET")
 
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using fallback answer.")
@@ -501,6 +513,7 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
             "Keep each answer under 3 sentences."
         )
 
+        logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
         logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
         response = client.chat.completions.create(
             model=openai_deployment,
@@ -553,6 +566,9 @@ async def generate_welcome_text_with_gpt() -> str:
     )
     llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
 
+    # 立即输出使用的模型信息
+    logger.info("🤖 GPT Model Configuration (Welcome) - Deployment: %s, Endpoint: %s", openai_deployment, openai_endpoint or "NOT SET")
+
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using default welcome text.")
         return default_text
@@ -584,6 +600,7 @@ async def generate_welcome_text_with_gpt() -> str:
             "Return ONLY the sentence, without quotes, explanations or extra text."
         )
 
+        logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
         logger.info("Calling Azure OpenAI to generate welcome text using deployment: %s", openai_deployment)
         response = client.chat.completions.create(
             model=openai_deployment,
@@ -717,23 +734,33 @@ async def start_speech_recognition(call_connection_id: str) -> None:
 
         call_connection = acs_client.get_call_connection(call_connection_id)
         call_info = _active_acs_calls.get(call_connection_id, {})
-        caller_phone = call_info.get("caller_id")
-
+        
+        # 优先使用保存的真正电话号码
+        caller_phone = call_info.get("caller_phone")
+        
+        # 兜底：如果只有 rawId（如 "4:+613..."），strip 掉 "4:" 前缀
         if not caller_phone:
-            logger.error("❌ Missing caller phone for call %s", call_connection_id)
-            await speak_error_message(call_connection_id, debug_tag="start-recognize-missing-caller")
-            return
+            caller_raw_id = call_info.get("caller_raw_id", "")
+            if isinstance(caller_raw_id, str) and caller_raw_id.startswith("4:"):
+                caller_phone = caller_raw_id[2:]  # 去掉 "4:" 前缀，得到 "+613..."
+                logger.warning("Using caller_phone extracted from rawId (stripped '4:'): %s", caller_phone)
+            else:
+                logger.error("❌ Missing caller phone for call %s (caller_phone=%s, caller_raw_id=%s)", 
+                           call_connection_id, caller_phone, caller_raw_id)
+                await speak_error_message(call_connection_id, debug_tag="start-recognize-missing-caller")
+                return
 
+        # 使用真正的电话号码构造 PhoneNumberIdentifier（不能用 rawId）
         caller_identifier = PhoneNumberIdentifier(caller_phone)  # type: ignore[call-arg]
-        logger.info("🎧 Starting speech recognition for call %s, caller=%s", call_connection_id, caller_phone)
+        logger.info("🎧 Starting speech recognition for call %s, caller_phone=%s", call_connection_id, caller_phone)
 
         call_connection.start_recognizing_media(
-            RecognizeInputType.SPEECH,
+            RecognizeInputType.SPEECH,  # type: ignore[name-defined]
             caller_identifier,
-            speech_language="en-AU",
-            initial_silence_timeout=5,
-            end_silence_timeout=2,
-            operation_context="listen-user",
+            speech_language="en-US",  # 改为 en-US 匹配你的 TTS 配置
+            initial_silence_timeout=10,  # 等对方开口的秒数
+            end_silence_timeout=2,  # 停顿多久算一句结束
+            operation_context="user-speech",
         )
         logger.info("✅ Speech recognition started (waiting for RecognizeCompleted event)")
 
