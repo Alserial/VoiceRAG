@@ -17,12 +17,10 @@ Azure Communication Services (ACS) Call Automation Handler
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
-from uuid import uuid4
 import time
-import aiohttp
+from typing import Any, Optional
+
 from aiohttp import web
-from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
 
 # 先获取 logger，供后续导入失败时使用
@@ -44,7 +42,10 @@ try:
         logger.info("PhoneNumberIdentifier / RecognizeInputType not available; speech Q&A may be limited.")
     try:
         # 新版 SDK：使用 AnswerCallOptions + CallIntelligenceOptions，可以在接听时配置认知服务
-        from azure.communication.callautomation import AnswerCallOptions, CallIntelligenceOptions  # type: ignore
+        from azure.communication.callautomation import (  # type: ignore
+            AnswerCallOptions,
+            CallIntelligenceOptions,
+        )
     except ImportError:
         AnswerCallOptions = None  # type: ignore[assignment]
         CallIntelligenceOptions = None  # type: ignore[assignment]
@@ -59,7 +60,7 @@ except ImportError as e:
     CallIntelligenceOptions = None  # type: ignore[assignment]
 
 # 存储活跃通话
-_active_acs_calls: Dict[str, Dict[str, Any]] = {}
+_active_acs_calls: dict[str, dict[str, Any]] = {}
 
 # ACS 客户端（全局单例）
 _acs_client: Optional[CallAutomationClient] = None
@@ -93,7 +94,7 @@ def get_acs_client() -> Optional[CallAutomationClient]:
         return None
 
 
-async def handle_incoming_call_event(event_data: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, Any]:
     """
     处理来电事件 - 自动接听电话
     
@@ -230,7 +231,7 @@ async def handle_incoming_call_event(event_data: Dict[str, Any]) -> Dict[str, An
         return {"error": str(e)}
 
 
-async def handle_call_connected_event(event_data: Dict[str, Any]) -> None:
+async def handle_call_connected_event(event_data: dict[str, Any]) -> None:
     """处理通话已连接事件"""
     try:
         # callConnectionId 在 data 字段中
@@ -255,7 +256,7 @@ async def handle_call_connected_event(event_data: Dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def handle_call_disconnected_event(event_data: Dict[str, Any]) -> None:
+async def handle_call_disconnected_event(event_data: dict[str, Any]) -> None:
     """处理通话断开事件"""
     try:
         # callConnectionId 在 data 字段中
@@ -268,7 +269,7 @@ async def handle_call_disconnected_event(event_data: Dict[str, Any]) -> None:
         logger.info("   Reason: %s", disconnect_reason)
         
         if call_connection_id and call_connection_id in _active_acs_calls:
-            call_info = _active_acs_calls.pop(call_connection_id)
+            _active_acs_calls.pop(call_connection_id)
             logger.info("   Removed call from active calls: %s", call_connection_id)
         else:
             logger.warning("   Call connection ID not found in active calls")
@@ -279,7 +280,7 @@ async def handle_call_disconnected_event(event_data: Dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def handle_play_completed_event(event_data: Dict[str, Any]) -> None:
+async def handle_play_completed_event(event_data: dict[str, Any]) -> None:
     """处理音频播放完成事件"""
     try:
         event_data_obj = event_data.get("data", {})
@@ -308,7 +309,7 @@ async def handle_play_completed_event(event_data: Dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def handle_play_failed_event(event_data: Dict[str, Any]) -> None:
+async def handle_play_failed_event(event_data: dict[str, Any]) -> None:
     """处理音频播放失败事件（详细打印 Cognitive Services 错误信息）"""
     try:
         data = event_data.get("data", {}) or {}
@@ -334,7 +335,7 @@ async def handle_play_failed_event(event_data: Dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def handle_recognize_completed(event_data: Dict[str, Any]) -> None:
+async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
     """
     处理语音识别完成事件：
     1. 从事件里拿到用户说的话（转成的文本）
@@ -421,12 +422,12 @@ async def handle_recognize_completed(event_data: Dict[str, Any]) -> None:
         await speak_error_message(call_connection_id, debug_tag="recognize-completed-exception")
 
 
-async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
+async def handle_recognize_completed_event(event_data: dict[str, Any]) -> None:
     """兼容旧调用路径，转发到新的处理函数。"""
     await handle_recognize_completed(event_data)
 
 
-async def handle_recognize_failed_event(event_data: Dict[str, Any]) -> None:
+async def handle_recognize_failed_event(event_data: dict[str, Any]) -> None:
     """处理语音识别失败事件，主要用于日志排查"""
     try:
         data = event_data.get("data", {}) or {}
@@ -455,9 +456,9 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
     fallback = "I am sorry, I could not process your question. Please try again later."
 
     try:
-        from openai import AzureOpenAI
         from azure.core.credentials import AzureKeyCredential
         from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
     except Exception as e:
         logger.warning("Azure OpenAI SDK not available, using fallback answer. Error: %s", str(e))
         return fallback
@@ -536,9 +537,9 @@ async def generate_welcome_text_with_gpt() -> str:
 
     try:
         # 延迟导入，避免在没装 openai 包时直接崩溃
-        from openai import AzureOpenAI
         from azure.core.credentials import AzureKeyCredential
         from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
     except Exception as e:
         logger.warning("Azure OpenAI SDK not available, using default welcome text. Error: %s", str(e))
         return default_text
@@ -652,7 +653,9 @@ async def play_welcome_message(call_connection_id: str) -> None:
         except ImportError:
             # 方法 2: 尝试从 models 导入（某些 SDK 版本可能在这里）
             try:
-                from azure.communication.callautomation.models import TextSource  # type: ignore
+                from azure.communication.callautomation.models import (
+                    TextSource,  # type: ignore
+                )
                 text_source = TextSource(
                     text=welcome_text,
                     voice_name="en-US-JennyNeural",
@@ -768,7 +771,9 @@ async def play_answer_message(call_connection_id: str, answer_text: str) -> None
             logger.info("   Using TextSource from main module for answer")
         except ImportError:
             try:
-                from azure.communication.callautomation.models import TextSource  # type: ignore
+                from azure.communication.callautomation.models import (
+                    TextSource,  # type: ignore
+                )
                 text_source = TextSource(
                     text=answer_text,
                     voice_name="en-US-JennyNeural",
@@ -826,7 +831,9 @@ async def speak_error_message(call_connection_id: Optional[str], debug_tag: str 
             )
         except ImportError:
             try:
-                from azure.communication.callautomation.models import TextSource  # type: ignore
+                from azure.communication.callautomation.models import (
+                    TextSource,  # type: ignore
+                )
                 text_source = TextSource(
                     text=error_text,
                     voice_name="en-US-JennyNeural",
