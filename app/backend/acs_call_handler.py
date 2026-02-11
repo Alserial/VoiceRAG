@@ -361,7 +361,17 @@ async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
                 return ""
             if isinstance(obj, dict):
                 # 常见字段名
-                for key in ("transcript", "text", "recognizedSpeech", "speechText", "displayText"):
+                for key in (
+                    "transcript",
+                    "text",
+                    "recognizedSpeech",
+                    "speechText",
+                    "displayText",
+                    "speech",
+                    "lexical",
+                    "itn",
+                    "maskedItn",
+                ):
                     if key in obj and isinstance(obj[key], str) and obj[key].strip():
                         return obj[key]
                 for v in obj.values():
@@ -382,6 +392,9 @@ async def handle_recognize_completed_event(event_data: Dict[str, Any]) -> None:
 
         if not user_text:
             logger.warning("RecognizeCompleted received but no transcript text found.")
+            if call_connection_id:
+                logger.info("Restarting speech recognition because transcript was empty.")
+                await start_speech_recognition(call_connection_id)
             return
 
         logger.info("User said (transcript): %s", user_text)
@@ -693,15 +706,36 @@ async def start_speech_recognition(call_connection_id: str) -> None:
         call_info = _active_acs_calls.get(call_connection_id, {})
         caller_id_str = call_info.get("caller_id")
         caller_info = call_info.get("caller_info", {})
-        
-        # 需要将 caller_id 字符串转换为 CommunicationIdentifier 对象
-        # 尝试导入并构造
+
+        # 优先从当前通话参与者列表中获取识别目标，避免自己手动拼标识符失败
         caller = None
+        try:
+            participants = call_connection.list_participants()
+            if participants:
+                for participant in participants:
+                    identifier = (
+                        getattr(participant, "identifier", None)
+                        or getattr(participant, "participant", None)
+                        or participant
+                    )
+                    if identifier:
+                        # 过滤掉机器人的 participant，优先找来电方
+                        raw_id = getattr(identifier, "raw_id", "") or getattr(identifier, "rawId", "")
+                        if raw_id and "8:acs:" in str(raw_id).lower():
+                            continue
+                        caller = identifier
+                        logger.info("   Recognition target resolved from list_participants(): %s", identifier)
+                        break
+        except Exception as participant_err:
+            logger.warning("Failed to resolve target from list_participants(): %s", str(participant_err))
+
+        # 如果 list_participants 拿不到，则回退为从来电事件数据构造
+        # 需要将 caller_id 字符串转换为 CommunicationIdentifier 对象
         try:
             from azure.communication.callautomation import CommunicationIdentifier, PhoneNumberIdentifier
             
             # 优先从 caller_info 构造（如果 SDK 支持）
-            if caller_info and isinstance(caller_info, dict):
+            if caller is None and caller_info and isinstance(caller_info, dict):
                 # 尝试从 phoneNumber 构造
                 phone_number = caller_info.get("phoneNumber", {}).get("value")
                 if phone_number:
@@ -1168,7 +1202,6 @@ if __name__ == "__main__":
             logger.info("Please check your ACS_CONNECTION_STRING environment variable")
     
     asyncio.run(main())
-
 
 
 
