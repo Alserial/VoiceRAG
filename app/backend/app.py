@@ -18,6 +18,15 @@ from teams_calling import TeamsCaller
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voicerag")
 
+# 延迟导入 ACS handler，避免导入失败导致应用无法启动
+try:
+    from acs_call_handler import register_acs_routes
+    _acs_handler_available = True
+except ImportError as e:
+    logger.warning("ACS call handler not available: %s", str(e))
+    _acs_handler_available = False
+    register_acs_routes = None
+
 # Store active calls: call_id -> call_info
 _active_calls: dict[str, dict] = {}
 
@@ -41,7 +50,7 @@ async def create_app():
     search_credential = AzureKeyCredential(search_key) if search_key else credential
     
     app = web.Application()
-
+    
     # Initialize RTMiddleTier only if Azure OpenAI configuration is available
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     openai_deployment = os.environ.get("AZURE_OPENAI_REALTIME_DEPLOYMENT")
@@ -662,6 +671,31 @@ async def create_app():
         logger.info("Teams calling API endpoints registered")
 
     app.add_routes(routes)
+    
+    # 注册 ACS Call Automation 路由（在 add_static 之前，避免路由冲突）
+    if _acs_handler_available and register_acs_routes:
+        try:
+            logger.info("About to call register_acs_routes(app)...")
+            register_acs_routes(app)
+            logger.info("ACS call handler routes registered successfully")
+            
+            # 验证路由是否真的被添加
+            acs_routes_found = []
+            for route in app.router.routes():
+                route_str = str(route)
+                if '/api/acs' in route_str:
+                    acs_routes_found.append(route_str)
+            logger.info("Verified ACS routes in app.router: %s", acs_routes_found)
+        except Exception as e:
+            logger.error("Failed to register ACS routes: %s", str(e))
+            import traceback
+            logger.error("Traceback: %s", traceback.format_exc())
+    else:
+        logger.info("ACS call handler not available, skipping route registration")
+        logger.info("  _acs_handler_available: %s", _acs_handler_available)
+        logger.info("  register_acs_routes is None: %s", register_acs_routes is None)
+    
+    # 静态文件路由放在最后（避免覆盖 API 路由）
     app.router.add_static('/', path=current_directory / 'static', name='static')
     
     return app
