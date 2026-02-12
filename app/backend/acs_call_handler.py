@@ -673,6 +673,7 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             bool(quote_state),
             bool(quote_state.get("is_complete")),
         )
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
         quote_updated = False
 
         # 用户请求修改已提供信息
@@ -697,6 +698,10 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             )
 
         # 用户询问"之前填写了什么"时，优先用当前已提取状态回答（支持部分字段回顾）
+=======
+
+        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
+>>>>>>> main
         is_recall_question = behavior == "recall_quote_info"
         logger.info("🔍 BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
                    behavior, is_recall_question, bool(quote_state))
@@ -721,6 +726,11 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         is_quote_request = behavior == "quote_request"
         logger.info("🔍 BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
                    behavior, is_quote_request, call_connection_id is not None)
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
+=======
+        quote_updated = False
+        
+>>>>>>> main
         if is_quote_request and call_connection_id:
             logger.info("➡️  BRANCH: Entering QUOTE REQUEST branch")
             # 提取报价信息
@@ -1084,6 +1094,7 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
 
     try:
         from openai import AzureOpenAI
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
 
         if llm_key:
             client = AzureOpenAI(
@@ -1101,6 +1112,25 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
                 azure_endpoint=openai_endpoint,
             )
 
+=======
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+>>>>>>> main
         behavior = await _classify_user_behavior_with_llm(
             client=client,
             deployment=openai_deployment,

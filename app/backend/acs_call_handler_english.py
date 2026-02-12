@@ -674,30 +674,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             bool(quote_state),
             bool(quote_state.get("is_complete")),
         )
-        quote_updated = False
 
-        # User requests to modify previously provided quote info
-        is_modify_request = behavior == "modify_quote_info"
-        if quote_state and is_modify_request:
-            logger.info("BRANCH: Entering QUOTE MODIFY branch")
-            quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
-            quote_updated = True
-            if call_connection_id in _active_acs_calls:
-                _active_acs_calls[call_connection_id]["quote_state"] = quote_state
-
-            missing_fields = quote_state.get("missing_fields", [])
-            if missing_fields:
-                follow_up = _generate_quote_collection_response(missing_fields, quote_state)
-                return f"Got it, I updated the quote details. {follow_up}", quote_updated
-
-            recap = _build_quote_confirmation_recap(quote_state)
-            return (
-                f"Got it, I updated the quote details. {recap} "
-                "Please say 'confirm' or 'yes' to create the quote, or tell me what you'd like to change.",
-                quote_updated,
-            )
-
-        # When user asks to recap, support one or multiple requested fields
+        # When user asks "what did I provide", prioritize using current extracted state to answer
         is_recall_question = behavior == "recall_quote_info"
         logger.info("BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
                    behavior, is_recall_question, bool(quote_state))
@@ -722,6 +700,11 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         is_quote_request = behavior == "quote_request"
         logger.info("BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
                    behavior, is_quote_request, call_connection_id is not None)
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
+=======
+        quote_updated = False
+        
+>>>>>>> main
         if is_quote_request and call_connection_id:
             logger.info("BRANCH: Entering QUOTE REQUEST branch")
             # Extract quote information
@@ -1140,6 +1123,7 @@ async def _classify_user_behavior_with_llm(
         "Return JSON only with field 'behavior'.\n"
         "Allowed behaviors:\n"
         "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
         "- recall_quote_info: user asks to repeat/recap one or more previously provided fields.\n"
         "- modify_quote_info: user wants to change one or more previously provided quote fields.\n"
         "- general_qa: regular Q&A not about quote flow.\n"
@@ -1149,6 +1133,15 @@ async def _classify_user_behavior_with_llm(
         "3) If user is giving initial details for quote flow or asking for a quote, choose quote_request.\n"
         "4) If not quote related, choose general_qa.\n"
         "5) Use conversation context, not keywords only."
+=======
+        "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
+        "- general_qa: regular Q&A not about quote flow.\n"
+        "Rules:\n"
+        "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
+        "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
+        "3) If not quote related, choose general_qa.\n"
+        "4) Use conversation context, not keywords only."
+>>>>>>> main
     )
 
     payload = {
@@ -1172,7 +1165,11 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
         if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
+=======
+        if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
+>>>>>>> main
             logger.info("LLM behavior classification: %s", behavior)
             return behavior
         logger.warning("Unknown behavior from classifier: %s", behavior)
