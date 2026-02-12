@@ -417,10 +417,42 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                 "call_connection_id": call_connection_id,
                 "status": "active",
             }
+            logger.info("📞 Initialized new call state for: %s", call_connection_id)
         
         # 处理报价逻辑
         if call_connection_id:
-            quote_state = _active_acs_calls.get(call_connection_id, {}).get("quote_state", {})
+            call_info = _active_acs_calls.get(call_connection_id, {})
+            quote_state = call_info.get("quote_state", {})
+            conversation_history = call_info.get("conversation_history", [])
+            
+            # 打印当前对话历史
+            logger.info("=" * 80)
+            logger.info("📝 CONVERSATION HISTORY (call: %s, messages: %d)", call_connection_id, len(conversation_history))
+            for idx, msg in enumerate(conversation_history[-5:], 1):  # 只打印最近 5 条
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")[:100]  # 截断到 100 字符
+                logger.info("  [%d] %s: %s", idx, role.upper(), content)
+            logger.info("=" * 80)
+            
+            # 打印当前报价状态
+            if quote_state:
+                logger.info("📋 CURRENT QUOTE STATE (call: %s)", call_connection_id)
+                extracted = quote_state.get("extracted", {})
+                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
+                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
+                quote_items = extracted.get("quote_items", [])
+                if quote_items:
+                    logger.info("  - Quote Items (%d):", len(quote_items))
+                    for item in quote_items:
+                        logger.info("      * %s x %s", item.get("product_package", "N/A"), item.get("quantity", "N/A"))
+                else:
+                    logger.info("  - Quote Items: NOT SET")
+                logger.info("  - Expected Start Date: %s", extracted.get("expected_start_date") or "NOT SET")
+                logger.info("  - Notes: %s", extracted.get("notes") or "NOT SET")
+                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
+                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
+            else:
+                logger.info("📋 NO QUOTE STATE (call: %s) - Regular conversation", call_connection_id)
             
             # 先更新报价状态（提取信息）
             answer_text, quote_updated = await generate_answer_text_with_gpt(
@@ -428,14 +460,55 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             )
             
             # 重新获取更新后的报价状态
-            quote_state = _active_acs_calls.get(call_connection_id, {}).get("quote_state", {})
+            updated_call_info = _active_acs_calls.get(call_connection_id, {})
+            quote_state = updated_call_info.get("quote_state", {})
+            updated_conversation = updated_call_info.get("conversation_history", [])
+            
+            # 打印更新后的对话历史
+            if len(updated_conversation) > len(conversation_history):
+                logger.info("📝 UPDATED CONVERSATION HISTORY (call: %s, total messages: %d)", 
+                          call_connection_id, len(updated_conversation))
+                for idx, msg in enumerate(updated_conversation[-3:], len(updated_conversation) - 2):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")[:100]
+                    logger.info("  [%d] %s: %s", idx, role.upper(), content)
+            
+            # 打印更新后的报价状态
+            if quote_state:
+                logger.info("📋 UPDATED QUOTE STATE (call: %s)", call_connection_id)
+                extracted = quote_state.get("extracted", {})
+                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
+                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
+                quote_items = extracted.get("quote_items", [])
+                if quote_items:
+                    logger.info("  - Quote Items (%d):", len(quote_items))
+                    for item in quote_items:
+                        logger.info("      * %s x %s", item.get("product_package", "N/A"), item.get("quantity", "N/A"))
+                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
+                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
             # 检查是否是报价确认（用户说 "confirm", "yes", "send" 等）
-            if quote_state.get("is_complete") and _is_confirmation(user_text):
+            is_confirmation = _is_confirmation(user_text)
+            logger.info("🔍 BRANCH: Confirmation check - user_text='%s', is_confirmation=%s, is_complete=%s", 
+                       user_text, is_confirmation, quote_state.get("is_complete", False))
+            
+            if quote_state.get("is_complete") and is_confirmation:
+                logger.info("➡️  BRANCH: Entering QUOTE CONFIRMATION branch (creating quote)")
                 # 用户确认报价，创建报价
-                logger.info("📋 User confirmed quote request, creating quote in Salesforce...")
+                logger.info("=" * 80)
+                logger.info("📋 USER CONFIRMED QUOTE REQUEST - Creating quote in Salesforce...")
+                logger.info("  Call ID: %s", call_connection_id)
+                extracted = quote_state.get("extracted", {})
+                logger.info("  Quote Details:")
+                logger.info("    - Customer: %s", extracted.get("customer_name"))
+                logger.info("    - Contact: %s", extracted.get("contact_info"))
+                quote_items = extracted.get("quote_items", [])
+                for item in quote_items:
+                    logger.info("    - Product: %s x %s", item.get("product_package"), item.get("quantity"))
+                logger.info("=" * 80)
                 quote_result = await create_quote_from_state(call_connection_id, quote_state)
                 if quote_result:
+                    logger.info("➡️  SUB-BRANCH: Quote creation SUCCESS")
                     answer_text = (
                         f"Great! I've created your quote. "
                         f"The quote number is {quote_result.get('quote_number', 'N/A')}. "
@@ -445,12 +518,15 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                     # 清除报价状态
                     if call_connection_id in _active_acs_calls:
                         _active_acs_calls[call_connection_id].pop("quote_state", None)
+                        logger.info("🧹 Cleared quote_state after successful creation")
                 else:
+                    logger.info("➡️  SUB-BRANCH: Quote creation FAILED")
                     answer_text = (
                         "I'm sorry, I couldn't create the quote at this time. "
                         "Please try again later or contact our support team."
                     )
             elif quote_updated and quote_state.get("is_complete"):
+                logger.info("➡️  BRANCH: Entering QUOTE COMPLETE (waiting for confirmation) branch")
                 # 报价信息已完整，确认前先完整复述
                 recap = _build_quote_confirmation_recap(quote_state)
                 answer_text = (
@@ -458,7 +534,10 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                     "Please say 'confirm' or 'yes' to create the quote, "
                     "or let me know if you'd like to make any changes."
                 )
+            else:
+                logger.info("➡️  BRANCH: Entering REGULAR FLOW branch (no confirmation needed)")
         else:
+            logger.info("➡️  BRANCH: Entering SIMPLE MODE branch (no call_connection_id)")
             # 没有 call_connection_id，使用简单模式
             answer_text, _ = await generate_answer_text_with_gpt(user_text, None)
 
@@ -574,47 +653,82 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         # 添加当前用户消息到历史（如果还没有添加）
         if not conversation_history or conversation_history[-1].get("content") != user_text:
             conversation_history.append({"role": "user", "content": user_text})
+            logger.info("💬 Added user message to conversation history (total: %d messages)", len(conversation_history))
         # 只保留最近 10 条消息
-        conversation_history = conversation_history[-10:]
+        if len(conversation_history) > 10:
+            conversation_history = conversation_history[-10:]
+            logger.info("💬 Trimmed conversation history to last 10 messages")
         
         # 更新通话状态中的对话历史
         if call_connection_id and call_connection_id in _active_acs_calls:
             _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+            logger.info("💾 Saved conversation history to call state (call: %s, messages: %d)", 
+                       call_connection_id, len(conversation_history))
         
-        # 用户询问“之前填写了什么”时，优先用当前已提取状态回答
-        if quote_state and _is_quote_info_recall_question(user_text):
+        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
+        is_recall_question = _is_quote_info_recall_question(user_text)
+        logger.info("🔍 BRANCH: Recall question check - is_recall_question=%s, has_quote_state=%s", 
+                   is_recall_question, bool(quote_state))
+        if quote_state and is_recall_question:
+            logger.info("➡️  BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
             recap = _build_quote_confirmation_recap(quote_state)
             if quote_state.get("is_complete"):
+                logger.info("➡️  SUB-BRANCH: Quote is complete, asking for confirmation")
                 return (
                     f"{recap} Please say 'confirm' or 'yes' to create the quote, "
                     "or tell me what you'd like to change.",
                     False,
                 )
 
+            logger.info("➡️  SUB-BRANCH: Quote incomplete, asking for missing fields")
             missing_fields = quote_state.get("missing_fields", [])
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
             return f"{recap} {follow_up}", False
 
         # 检测是否是报价请求
         is_quote_request = await _detect_quote_intent(user_text, conversation_history)
+        logger.info("🔍 BRANCH: Quote intent detection - is_quote_request=%s, call_connection_id=%s", 
+                   is_quote_request, call_connection_id is not None)
         quote_updated = False
         
         if is_quote_request and call_connection_id:
+            logger.info("➡️  BRANCH: Entering QUOTE REQUEST branch")
             # 提取报价信息
-            logger.info("📋 Quote request detected, extracting quote information...")
+            logger.info("=" * 80)
+            logger.info("📋 QUOTE REQUEST DETECTED - Extracting quote information...")
+            logger.info("  Call ID: %s", call_connection_id)
+            logger.info("  Conversation history length: %d", len(conversation_history))
+            logger.info("  Current quote state: %s", json.dumps(quote_state, ensure_ascii=False, default=str)[:200])
+            logger.info("=" * 80)
+            
             quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
             quote_updated = True
+            
+            # 打印提取结果
+            logger.info("📋 QUOTE EXTRACTION RESULT:")
+            extracted = quote_state.get("extracted", {})
+            logger.info("  - Extracted Customer Name: %s", extracted.get("customer_name") or "None")
+            logger.info("  - Extracted Contact Info: %s", extracted.get("contact_info") or "None")
+            quote_items = extracted.get("quote_items", [])
+            logger.info("  - Extracted Quote Items: %d items", len(quote_items))
+            for idx, item in enumerate(quote_items, 1):
+                logger.info("      [%d] %s x %s", idx, item.get("product_package"), item.get("quantity"))
+            logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
+            logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
             # 更新通话状态
             if call_connection_id in _active_acs_calls:
                 _active_acs_calls[call_connection_id]["quote_state"] = quote_state
                 _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+                logger.info("✅ Updated call state with quote information")
             
             # 根据缺失字段生成回答
             missing_fields = quote_state.get("missing_fields", [])
             if missing_fields:
+                logger.info("➡️  SUB-BRANCH: Quote collection - missing fields, asking for: %s", missing_fields)
                 answer_text = _generate_quote_collection_response(missing_fields, quote_state)
             else:
+                logger.info("➡️  SUB-BRANCH: Quote collection - all fields complete, asking for confirmation")
                 # 信息已完整，确认前先复述完整信息
                 recap = _build_quote_confirmation_recap(quote_state)
                 answer_text = (
@@ -622,25 +736,47 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     "Please say 'confirm' or 'yes' to create the quote."
                 )
         else:
+            logger.info("➡️  BRANCH: Entering NON-QUOTE-REQUEST branch (regular Q&A or continuing quote collection)")
             # 普通问答或继续收集报价信息
             if quote_state and not quote_state.get("is_complete"):
+                logger.info("➡️  SUB-BRANCH: Continuing quote collection (quote_state exists but incomplete)")
                 # 正在收集报价信息，继续提取
+                logger.info("📋 CONTINUING QUOTE COLLECTION - Extracting additional information...")
+                logger.info("  Call ID: %s", call_connection_id)
+                logger.info("  Previous missing fields: %s", quote_state.get("missing_fields", []))
+                
                 quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
                 quote_updated = True
                 
+                # 打印更新后的状态
+                logger.info("📋 QUOTE COLLECTION UPDATE:")
+                extracted = quote_state.get("extracted", {})
+                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
+                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
+                quote_items = extracted.get("quote_items", [])
+                logger.info("  - Quote Items: %d items", len(quote_items))
+                for item in quote_items:
+                    logger.info("      * %s x %s", item.get("product_package"), item.get("quantity"))
+                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
+                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
+                
                 if call_connection_id and call_connection_id in _active_acs_calls:
                     _active_acs_calls[call_connection_id]["quote_state"] = quote_state
+                    logger.info("✅ Updated call state with new quote information")
                 
                 missing_fields = quote_state.get("missing_fields", [])
                 if missing_fields:
+                    logger.info("➡️  SUB-SUB-BRANCH: Still missing fields, asking for: %s", missing_fields)
                     answer_text = _generate_quote_collection_response(missing_fields, quote_state)
                 else:
+                    logger.info("➡️  SUB-SUB-BRANCH: All fields complete, asking for confirmation")
                     recap = _build_quote_confirmation_recap(quote_state)
                     answer_text = (
                         f"{recap} "
                         "Please say 'confirm' or 'yes' to create the quote."
                     )
             else:
+                logger.info("➡️  SUB-BRANCH: Regular Q&A (no quote_state or quote_state is complete)")
                 # 普通问答
                 system_prompt = (
                     "You are a helpful support assistant speaking on a phone call. "
@@ -787,11 +923,16 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
     复用 quote_tools 的逻辑，但适配电话端的对话格式
     """
     try:
+        logger.info("🔍 EXTRACTING QUOTE INFO FROM CONVERSATION")
+        logger.info("  Conversation history length: %d messages", len(conversation_history))
+        logger.info("  Current state: %s", json.dumps(current_state, ensure_ascii=False, default=str)[:200])
+        
         # 构建对话文本
         conversation_text = "\n".join([
             f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
             for msg in conversation_history[-10:]
         ])
+        logger.info("  Conversation text length: %d characters", len(conversation_text))
         
         # 获取可用产品
         from salesforce_service import get_salesforce_service
@@ -800,6 +941,7 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
         
         if sf_service.is_available():
             try:
+                logger.info("📦 Fetching available products from Salesforce...")
                 result = sf_service.sf.query(
                     "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
                 )
@@ -808,8 +950,15 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
                         {"id": record["Id"], "name": record["Name"]}
                         for record in result["records"]
                     ]
+                    logger.info("  Found %d available products", len(products))
+                    product_names = [p["name"] for p in products[:5]]  # 只打印前 5 个
+                    logger.info("  Sample products: %s", ", ".join(product_names))
+                else:
+                    logger.warning("  No products found in Salesforce")
             except Exception as e:
-                logger.error("Error fetching products: %s", str(e))
+                logger.error("❌ Error fetching products: %s", str(e))
+        else:
+            logger.warning("⚠️  Salesforce service not available, cannot fetch products")
         
         # 使用 GPT 提取信息
         from azure.core.credentials import AzureKeyCredential
@@ -876,6 +1025,9 @@ Merge with current extracted data - only update fields where new information is 
                 azure_endpoint=openai_endpoint
             )
         
+        logger.info("🤖 Calling GPT for quote extraction (deployment: %s)", openai_deployment)
+        logger.info("  Prompt length: %d characters", len(extraction_prompt))
+        
         response = client.chat.completions.create(
             model=openai_deployment,
             messages=[
@@ -886,17 +1038,25 @@ Merge with current extracted data - only update fields where new information is 
             response_format={"type": "json_object"}
         )
         
+        logger.info("✅ GPT extraction response received")
         new_extracted = json.loads(response.choices[0].message.content)
+        logger.info("  Extracted data: %s", json.dumps(new_extracted, ensure_ascii=False, default=str)[:300])
         
         # 合并提取的数据（新数据覆盖旧数据）
+        logger.info("🔄 Merging extracted data with current state...")
         for key in ["customer_name", "contact_info", "expected_start_date", "notes"]:
-            if new_extracted.get(key):
-                extracted_data[key] = new_extracted[key]
+            old_value = extracted_data.get(key)
+            new_value = new_extracted.get(key)
+            if new_value:
+                extracted_data[key] = new_value
+                if old_value != new_value:
+                    logger.info("    Updated %s: '%s' -> '%s'", key, old_value, new_value)
         
         # 合并 quote_items（追加新项）
         if new_extracted.get("quote_items"):
             existing_items = extracted_data.get("quote_items", [])
             new_items = new_extracted["quote_items"]
+            logger.info("  Merging quote_items: existing=%d, new=%d", len(existing_items), len(new_items))
             # 简单的去重逻辑：如果产品名相同，更新数量
             for new_item in new_items:
                 if not isinstance(new_item, dict):
@@ -908,15 +1068,21 @@ Merge with current extracted data - only update fields where new information is 
                     found = False
                     for existing_item in existing_items:
                         if isinstance(existing_item, dict) and existing_item.get("product_package") == product_name:
+                            old_quantity = existing_item.get("quantity")
                             existing_item["quantity"] = quantity
                             found = True
+                            if old_quantity != quantity:
+                                logger.info("    Updated quantity for %s: %s -> %s", product_name, old_quantity, quantity)
                             break
                     if not found:
                         existing_items.append(new_item)
+                        logger.info("    Added new product: %s x %s", product_name, quantity)
             extracted_data["quote_items"] = existing_items
+            logger.info("  Final quote_items count: %d", len(extracted_data["quote_items"]))
         
         # 产品匹配（使用 quote_tools 的逻辑）
         if extracted_data.get("quote_items") and products:
+            logger.info("🔍 Matching products with available products...")
             from quote_tools import _find_best_product_match
             matched_items = []
             for item in extracted_data["quote_items"]:
@@ -927,16 +1093,20 @@ Merge with current extracted data - only update fields where new information is 
                 if user_product:
                     matched_product = _find_best_product_match(user_product, products)
                     if matched_product:
+                        if matched_product != user_product:
+                            logger.info("    Matched '%s' -> '%s'", user_product, matched_product)
                         matched_items.append({
                             "product_package": matched_product,
                             "quantity": quantity or 1
                         })
                     else:
+                        logger.warning("    No match found for '%s' (keeping original)", user_product)
                         matched_items.append({
                             "product_package": user_product,
                             "quantity": quantity or 1
                         })
             extracted_data["quote_items"] = matched_items
+            logger.info("  Product matching completed: %d items", len(matched_items))
         
         # 邮箱标准化
         if extracted_data.get("contact_info"):
@@ -944,14 +1114,21 @@ Merge with current extracted data - only update fields where new information is 
             original_contact = extracted_data["contact_info"]
             normalized_email = normalize_email(str(original_contact))
             if normalized_email:
+                if normalized_email != original_contact:
+                    logger.info("📧 Normalized email: '%s' -> '%s'", original_contact, normalized_email)
                 extracted_data["contact_info"] = normalized_email
+            else:
+                logger.warning("⚠️  Could not normalize contact info: '%s'", original_contact)
         
         # 确定缺失字段
+        logger.info("📊 Validating extracted data...")
         missing_fields = []
         if not extracted_data.get("customer_name"):
             missing_fields.append("customer_name")
+            logger.info("    Missing: customer_name")
         if not extracted_data.get("contact_info"):
             missing_fields.append("contact_info")
+            logger.info("    Missing: contact_info")
         
         # 检查 quote_items
         quote_items = extracted_data.get("quote_items", [])
@@ -964,13 +1141,21 @@ Merge with current extracted data - only update fields where new information is 
         ]
         if not valid_items:
             missing_fields.append("quote_items")
+            logger.info("    Missing: quote_items (or invalid)")
+        else:
+            logger.info("    Valid quote_items: %d items", len(valid_items))
         
-        return {
+        is_complete = len(missing_fields) == 0
+        logger.info("✅ Extraction result: is_complete=%s, missing_fields=%s", is_complete, missing_fields)
+        
+        result = {
             "extracted": extracted_data,
             "missing_fields": missing_fields,
             "products_available": product_names,
-            "is_complete": len(missing_fields) == 0,
+            "is_complete": is_complete,
         }
+        logger.info("📋 Final quote state: %s", json.dumps(result, ensure_ascii=False, default=str)[:400])
+        return result
         
     except Exception as e:
         logger.error("Error extracting quote info: %s", str(e))
@@ -1009,6 +1194,10 @@ def _generate_quote_collection_response(missing_fields: list, quote_state: dict)
 async def create_quote_from_state(call_connection_id: str, quote_state: dict) -> Optional[dict]:
     """从报价状态创建 Salesforce 报价"""
     try:
+        logger.info("=" * 80)
+        logger.info("🏭 CREATING QUOTE FROM STATE")
+        logger.info("  Call ID: %s", call_connection_id)
+        
         extracted = quote_state.get("extracted", {})
         customer_name = extracted.get("customer_name")
         contact_info = extracted.get("contact_info")
@@ -1016,8 +1205,18 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
         expected_start_date = extracted.get("expected_start_date")
         notes = extracted.get("notes")
         
+        logger.info("  Quote Information:")
+        logger.info("    - Customer Name: %s", customer_name)
+        logger.info("    - Contact Info: %s", contact_info)
+        logger.info("    - Quote Items: %d items", len(quote_items))
+        for idx, item in enumerate(quote_items, 1):
+            logger.info("        [%d] %s x %s", idx, item.get("product_package"), item.get("quantity"))
+        logger.info("    - Expected Start Date: %s", expected_start_date or "Not set")
+        logger.info("    - Notes: %s", notes or "Not set")
+        logger.info("=" * 80)
+        
         if not customer_name or not contact_info or not quote_items:
-            logger.error("Incomplete quote information: customer_name=%s, contact_info=%s, quote_items=%s",
+            logger.error("❌ Incomplete quote information: customer_name=%s, contact_info=%s, quote_items=%s",
                         customer_name, contact_info, quote_items)
             return None
         
@@ -1031,23 +1230,34 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
             return None
         
         # 创建或获取 Account
+        logger.info("📊 Creating/getting Account in Salesforce...")
         account_id = sf_service.create_or_get_account(customer_name, contact_info)
         if not account_id:
-            logger.warning("Failed to create/get Account, will create Quote without Account association")
+            logger.warning("⚠️  Failed to create/get Account, will create Quote without Account association")
+        else:
+            logger.info("✅ Account ID: %s", account_id)
         
         # 创建或获取 Contact
+        contact_id = None
         if account_id:
-            sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+            logger.info("👤 Creating/getting Contact in Salesforce...")
+            contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+            if contact_id:
+                logger.info("✅ Contact ID: %s", contact_id)
         
         # 创建 Opportunity（可选）
         opportunity_id = None
         if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true" and account_id:
+            logger.info("💼 Creating Opportunity in Salesforce...")
             opportunity_id = sf_service.create_opportunity(
                 account_id,
                 f"Opportunity for {customer_name}"
             )
+            if opportunity_id:
+                logger.info("✅ Opportunity ID: %s", opportunity_id)
         
         # 创建 Quote
+        logger.info("📋 Creating Quote in Salesforce...")
         quote_result = sf_service.create_quote(
             account_id=account_id,
             opportunity_id=opportunity_id,
@@ -1058,18 +1268,24 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
         )
         
         if not quote_result:
-            logger.error("Failed to create quote in Salesforce")
+            logger.error("❌ Failed to create quote in Salesforce")
             return None
+        
+        logger.info("✅ Quote created successfully:")
+        logger.info("    - Quote ID: %s", quote_result.get("quote_id"))
+        logger.info("    - Quote Number: %s", quote_result.get("quote_number"))
+        logger.info("    - Quote URL: %s", quote_result.get("quote_url"))
         
         # 发送邮件通知
         if "@" in contact_info:
             try:
+                logger.info("📧 Sending quote email notification...")
                 product_summary = ", ".join([
                     f"{item.get('product_package')} (x{item.get('quantity')})" 
                     for item in quote_items
                 ])
                 total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
-                await send_quote_email(
+                email_sent = await send_quote_email(
                     to_email=contact_info,
                     customer_name=customer_name,
                     quote_url=quote_result["quote_url"],
@@ -1078,12 +1294,22 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
                     expected_start_date=expected_start_date,
                     notes=notes
                 )
-                logger.info("Quote email sent to %s", contact_info)
+                if email_sent:
+                    logger.info("✅ Quote email sent successfully to %s", contact_info)
+                else:
+                    logger.warning("⚠️  Quote email sending returned False for %s", contact_info)
             except Exception as e:
-                logger.error("Error sending quote email: %s", str(e))
+                logger.error("❌ Error sending quote email: %s", str(e))
+                import traceback
+                logger.error("Traceback: %s", traceback.format_exc())
+        else:
+            logger.info("ℹ️  Contact info is not an email address, skipping email notification")
         
-        logger.info("Quote created successfully: ID=%s, Number=%s", 
-                   quote_result.get("quote_id"), quote_result.get("quote_number"))
+        logger.info("=" * 80)
+        logger.info("✅ QUOTE CREATION COMPLETED SUCCESSFULLY")
+        logger.info("  Quote ID: %s", quote_result.get("quote_id"))
+        logger.info("  Quote Number: %s", quote_result.get("quote_number"))
+        logger.info("=" * 80)
         return quote_result
         
     except Exception as e:
@@ -1205,7 +1431,7 @@ async def play_welcome_message(call_connection_id: str) -> None:
         
         # 🎯 最小可行 TTS 测试：先用固定的简短英文欢迎语，排除 GPT 文本 / 字符集等因素
         # 如果这一步通过，再切回 GPT 生成文本
-        welcome_text = "I love you Karina, and I will love you forever and ever."
+        welcome_text = "Hi, I'm your voice assistant how can I help you today?"
         
         logger.info("🎵 Playing welcome message using TTS...")
         logger.info("   Text: %s", welcome_text)
