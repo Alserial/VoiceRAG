@@ -155,7 +155,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                 size="sm"
             >
                 <Bug className="h-4 w-4 mr-2" />
-                调试面板 {messages.length > 0 && `(${messages.length})`}
+                Debug Panel {messages.length > 0 && `(${messages.length})`}
                 {isOpen ? (
                     <ChevronDown className="h-4 w-4 ml-2" />
                 ) : (
@@ -167,7 +167,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                 <Card className="w-[600px] max-h-[70vh] flex flex-col shadow-2xl">
                     <CardHeader className="pb-3">
                         <div className="flex items-center justify-between">
-                            <CardTitle className="text-lg">调试面板</CardTitle>
+                            <CardTitle className="text-lg">Debug Panel</CardTitle>
                             <div className="flex gap-2">
                                 <div className="flex gap-1 border rounded-md">
                                     <Button
@@ -176,7 +176,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                         onClick={() => setViewMode("collected")}
                                         className="text-xs h-7"
                                     >
-                                        收集信息
+                                        Collected Info
                                     </Button>
                                     <Button
                                         variant={viewMode === "messages" ? "default" : "ghost"}
@@ -184,7 +184,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                         onClick={() => setViewMode("messages")}
                                         className="text-xs h-7"
                                     >
-                                        调试日志
+                                        Debug Log
                                     </Button>
                                 </div>
                                 {viewMode === "messages" && (
@@ -195,7 +195,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                             onClick={() => setAutoScroll(!autoScroll)}
                                             className="text-xs"
                                         >
-                                            {autoScroll ? "自动滚动: 开" : "自动滚动: 关"}
+                                            {autoScroll ? "Auto Scroll: On" : "Auto Scroll: Off"}
                                         </Button>
                                         <Button
                                             variant="ghost"
@@ -204,7 +204,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                             className="text-xs text-red-600 hover:text-red-700"
                                         >
                                             <Trash2 className="h-4 w-4 mr-1" />
-                                            清除
+                                            Clear
                                         </Button>
                                     </>
                                 )}
@@ -225,41 +225,41 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                     <div className="border rounded-lg p-4 bg-gray-50">
                                         <div className="flex items-center gap-2 mb-3">
                                             <User className="h-4 w-4 text-gray-600" />
-                                            <label className="text-sm font-medium text-gray-700">姓名 (Name)</label>
+                                            <label className="text-sm font-medium text-gray-700">Name</label>
                                         </div>
                                         <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[2rem]">
-                                            {collectedInfo.customer_name || <span className="text-gray-400">（未收集）</span>}
+                                            {collectedInfo.customer_name || <span className="text-gray-400">(Not collected)</span>}
                                         </div>
                                     </div>
 
                                     <div className="border rounded-lg p-4 bg-gray-50">
                                         <div className="flex items-center gap-2 mb-3">
                                             <Mail className="h-4 w-4 text-gray-600" />
-                                            <label className="text-sm font-medium text-gray-700">邮箱 (Email)</label>
+                                            <label className="text-sm font-medium text-gray-700">Email</label>
                                         </div>
                                         <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[2rem]">
-                                            {collectedInfo.contact_info || <span className="text-gray-400">（未收集）</span>}
+                                            {collectedInfo.contact_info || <span className="text-gray-400">(Not collected)</span>}
                                         </div>
                                     </div>
 
                                     <div className="border rounded-lg p-4 bg-gray-50">
                                         <div className="flex items-center gap-2 mb-3">
                                             <Package className="h-4 w-4 text-gray-600" />
-                                            <label className="text-sm font-medium text-gray-700">产品 (Product)</label>
+                                            <label className="text-sm font-medium text-gray-700">Product</label>
                                         </div>
                                         <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[2rem]">
                                             {(() => {
                                                 if (collectedInfo.quote_items && collectedInfo.quote_items.length > 0) {
                                                     return collectedInfo.quote_items.map((item, idx) => (
                                                         <div key={idx} className="mb-1">
-                                                            {item.product_package || <span className="text-gray-400">（未指定）</span>}
+                                                            {item.product_package || <span className="text-gray-400">(Not specified)</span>}
                                                             {item.quantity !== undefined && item.quantity !== null && (
                                                                 <span className="text-gray-600 ml-2">x {item.quantity}</span>
                                                             )}
                                                         </div>
                                                     ));
                                                 }
-                                                return collectedInfo.product_package || <span className="text-gray-400">（未收集）</span>;
+                                                return collectedInfo.product_package || <span className="text-gray-400">(Not collected)</span>;
                                             })()}
                                         </div>
                                     </div>
@@ -268,7 +268,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                         <div className="border rounded-lg p-4 bg-gray-50">
                                             <div className="flex items-center gap-2 mb-3">
                                                 <Package className="h-4 w-4 text-gray-600" />
-                                                <label className="text-sm font-medium text-gray-700">数量 (Quantity)</label>
+                                                <label className="text-sm font-medium text-gray-700">Quantity</label>
                                             </div>
                                             <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[2rem]">
                                                 {collectedInfo.quantity}
@@ -279,20 +279,20 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                                     <div className="border rounded-lg p-4 bg-gray-50">
                                         <div className="flex items-center gap-2 mb-3">
                                             <Calendar className="h-4 w-4 text-gray-600" />
-                                            <label className="text-sm font-medium text-gray-700">期望开始日期 (Start Date)</label>
+                                            <label className="text-sm font-medium text-gray-700">Expected Start Date</label>
                                         </div>
                                         <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[2rem]">
-                                            {collectedInfo.expected_start_date || <span className="text-gray-400">（未收集）</span>}
+                                            {collectedInfo.expected_start_date || <span className="text-gray-400">(Not collected)</span>}
                                         </div>
                                     </div>
 
                                     <div className="border rounded-lg p-4 bg-gray-50">
                                         <div className="flex items-center gap-2 mb-3">
                                             <FileText className="h-4 w-4 text-gray-600" />
-                                            <label className="text-sm font-medium text-gray-700">备注 (Notes)</label>
+                                            <label className="text-sm font-medium text-gray-700">Notes</label>
                                         </div>
                                         <div className="text-sm text-gray-900 bg-white border border-gray-200 rounded px-3 py-2 min-h-[4rem]">
-                                            {collectedInfo.notes || <span className="text-gray-400">（未收集）</span>}
+                                            {collectedInfo.notes || <span className="text-gray-400">(Not collected)</span>}
                                         </div>
                                     </div>
                                 </div>
@@ -301,7 +301,7 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
                             <div className="flex-1 overflow-y-auto p-4 space-y-3">
                                 {messages.length === 0 ? (
                                     <div className="text-center text-gray-500 py-8">
-                                        暂无调试信息
+                                        No debug messages
                                     </div>
                                 ) : (
                                     messages.map((msg) => (
