@@ -17,6 +17,7 @@ Azure Communication Services (ACS) Call Automation Handler
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -659,9 +660,27 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
 def _is_confirmation(user_text: str) -> bool:
     """检测用户是否确认（用于报价确认）"""
-    confirmation_keywords = ["confirm", "yes", "send", "ok", "okay", "proceed", "go ahead", "create", "submit"]
     user_lower = user_text.lower().strip()
-    return any(keyword in user_lower for keyword in confirmation_keywords)
+    normalized = re.sub(r"[^a-z\s]", " ", user_lower)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # 仅接受明确确认短句，避免把“yes, but ...”这类修改请求误判成最终确认
+    explicit_confirmations = {
+        "confirm",
+        "yes",
+        "yes confirm",
+        "confirm yes",
+        "send",
+        "send it",
+        "ok",
+        "okay",
+        "proceed",
+        "go ahead",
+        "create",
+        "create it",
+        "submit",
+    }
+    return normalized in explicit_confirmations
 
 
 async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
@@ -693,13 +712,6 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
     复用 quote_tools 的逻辑，但适配电话端的对话格式
     """
     try:
-        from quote_tools import _extract_quote_info_tool
-        from rtmt import RTMiddleTier
-        
-        # 创建一个临时的 RTMiddleTier 实例用于调用提取工具
-        # 实际上我们只需要复用提取逻辑，不需要完整的 RTMiddleTier
-        # 直接调用 quote_tools 中的提取逻辑
-        
         # 构建对话文本
         conversation_text = "\n".join([
             f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
@@ -725,9 +737,9 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
                 logger.error("Error fetching products: %s", str(e))
         
         # 使用 GPT 提取信息
-        from openai import AzureOpenAI
         from azure.core.credentials import AzureKeyCredential
         from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
         
         openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
         openai_deployment = (
@@ -935,8 +947,8 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
             return None
         
         # 调用 Salesforce 创建报价
-        from salesforce_service import get_salesforce_service
         from email_service import send_quote_email
+        from salesforce_service import get_salesforce_service
         
         sf_service = get_salesforce_service()
         if not sf_service.is_available():
@@ -950,7 +962,7 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
         
         # 创建或获取 Contact
         if account_id:
-            contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+            sf_service.create_or_get_contact(account_id, customer_name, contact_info)
         
         # 创建 Opportunity（可选）
         opportunity_id = None
@@ -1616,5 +1628,4 @@ if __name__ == "__main__":
             logger.info("Please check your ACS_CONNECTION_STRING environment variable")
     
     asyncio.run(main())
-
 
