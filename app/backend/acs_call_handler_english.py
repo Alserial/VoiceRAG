@@ -488,8 +488,8 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                 logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
                 logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
-            # Check if it's a quote confirmation (user says "confirm", "yes", "send", etc.)
-            is_confirmation = _is_confirmation(user_text)
+            # Check if it's a quote confirmation (LLM semantic classification; explicit yes/confirm fast path)
+            is_confirmation = await _is_confirmation(user_text, updated_conversation, quote_state)
             logger.info("BRANCH: Confirmation check - user_text='%s', is_confirmation=%s, is_complete=%s", 
                        user_text, is_confirmation, quote_state.get("is_complete", False))
             
@@ -666,10 +666,19 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             logger.info("Saved conversation history to call state (call: %s, messages: %d)", 
                        call_connection_id, len(conversation_history))
         
+        behavior = await _classify_user_behavior_with_llm(
+            client,
+            openai_deployment,
+            user_text,
+            conversation_history,
+            bool(quote_state),
+            bool(quote_state.get("is_complete")),
+        )
+
         # When user asks "what did I provide", prioritize using current extracted state to answer
-        is_recall_question = _is_quote_info_recall_question(user_text)
-        logger.info("BRANCH: Recall question check - is_recall_question=%s, has_quote_state=%s", 
-                   is_recall_question, bool(quote_state))
+        is_recall_question = behavior == "recall_quote_info"
+        logger.info("BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
+                   behavior, is_recall_question, bool(quote_state))
         if quote_state and is_recall_question:
             logger.info("BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
             recap = _build_quote_confirmation_recap(quote_state)
@@ -686,10 +695,10 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
             return f"{recap} {follow_up}", False
 
-        # Detect if it's a quote request
-        is_quote_request = await _detect_quote_intent(user_text, conversation_history)
-        logger.info("BRANCH: Quote intent detection - is_quote_request=%s, call_connection_id=%s", 
-                   is_quote_request, call_connection_id is not None)
+        # Detect if it's a quote request (LLM semantic classification)
+        is_quote_request = behavior == "quote_request"
+        logger.info("BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
+                   behavior, is_quote_request, call_connection_id is not None)
         quote_updated = False
         
         if is_quote_request and call_connection_id:
@@ -821,29 +830,87 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         return fallback, False
 
 
-def _is_confirmation(user_text: str) -> bool:
-    """Detect if user is confirming (for quote confirmation)"""
-    user_lower = user_text.lower().strip()
+async def _is_confirmation(user_text: str, conversation_history: list, quote_state: dict) -> bool:
+    """Use LLM to classify final quote confirmation (keep very explicit yes/confirm fast path)."""
+    user_lower = (user_text or "").lower().strip()
     normalized = re.sub(r"[^a-z\s]", " ", user_lower)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    # Only accept explicit confirmation short phrases, avoid misjudging modification requests like "yes, but ..." as final confirmation
-    explicit_confirmations = {
-        "confirm",
-        "yes",
-        "yes confirm",
-        "confirm yes",
-        "send",
-        "send it",
-        "ok",
-        "okay",
-        "proceed",
-        "go ahead",
-        "create",
-        "create it",
-        "submit",
-    }
-    return normalized in explicit_confirmations
+    if normalized in {"yes", "confirm"}:
+        return True
+
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint:
+        logger.warning("Confirmation classification skipped: missing AZURE_OPENAI_ENDPOINT")
+        return False
+
+    try:
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        recent_history = [
+            {
+                "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+                "content": msg.get("content", ""),
+            }
+            for msg in (conversation_history or [])[-6:]
+            if isinstance(msg, dict) and msg.get("content")
+        ]
+
+        payload = {
+            "latest_user_text": user_text,
+            "quote_state_complete": bool((quote_state or {}).get("is_complete")),
+            "recent_history": recent_history,
+            "task": "final_quote_confirmation",
+        }
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify whether the user is explicitly confirming final quote creation right now. "
+                        "Return JSON only with field 'state' and value confirm or other. "
+                        "Use semantics and context, not keywords only. "
+                        "If user is modifying details, asking questions, hesitating, or saying maybe, return other."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=48,
+        )
+
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        return result.get("state") == "confirm"
+    except Exception as e:
+        logger.warning("LLM confirmation classification failed: %s", str(e))
+        return False
 
 
 def _build_quote_confirmation_recap(quote_state: dict) -> str:
@@ -896,26 +963,113 @@ def _is_quote_info_recall_question(user_text: str) -> bool:
 
 
 async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
-    """Detect if user has quote intent"""
-    quote_keywords = [
-        "quote", "quotation", "price", "pricing", "estimate", "cost",
-        "get a quote", "need a quote", "want a quote", "request a quote"
-    ]
-    user_lower = user_text.lower()
-    
-    # Check current message
-    if any(keyword in user_lower for keyword in quote_keywords):
-        return True
-    
-    # Check conversation history (last 3 messages)
-    for msg in conversation_history[-3:]:
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "").lower()
-            if any(keyword in content for keyword in quote_keywords):
-                return True
-    
-    return False
+    """Keep compatibility for old callsites; now uses LLM semantic classification."""
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
 
+    if not openai_endpoint:
+        return False
+
+    try:
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        behavior = await _classify_user_behavior_with_llm(
+            client=client,
+            deployment=openai_deployment,
+            user_text=user_text,
+            conversation_history=conversation_history,
+            has_quote_state=False,
+            quote_complete=False,
+        )
+        return behavior == "quote_request"
+    except Exception:
+        return False
+
+
+
+
+async def _classify_user_behavior_with_llm(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    has_quote_state: bool,
+    quote_complete: bool,
+) -> str:
+    """Use LLM to classify the user's current intent into a branch behavior."""
+    recent_history = [
+        {
+            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+            "content": msg.get("content", ""),
+        }
+        for msg in conversation_history[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+
+    classifier_prompt = (
+        "Classify the user's intent for call-flow branching. "
+        "Return JSON only with field 'behavior'.\n"
+        "Allowed behaviors:\n"
+        "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
+        "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
+        "- general_qa: regular Q&A not about quote flow.\n"
+        "Rules:\n"
+        "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
+        "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
+        "3) If not quote related, choose general_qa.\n"
+        "4) Use conversation context, not keywords only."
+    )
+
+    payload = {
+        "has_quote_state": has_quote_state,
+        "quote_complete": quote_complete,
+        "recent_history": recent_history,
+        "latest_user_text": user_text,
+    }
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": classifier_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=64,
+        )
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        behavior = result.get("behavior")
+        if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
+            logger.info("LLM behavior classification: %s", behavior)
+            return behavior
+        logger.warning("Unknown behavior from classifier: %s", behavior)
+    except Exception as e:
+        logger.warning("LLM behavior classification failed, fallback to general_qa: %s", str(e))
+
+    return "general_qa"
 
 async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:
     """
