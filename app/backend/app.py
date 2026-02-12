@@ -76,16 +76,14 @@ async def create_app():
             - After the user provides their information, call 'extract_user_info' tool to extract their name and email.
             - If information is incomplete (is_complete = false), ask for the missing piece (name OR email, one at a time).
             - Keep calling 'extract_user_info' after each response until is_complete = true.
-            - Once complete (is_complete = true), ALWAYS restate all collected registration details (name and email) before asking for confirmation.
-            - Then tell the user: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
+            - Once complete (is_complete = true), tell the user: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
             - This registration MUST happen BEFORE any other questions, searches, or quote requests. Do not help with other tasks until registration is complete.
             
             ROLE OF 'extract_user_info' (user registration):
             - Call this tool after the user provides their name and/or email.
             - Returns: {"extracted": {"customer_name": ..., "contact_info": ...}, "is_complete": bool}
             - If is_complete = false: Ask for the missing information (either name or email, whichever is missing).
-            - If is_complete = true: The system will show a confirmation dialog. BEFORE asking for confirmation, repeat all collected registration details (name + email), then say: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
-            - If user asks what they previously provided (for example: "what name did I give?" or "what email did I enter?"), call 'extract_user_info' again and answer using the extracted values. Do NOT reply with "I don't know" if the values exist in conversation history.
+            - If is_complete = true: The system will show a confirmation dialog. Tell the user: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
             - IMPORTANT: Only proceed with other tasks (search, quote requests) AFTER user registration is complete (is_complete = true and user has confirmed).
             
             ROLE OF 'extract_quote_info' (state evaluator):
@@ -109,7 +107,7 @@ async def create_app():
               * If user mentions a product but no quantity, ask for the quantity: "What quantity do you need for [product name]?"
               * If user mentions quantity but no product, ask for the product: "Which product would you like? Available: [list products]"
               * Both product_package AND quantity are required for each item. Do NOT mark as complete if either is missing.
-            - If is_complete = true: First restate all collected quote details (customer_name, contact_info, each quote_items product + quantity, expected_start_date, notes), then tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
+            - If is_complete = true: Tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
             
             CONFIRMATION:
             - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, proceed with sending the quote (the system will handle the send).
