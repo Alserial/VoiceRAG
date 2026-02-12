@@ -348,8 +348,9 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
     """
     处理语音识别完成事件：
     1. 从事件里拿到用户说的话（转成的文本）
-    2. 调 GPT 生成回答
-    3. 用 ACS TTS 播放回答
+    2. 检测是否是报价请求，如果是则收集报价信息
+    3. 调 GPT 生成回答
+    4. 用 ACS TTS 播放回答
     """
     try:
         data = event_data.get("data", {}) or {}
@@ -409,8 +410,55 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
 
         logger.info("User said (transcript): %s", user_text)
 
-        # 调用 GPT 生成电话回答
-        answer_text = await generate_answer_text_with_gpt(user_text)
+        # 初始化通话的报价状态（如果还没有）
+        if call_connection_id and call_connection_id not in _active_acs_calls:
+            _active_acs_calls[call_connection_id] = {
+                "call_connection_id": call_connection_id,
+                "status": "active",
+            }
+        
+        # 处理报价逻辑
+        if call_connection_id:
+            quote_state = _active_acs_calls.get(call_connection_id, {}).get("quote_state", {})
+            
+            # 先更新报价状态（提取信息）
+            answer_text, quote_updated = await generate_answer_text_with_gpt(
+                user_text, call_connection_id
+            )
+            
+            # 重新获取更新后的报价状态
+            quote_state = _active_acs_calls.get(call_connection_id, {}).get("quote_state", {})
+            
+            # 检查是否是报价确认（用户说 "confirm", "yes", "send" 等）
+            if quote_state.get("is_complete") and _is_confirmation(user_text):
+                # 用户确认报价，创建报价
+                logger.info("📋 User confirmed quote request, creating quote in Salesforce...")
+                quote_result = await create_quote_from_state(call_connection_id, quote_state)
+                if quote_result:
+                    answer_text = (
+                        f"Great! I've created your quote. "
+                        f"The quote number is {quote_result.get('quote_number', 'N/A')}. "
+                        f"An email with the quote details has been sent to your email address. "
+                        f"Is there anything else I can help you with?"
+                    )
+                    # 清除报价状态
+                    if call_connection_id in _active_acs_calls:
+                        _active_acs_calls[call_connection_id].pop("quote_state", None)
+                else:
+                    answer_text = (
+                        "I'm sorry, I couldn't create the quote at this time. "
+                        "Please try again later or contact our support team."
+                    )
+            elif quote_updated and quote_state.get("is_complete"):
+                # 报价信息已完整，提示用户确认
+                answer_text = (
+                    f"{answer_text} "
+                    f"I have all the information I need. "
+                    f"Please say 'confirm' or 'yes' to create the quote, or let me know if you'd like to make any changes."
+                )
+        else:
+            # 没有 call_connection_id，使用简单模式
+            answer_text, _ = await generate_answer_text_with_gpt(user_text, None)
 
         # 播放回答
         if call_connection_id:
@@ -455,11 +503,17 @@ async def handle_recognize_failed_event(event_data: dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def generate_answer_text_with_gpt(user_text: str) -> str:
+async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool]:
     """
     使用 Azure OpenAI 根据用户语音转成的文本生成回答（电话版 Q&A 核心逻辑）。
     
-    和网页版一样，本质是：用户一句话 -> GPT 生成一句 / 一小段回答文本。
+    支持报价功能：
+    - 检测报价意图
+    - 收集报价信息
+    - 生成自然对话回答
+    
+    Returns:
+        tuple[str, bool]: (回答文本, 报价状态是否更新)
     """
     # 如果 GPT 不可用，就回个固定文案，避免电话静音
     fallback = "I am sorry, I could not process your question. Please try again later."
@@ -470,7 +524,7 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
         from openai import AzureOpenAI
     except Exception as e:
         logger.warning("Azure OpenAI SDK not available, using fallback answer. Error: %s", str(e))
-        return fallback
+        return fallback, False
 
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     openai_deployment = (
@@ -485,7 +539,7 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
 
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using fallback answer.")
-        return fallback
+        return fallback, False
 
     if llm_key:
         credential = AzureKeyCredential(llm_key)
@@ -507,33 +561,449 @@ async def generate_answer_text_with_gpt(user_text: str) -> str:
                 azure_endpoint=openai_endpoint,
             )
 
-        system_prompt = (
-            "You are a helpful support assistant speaking on a phone call. "
-            "Answer briefly and clearly in natural English. "
-            "Keep each answer under 3 sentences."
-        )
+        # 获取当前通话的对话历史（用于报价信息提取）
+        conversation_history = []
+        quote_state = {}
+        if call_connection_id and call_connection_id in _active_acs_calls:
+            call_info = _active_acs_calls[call_connection_id]
+            quote_state = call_info.get("quote_state", {})
+            conversation_history = call_info.get("conversation_history", [])
+        
+        # 添加当前用户消息到历史（如果还没有添加）
+        if not conversation_history or conversation_history[-1].get("content") != user_text:
+            conversation_history.append({"role": "user", "content": user_text})
+        # 只保留最近 10 条消息
+        conversation_history = conversation_history[-10:]
+        
+        # 更新通话状态中的对话历史
+        if call_connection_id and call_connection_id in _active_acs_calls:
+            _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+        
+        # 检测是否是报价请求
+        is_quote_request = await _detect_quote_intent(user_text, conversation_history)
+        quote_updated = False
+        
+        if is_quote_request and call_connection_id:
+            # 提取报价信息
+            logger.info("📋 Quote request detected, extracting quote information...")
+            quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
+            quote_updated = True
+            
+            # 更新通话状态
+            if call_connection_id in _active_acs_calls:
+                _active_acs_calls[call_connection_id]["quote_state"] = quote_state
+                _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+            
+            # 根据缺失字段生成回答
+            missing_fields = quote_state.get("missing_fields", [])
+            if missing_fields:
+                answer_text = _generate_quote_collection_response(missing_fields, quote_state)
+            else:
+                # 信息已完整
+                answer_text = (
+                    "I have all the information I need for your quote. "
+                    "Please say 'confirm' or 'yes' to create the quote."
+                )
+        else:
+            # 普通问答或继续收集报价信息
+            if quote_state and not quote_state.get("is_complete"):
+                # 正在收集报价信息，继续提取
+                quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
+                quote_updated = True
+                
+                if call_connection_id and call_connection_id in _active_acs_calls:
+                    _active_acs_calls[call_connection_id]["quote_state"] = quote_state
+                
+                missing_fields = quote_state.get("missing_fields", [])
+                if missing_fields:
+                    answer_text = _generate_quote_collection_response(missing_fields, quote_state)
+                else:
+                    answer_text = (
+                        "I have all the information I need for your quote. "
+                        "Please say 'confirm' or 'yes' to create the quote."
+                    )
+            else:
+                # 普通问答
+                system_prompt = (
+                    "You are a helpful support assistant speaking on a phone call. "
+                    "Answer briefly and clearly in natural English. "
+                    "Keep each answer under 3 sentences. "
+                    "If the user asks about quotes, pricing, or estimates, help them request a quote."
+                )
+                
+                logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
+                logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
+                response = client.chat.completions.create(
+                    model=openai_deployment,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                    temperature=0.4,
+                    max_tokens=128,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                if not text:
+                    logger.warning("GPT returned empty answer text, using fallback.")
+                    return fallback, False
+                answer_text = text
 
-        logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
-        logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
+        logger.info("Answer text from GPT: %s", answer_text)
+        return answer_text, quote_updated
+    except Exception as e:
+        logger.error("Failed to generate answer text via Azure OpenAI: %s", str(e))
+        import traceback
+        logger.error("Traceback: %s", traceback.format_exc())
+        return fallback, False
+
+
+def _is_confirmation(user_text: str) -> bool:
+    """检测用户是否确认（用于报价确认）"""
+    confirmation_keywords = ["confirm", "yes", "send", "ok", "okay", "proceed", "go ahead", "create", "submit"]
+    user_lower = user_text.lower().strip()
+    return any(keyword in user_lower for keyword in confirmation_keywords)
+
+
+async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
+    """检测用户是否有报价意图"""
+    quote_keywords = [
+        "quote", "quotation", "price", "pricing", "estimate", "cost",
+        "get a quote", "need a quote", "want a quote", "request a quote"
+    ]
+    user_lower = user_text.lower()
+    
+    # 检查当前消息
+    if any(keyword in user_lower for keyword in quote_keywords):
+        return True
+    
+    # 检查对话历史（最近 3 条）
+    for msg in conversation_history[-3:]:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "").lower()
+            if any(keyword in content for keyword in quote_keywords):
+                return True
+    
+    return False
+
+
+async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:
+    """
+    从对话历史中提取报价信息（电话端版本）
+    
+    复用 quote_tools 的逻辑，但适配电话端的对话格式
+    """
+    try:
+        from quote_tools import _extract_quote_info_tool
+        from rtmt import RTMiddleTier
+        
+        # 创建一个临时的 RTMiddleTier 实例用于调用提取工具
+        # 实际上我们只需要复用提取逻辑，不需要完整的 RTMiddleTier
+        # 直接调用 quote_tools 中的提取逻辑
+        
+        # 构建对话文本
+        conversation_text = "\n".join([
+            f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
+            for msg in conversation_history[-10:]
+        ])
+        
+        # 获取可用产品
+        from salesforce_service import get_salesforce_service
+        sf_service = get_salesforce_service()
+        products = []
+        
+        if sf_service.is_available():
+            try:
+                result = sf_service.sf.query(
+                    "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
+                )
+                if result["totalSize"] > 0:
+                    products = [
+                        {"id": record["Id"], "name": record["Name"]}
+                        for record in result["records"]
+                    ]
+            except Exception as e:
+                logger.error("Error fetching products: %s", str(e))
+        
+        # 使用 GPT 提取信息
+        from openai import AzureOpenAI
+        from azure.core.credentials import AzureKeyCredential
+        from azure.identity import DefaultAzureCredential
+        
+        openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        openai_deployment = (
+            os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+            or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            or "gpt-4o-mini"
+        )
+        llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        
+        if not openai_endpoint or not openai_deployment:
+            return {
+                "extracted": current_state.get("extracted", {}),
+                "missing_fields": ["customer_name", "contact_info", "quote_items"],
+                "is_complete": False,
+            }
+        
+        if llm_key:
+            credential = AzureKeyCredential(llm_key)
+        else:
+            credential = DefaultAzureCredential()
+        
+        product_names = [p["name"] for p in products] if products else []
+        product_list_text = ", ".join(product_names) if product_names else "No products available"
+        
+        # 合并当前已提取的信息
+        extracted_data = current_state.get("extracted", {}).copy()
+        
+        extraction_prompt = f"""Extract quote information from the following conversation. 
+Return a JSON object with the following fields:
+- customer_name: Customer's name (if mentioned)
+- contact_info: Email address or phone number (if mentioned)
+- quote_items: Array of items, each with {{"product_package": "product name", "quantity": number}}. 
+  Support multiple products - if user mentions multiple products, include all of them.
+- expected_start_date: Expected start date in format YYYY-MM-DD (if mentioned)
+- notes: Any additional notes or requirements mentioned
+
+Available products: {product_list_text}
+
+Conversation:
+{conversation_text}
+
+Current extracted data (update only if new information is found):
+{json.dumps(extracted_data, ensure_ascii=False)}
+
+Return ONLY a valid JSON object, no other text. If a field is not found, use null for that field (use [] for quote_items if no products mentioned).
+Merge with current extracted data - only update fields where new information is found."""
+        
+        if isinstance(credential, AzureKeyCredential):
+            client = AzureOpenAI(
+                api_key=credential.key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint
+            )
+        else:
+            token = credential.get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint
+            )
+        
         response = client.chat.completions.create(
             model=openai_deployment,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
+                {"role": "system", "content": "You are a helpful assistant that extracts structured information from conversations. Always return valid JSON only."},
+                {"role": "user", "content": extraction_prompt}
             ],
-            temperature=0.4,
-            max_tokens=128,
+            temperature=0.1,
+            response_format={"type": "json_object"}
         )
-        text = (response.choices[0].message.content or "").strip()
-        if not text:
-            logger.warning("GPT returned empty answer text, using fallback.")
-            return fallback
-
-        logger.info("Answer text from GPT: %s", text)
-        return text
+        
+        new_extracted = json.loads(response.choices[0].message.content)
+        
+        # 合并提取的数据（新数据覆盖旧数据）
+        for key in ["customer_name", "contact_info", "expected_start_date", "notes"]:
+            if new_extracted.get(key):
+                extracted_data[key] = new_extracted[key]
+        
+        # 合并 quote_items（追加新项）
+        if new_extracted.get("quote_items"):
+            existing_items = extracted_data.get("quote_items", [])
+            new_items = new_extracted["quote_items"]
+            # 简单的去重逻辑：如果产品名相同，更新数量
+            for new_item in new_items:
+                if not isinstance(new_item, dict):
+                    continue
+                product_name = new_item.get("product_package")
+                quantity = new_item.get("quantity")
+                if product_name:
+                    # 查找是否已存在
+                    found = False
+                    for existing_item in existing_items:
+                        if isinstance(existing_item, dict) and existing_item.get("product_package") == product_name:
+                            existing_item["quantity"] = quantity
+                            found = True
+                            break
+                    if not found:
+                        existing_items.append(new_item)
+            extracted_data["quote_items"] = existing_items
+        
+        # 产品匹配（使用 quote_tools 的逻辑）
+        if extracted_data.get("quote_items") and products:
+            from quote_tools import _find_best_product_match
+            matched_items = []
+            for item in extracted_data["quote_items"]:
+                if not isinstance(item, dict):
+                    continue
+                user_product = item.get("product_package")
+                quantity = item.get("quantity")
+                if user_product:
+                    matched_product = _find_best_product_match(user_product, products)
+                    if matched_product:
+                        matched_items.append({
+                            "product_package": matched_product,
+                            "quantity": quantity or 1
+                        })
+                    else:
+                        matched_items.append({
+                            "product_package": user_product,
+                            "quantity": quantity or 1
+                        })
+            extracted_data["quote_items"] = matched_items
+        
+        # 邮箱标准化
+        if extracted_data.get("contact_info"):
+            from quote_tools import normalize_email
+            original_contact = extracted_data["contact_info"]
+            normalized_email = normalize_email(str(original_contact))
+            if normalized_email:
+                extracted_data["contact_info"] = normalized_email
+        
+        # 确定缺失字段
+        missing_fields = []
+        if not extracted_data.get("customer_name"):
+            missing_fields.append("customer_name")
+        if not extracted_data.get("contact_info"):
+            missing_fields.append("contact_info")
+        
+        # 检查 quote_items
+        quote_items = extracted_data.get("quote_items", [])
+        valid_items = [
+            item for item in quote_items 
+            if isinstance(item, dict) and 
+               item.get("product_package") and 
+               item.get("quantity") is not None and 
+               item.get("quantity") > 0
+        ]
+        if not valid_items:
+            missing_fields.append("quote_items")
+        
+        return {
+            "extracted": extracted_data,
+            "missing_fields": missing_fields,
+            "products_available": product_names,
+            "is_complete": len(missing_fields) == 0,
+        }
+        
     except Exception as e:
-        logger.error("Failed to generate answer text via Azure OpenAI: %s", str(e))
-        return fallback
+        logger.error("Error extracting quote info: %s", str(e))
+        import traceback
+        logger.error("Traceback: %s", traceback.format_exc())
+        return {
+            "extracted": current_state.get("extracted", {}),
+            "missing_fields": ["customer_name", "contact_info", "quote_items"],
+            "is_complete": False,
+        }
+
+
+def _generate_quote_collection_response(missing_fields: list, quote_state: dict) -> str:
+    """根据缺失字段生成收集报价信息的回答"""
+    extracted = quote_state.get("extracted", {})
+    products_available = quote_state.get("products_available", [])
+    
+    if "customer_name" in missing_fields:
+        return "I'd be happy to help you with a quote. May I have your name, please?"
+    
+    if "contact_info" in missing_fields:
+        customer_name = extracted.get("customer_name", "")
+        if customer_name:
+            return f"Thank you, {customer_name}. What's your email address or phone number?"
+        return "What's your email address or phone number?"
+    
+    if "quote_items" in missing_fields:
+        if products_available:
+            products_text = ", ".join(products_available[:5])  # 只列出前 5 个
+            return f"Which product would you like a quote for? Available products include: {products_text}. And how many would you need?"
+        return "Which product would you like a quote for, and how many would you need?"
+    
+    return "I need a bit more information for your quote. Could you provide the missing details?"
+
+
+async def create_quote_from_state(call_connection_id: str, quote_state: dict) -> Optional[dict]:
+    """从报价状态创建 Salesforce 报价"""
+    try:
+        extracted = quote_state.get("extracted", {})
+        customer_name = extracted.get("customer_name")
+        contact_info = extracted.get("contact_info")
+        quote_items = extracted.get("quote_items", [])
+        expected_start_date = extracted.get("expected_start_date")
+        notes = extracted.get("notes")
+        
+        if not customer_name or not contact_info or not quote_items:
+            logger.error("Incomplete quote information: customer_name=%s, contact_info=%s, quote_items=%s",
+                        customer_name, contact_info, quote_items)
+            return None
+        
+        # 调用 Salesforce 创建报价
+        from salesforce_service import get_salesforce_service
+        from email_service import send_quote_email
+        
+        sf_service = get_salesforce_service()
+        if not sf_service.is_available():
+            logger.error("Salesforce service not available")
+            return None
+        
+        # 创建或获取 Account
+        account_id = sf_service.create_or_get_account(customer_name, contact_info)
+        if not account_id:
+            logger.warning("Failed to create/get Account, will create Quote without Account association")
+        
+        # 创建或获取 Contact
+        if account_id:
+            contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+        
+        # 创建 Opportunity（可选）
+        opportunity_id = None
+        if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true" and account_id:
+            opportunity_id = sf_service.create_opportunity(
+                account_id,
+                f"Opportunity for {customer_name}"
+            )
+        
+        # 创建 Quote
+        quote_result = sf_service.create_quote(
+            account_id=account_id,
+            opportunity_id=opportunity_id,
+            customer_name=customer_name,
+            quote_items=quote_items,
+            expected_start_date=expected_start_date,
+            notes=notes
+        )
+        
+        if not quote_result:
+            logger.error("Failed to create quote in Salesforce")
+            return None
+        
+        # 发送邮件通知
+        if "@" in contact_info:
+            try:
+                product_summary = ", ".join([
+                    f"{item.get('product_package')} (x{item.get('quantity')})" 
+                    for item in quote_items
+                ])
+                total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
+                await send_quote_email(
+                    to_email=contact_info,
+                    customer_name=customer_name,
+                    quote_url=quote_result["quote_url"],
+                    product_package=product_summary,
+                    quantity=str(total_quantity),
+                    expected_start_date=expected_start_date,
+                    notes=notes
+                )
+                logger.info("Quote email sent to %s", contact_info)
+            except Exception as e:
+                logger.error("Error sending quote email: %s", str(e))
+        
+        logger.info("Quote created successfully: ID=%s, Number=%s", 
+                   quote_result.get("quote_id"), quote_result.get("quote_number"))
+        return quote_result
+        
+    except Exception as e:
+        logger.error("Error creating quote from state: %s", str(e))
+        import traceback
+        logger.error("Traceback: %s", traceback.format_exc())
+        return None
 
 
 async def generate_welcome_text_with_gpt() -> str:
