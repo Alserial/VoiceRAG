@@ -681,16 +681,17 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                    behavior, is_recall_question, bool(quote_state))
         if quote_state and is_recall_question:
             logger.info("BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
-            recap = _build_quote_confirmation_recap(quote_state)
+            requested_fields = await _extract_recap_requested_fields(user_text, conversation_history)
+            recap = _build_quote_targeted_recap(quote_state, requested_fields)
             if quote_state.get("is_complete"):
-                logger.info("SUB-BRANCH: Quote is complete, asking for confirmation")
+                logger.info("SUB-BRANCH: Quote is complete, answering requested recap and asking for confirmation")
                 return (
                     f"{recap} Please say 'confirm' or 'yes' to create the quote, "
                     "or tell me what you'd like to change.",
                     False,
                 )
 
-            logger.info("SUB-BRANCH: Quote incomplete, asking for missing fields")
+            logger.info("SUB-BRANCH: Quote incomplete, answering requested recap and asking for missing fields")
             missing_fields = quote_state.get("missing_fields", [])
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
             return f"{recap} {follow_up}", False
@@ -699,8 +700,11 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         is_quote_request = behavior == "quote_request"
         logger.info("BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
                    behavior, is_quote_request, call_connection_id is not None)
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
+=======
         quote_updated = False
         
+>>>>>>> main
         if is_quote_request and call_connection_id:
             logger.info("BRANCH: Entering QUOTE REQUEST branch")
             # Extract quote information
@@ -939,6 +943,93 @@ def _build_quote_confirmation_recap(quote_state: dict) -> str:
     )
 
 
+async def _extract_recap_requested_fields(user_text: str, conversation_history: list) -> list[str]:
+    """Use LLM to identify which quote fields user wants to recap; empty means recap all."""
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint:
+        return []
+
+    try:
+        from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(api_key=llm_key, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+        else:
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(api_key=token, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+
+        payload = {
+            "latest_user_text": user_text,
+            "recent_history": [
+                {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": m.get("content", "")}
+                for m in (conversation_history or [])[-6:]
+                if isinstance(m, dict) and m.get("content")
+            ],
+        }
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Identify which quote fields the user wants to recap. "
+                        "Return JSON only with key requested_fields. "
+                        "Allowed field values: customer_name, contact_info, quote_items, expected_start_date, notes. "
+                        "If user asks for all details or is ambiguous, return an empty array."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=64,
+        )
+        result = json.loads((response.choices[0].message.content or "{}").strip())
+        requested = result.get("requested_fields")
+        if isinstance(requested, list):
+            allowed = {"customer_name", "contact_info", "quote_items", "expected_start_date", "notes"}
+            return [f for f in requested if f in allowed]
+    except Exception as e:
+        logger.warning("Failed to extract recap requested fields: %s", str(e))
+
+    return []
+
+
+def _build_quote_targeted_recap(quote_state: dict, requested_fields: list[str]) -> str:
+    """Build recap text for requested fields; if none specified, fallback to full recap."""
+    if not requested_fields:
+        return _build_quote_confirmation_recap(quote_state)
+
+    extracted = quote_state.get("extracted", {}) if isinstance(quote_state, dict) else {}
+    parts = []
+    if "customer_name" in requested_fields:
+        parts.append(f"name {extracted.get('customer_name') or 'not provided'}")
+    if "contact_info" in requested_fields:
+        parts.append(f"contact {extracted.get('contact_info') or 'not provided'}")
+    if "quote_items" in requested_fields:
+        items = extracted.get("quote_items") or []
+        valid_items = [it for it in items if isinstance(it, dict) and it.get("product_package") and it.get("quantity")]
+        product_text = ", ".join(f"{it.get('product_package')} x{it.get('quantity')}" for it in valid_items) if valid_items else "not provided"
+        parts.append(f"products {product_text}")
+    if "expected_start_date" in requested_fields:
+        parts.append(f"expected start date {extracted.get('expected_start_date') or 'not provided'}")
+    if "notes" in requested_fields:
+        parts.append(f"notes {extracted.get('notes') or 'none'}")
+
+    if not parts:
+        return _build_quote_confirmation_recap(quote_state)
+    return "Here is what I have: " + ", ".join(parts) + "."
+
+
 def _is_quote_info_recall_question(user_text: str) -> bool:
     """Detect if user is asking to recall previously provided quote details."""
     normalized = re.sub(r"\s+", " ", (user_text or "").lower()).strip()
@@ -1032,6 +1123,17 @@ async def _classify_user_behavior_with_llm(
         "Return JSON only with field 'behavior'.\n"
         "Allowed behaviors:\n"
         "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
+        "- recall_quote_info: user asks to repeat/recap one or more previously provided fields.\n"
+        "- modify_quote_info: user wants to change one or more previously provided quote fields.\n"
+        "- general_qa: regular Q&A not about quote flow.\n"
+        "Rules:\n"
+        "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
+        "2) If user is explicitly changing/updating already provided fields, choose modify_quote_info.\n"
+        "3) If user is giving initial details for quote flow or asking for a quote, choose quote_request.\n"
+        "4) If not quote related, choose general_qa.\n"
+        "5) Use conversation context, not keywords only."
+=======
         "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
         "- general_qa: regular Q&A not about quote flow.\n"
         "Rules:\n"
@@ -1039,6 +1141,7 @@ async def _classify_user_behavior_with_llm(
         "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
         "3) If not quote related, choose general_qa.\n"
         "4) Use conversation context, not keywords only."
+>>>>>>> main
     )
 
     payload = {
@@ -1062,7 +1165,11 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
+<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
+        if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
+=======
         if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
+>>>>>>> main
             logger.info("LLM behavior classification: %s", behavior)
             return behavior
         logger.warning("Unknown behavior from classifier: %s", behavior)
