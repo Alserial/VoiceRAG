@@ -900,17 +900,20 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
         "quote", "quotation", "price", "pricing", "estimate", "cost",
         "get a quote", "need a quote", "want a quote", "request a quote"
     ]
-    if valid_items:
-        product_text = ", ".join(
-            f"{item.get('product_package')} x{item.get('quantity')}" for item in valid_items
-        )
-    else:
-        product_text = "not provided"
+    user_lower = user_text.lower()
 
-    return (
-        f"Let me recap: name {customer_name}, contact {contact_info}, "
-        f"products {product_text}, expected start date {expected_start_date}, notes {notes}."
-    )
+    # 检查当前消息
+    if any(keyword in user_lower for keyword in quote_keywords):
+        return True
+
+    # 检查对话历史（最近3条用户消息）
+    for msg in conversation_history[-3:]:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "").lower()
+            if any(keyword in content for keyword in quote_keywords):
+                return True
+
+    return False
 
 
 async def _classify_user_behavior_with_llm(
@@ -1989,4 +1992,3 @@ if __name__ == "__main__":
             logger.info("Please check your ACS_CONNECTION_STRING environment variable")
     
     asyncio.run(main())
-
