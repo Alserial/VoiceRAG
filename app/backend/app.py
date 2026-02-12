@@ -15,6 +15,8 @@ from rtmt import RTMiddleTier
 from quote_tools import attach_quote_extraction_tool, attach_user_registration_tool
 from teams_calling import TeamsCaller
 
+from openai import AzureOpenAI
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voicerag")
 
@@ -143,6 +145,89 @@ async def create_app():
         logger.info("RTMiddleTier initialized with Azure OpenAI")
     else:
         logger.warning("Azure OpenAI configuration not found. Voice features will be disabled. Quote API is still available.")
+
+    def _classify_utterance_state(transcript: str, pending_action: str | None = None) -> dict:
+        """Use LLM to classify user utterance into state used for UI branching."""
+        normalized_pending_action = pending_action if pending_action in {"quote", "user_registration"} else "none"
+
+        if not transcript.strip():
+            return {"state": "other", "pending_action": normalized_pending_action}
+
+        llm_eval_deployment = (
+            os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+            or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+            or "gpt-4o-mini"
+        )
+
+        if not openai_endpoint:
+            logger.warning("Skipping utterance classification because AZURE_OPENAI_ENDPOINT is not configured")
+            return {"state": "other", "pending_action": normalized_pending_action}
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            token_credential = credential or DefaultAzureCredential()
+            token = token_credential.get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        response = client.chat.completions.create(
+            model=llm_eval_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an intent-state classifier for voice interactions. "
+                        "Classify the user utterance to one state only: confirm, cancel, or other. "
+                        "Use semantic intent rather than keywords. "
+                        "Only return cancel when the user truly wants to stop/reject current pending action."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Pending action: {normalized_pending_action}\n"
+                        f"Utterance: {transcript}\n\n"
+                        "Return JSON only with this shape: "
+                        '{"state":"confirm|cancel|other","pending_action":"quote|user_registration|none"}'
+                    ),
+                },
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
+        parsed = json.loads(response.choices[0].message.content)
+        state = parsed.get("state")
+        if state not in {"confirm", "cancel", "other"}:
+            state = "other"
+
+        return {
+            "state": state,
+            "pending_action": normalized_pending_action,
+        }
+
+    async def handle_utterance_state(request: web.Request) -> web.Response:
+        """Classify user utterance into behavior state for front-end branching."""
+        try:
+            payload = await request.json()
+            transcript = str(payload.get("transcript") or "")
+            pending_action = payload.get("pending_action")
+            result = _classify_utterance_state(transcript, pending_action)
+            return web.json_response(result)
+        except Exception as exc:
+            logger.exception("Failed to classify utterance state: %s", str(exc))
+            return web.json_response(
+                {"state": "other", "pending_action": "none", "error": "classification_failed"},
+                status=200,
+            )
 
     async def handle_quote_request(request: web.Request) -> web.Response:
         """Handle quote request - creates quote in Salesforce and sends email."""
@@ -658,6 +743,7 @@ async def create_app():
         web.get('/api/products', handle_get_products),
         web.post('/api/quotes', handle_quote_request),
         web.post('/api/quotes/confirm', handle_confirm_quote),
+        web.post('/api/utterance-state', handle_utterance_state),
         web.post('/api/salesforce/register-user', handle_register_user),
     ]
 

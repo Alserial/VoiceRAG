@@ -487,8 +487,8 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                 logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
                 logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
-            # 检查是否是报价确认（用户说 "confirm", "yes", "send" 等）
-            is_confirmation = _is_confirmation(user_text)
+            # 检查是否是报价确认（使用大模型语义判断，保留 very explicit yes/confirm 快捷判断）
+            is_confirmation = await _is_confirmation(user_text, updated_conversation, quote_state)
             logger.info("🔍 BRANCH: Confirmation check - user_text='%s', is_confirmation=%s, is_complete=%s", 
                        user_text, is_confirmation, quote_state.get("is_complete", False))
             
@@ -665,32 +665,62 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             logger.info("💾 Saved conversation history to call state (call: %s, messages: %d)", 
                        call_connection_id, len(conversation_history))
         
-        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
-        is_recall_question = _is_quote_info_recall_question(user_text)
-        logger.info("🔍 BRANCH: Recall question check - is_recall_question=%s, has_quote_state=%s", 
-                   is_recall_question, bool(quote_state))
+        behavior = await _classify_user_behavior_with_llm(
+            client,
+            openai_deployment,
+            user_text,
+            conversation_history,
+            bool(quote_state),
+            bool(quote_state.get("is_complete")),
+        )
+        quote_updated = False
+
+        # 用户请求修改已提供信息
+        is_modify_request = behavior == "modify_quote_info"
+        if quote_state and is_modify_request:
+            logger.info("➡️  BRANCH: Entering QUOTE MODIFY branch")
+            quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
+            quote_updated = True
+            if call_connection_id in _active_acs_calls:
+                _active_acs_calls[call_connection_id]["quote_state"] = quote_state
+
+            missing_fields = quote_state.get("missing_fields", [])
+            if missing_fields:
+                follow_up = _generate_quote_collection_response(missing_fields, quote_state)
+                return f"Got it, I updated the quote details. {follow_up}", quote_updated
+
+            recap = _build_quote_confirmation_recap(quote_state)
+            return (
+                f"Got it, I updated the quote details. {recap} "
+                "Please say 'confirm' or 'yes' to create the quote, or tell me what you'd like to change.",
+                quote_updated,
+            )
+
+        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答（支持部分字段回顾）
+        is_recall_question = behavior == "recall_quote_info"
+        logger.info("🔍 BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
+                   behavior, is_recall_question, bool(quote_state))
         if quote_state and is_recall_question:
             logger.info("➡️  BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
-            recap = _build_quote_confirmation_recap(quote_state)
+            requested_fields = await _extract_recap_requested_fields(user_text, conversation_history)
+            recap = _build_quote_targeted_recap(quote_state, requested_fields)
             if quote_state.get("is_complete"):
-                logger.info("➡️  SUB-BRANCH: Quote is complete, asking for confirmation")
+                logger.info("➡️  SUB-BRANCH: Quote is complete, answering requested recap and asking for confirmation")
                 return (
                     f"{recap} Please say 'confirm' or 'yes' to create the quote, "
                     "or tell me what you'd like to change.",
                     False,
                 )
 
-            logger.info("➡️  SUB-BRANCH: Quote incomplete, asking for missing fields")
+            logger.info("➡️  SUB-BRANCH: Quote incomplete, answering requested recap and asking for missing fields")
             missing_fields = quote_state.get("missing_fields", [])
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
             return f"{recap} {follow_up}", False
 
-        # 检测是否是报价请求
-        is_quote_request = await _detect_quote_intent(user_text, conversation_history)
-        logger.info("🔍 BRANCH: Quote intent detection - is_quote_request=%s, call_connection_id=%s", 
-                   is_quote_request, call_connection_id is not None)
-        quote_updated = False
-        
+        # 检测是否是报价请求（使用大模型语义判断）
+        is_quote_request = behavior == "quote_request"
+        logger.info("🔍 BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
+                   behavior, is_quote_request, call_connection_id is not None)
         if is_quote_request and call_connection_id:
             logger.info("➡️  BRANCH: Entering QUOTE REQUEST branch")
             # 提取报价信息
@@ -820,29 +850,87 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         return fallback, False
 
 
-def _is_confirmation(user_text: str) -> bool:
-    """检测用户是否确认（用于报价确认）"""
-    user_lower = user_text.lower().strip()
+async def _is_confirmation(user_text: str, conversation_history: list, quote_state: dict) -> bool:
+    """Use LLM to classify final quote confirmation (keep very explicit yes/confirm fast path)."""
+    user_lower = (user_text or "").lower().strip()
     normalized = re.sub(r"[^a-z\s]", " ", user_lower)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    # 仅接受明确确认短句，避免把“yes, but ...”这类修改请求误判成最终确认
-    explicit_confirmations = {
-        "confirm",
-        "yes",
-        "yes confirm",
-        "confirm yes",
-        "send",
-        "send it",
-        "ok",
-        "okay",
-        "proceed",
-        "go ahead",
-        "create",
-        "create it",
-        "submit",
-    }
-    return normalized in explicit_confirmations
+    if normalized in {"yes", "confirm"}:
+        return True
+
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint:
+        logger.warning("Confirmation classification skipped: missing AZURE_OPENAI_ENDPOINT")
+        return False
+
+    try:
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        recent_history = [
+            {
+                "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+                "content": msg.get("content", ""),
+            }
+            for msg in (conversation_history or [])[-6:]
+            if isinstance(msg, dict) and msg.get("content")
+        ]
+
+        payload = {
+            "latest_user_text": user_text,
+            "quote_state_complete": bool((quote_state or {}).get("is_complete")),
+            "recent_history": recent_history,
+            "task": "final_quote_confirmation",
+        }
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify whether the user is explicitly confirming final quote creation right now. "
+                        "Return JSON only with field 'state' and value confirm or other. "
+                        "Use semantics and context, not keywords only. "
+                        "If user is modifying details, asking questions, hesitating, or saying maybe, return other."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=48,
+        )
+
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        return result.get("state") == "confirm"
+    except Exception as e:
+        logger.warning("LLM confirmation classification failed: %s", str(e))
+        return False
 
 
 def _build_quote_confirmation_recap(quote_state: dict) -> str:
@@ -871,6 +959,93 @@ def _build_quote_confirmation_recap(quote_state: dict) -> str:
     )
 
 
+async def _extract_recap_requested_fields(user_text: str, conversation_history: list) -> list[str]:
+    """Use LLM to identify which quote fields user wants to recap; empty means recap all."""
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint:
+        return []
+
+    try:
+        from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(api_key=llm_key, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+        else:
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(api_key=token, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+
+        payload = {
+            "latest_user_text": user_text,
+            "recent_history": [
+                {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": m.get("content", "")}
+                for m in (conversation_history or [])[-6:]
+                if isinstance(m, dict) and m.get("content")
+            ],
+        }
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Identify which quote fields the user wants to recap. "
+                        "Return JSON only with key requested_fields. "
+                        "Allowed field values: customer_name, contact_info, quote_items, expected_start_date, notes. "
+                        "If user asks for all details or is ambiguous, return an empty array."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=64,
+        )
+        result = json.loads((response.choices[0].message.content or "{}").strip())
+        requested = result.get("requested_fields")
+        if isinstance(requested, list):
+            allowed = {"customer_name", "contact_info", "quote_items", "expected_start_date", "notes"}
+            return [f for f in requested if f in allowed]
+    except Exception as e:
+        logger.warning("Failed to extract recap requested fields: %s", str(e))
+
+    return []
+
+
+def _build_quote_targeted_recap(quote_state: dict, requested_fields: list[str]) -> str:
+    """Build recap text for requested fields; if none specified, fallback to full recap."""
+    if not requested_fields:
+        return _build_quote_confirmation_recap(quote_state)
+
+    extracted = quote_state.get("extracted", {}) if isinstance(quote_state, dict) else {}
+    parts = []
+    if "customer_name" in requested_fields:
+        parts.append(f"name {extracted.get('customer_name') or 'not provided'}")
+    if "contact_info" in requested_fields:
+        parts.append(f"contact {extracted.get('contact_info') or 'not provided'}")
+    if "quote_items" in requested_fields:
+        items = extracted.get("quote_items") or []
+        valid_items = [it for it in items if isinstance(it, dict) and it.get("product_package") and it.get("quantity")]
+        product_text = ", ".join(f"{it.get('product_package')} x{it.get('quantity')}" for it in valid_items) if valid_items else "not provided"
+        parts.append(f"products {product_text}")
+    if "expected_start_date" in requested_fields:
+        parts.append(f"expected start date {extracted.get('expected_start_date') or 'not provided'}")
+    if "notes" in requested_fields:
+        parts.append(f"notes {extracted.get('notes') or 'none'}")
+
+    if not parts:
+        return _build_quote_confirmation_recap(quote_state)
+    return "Here is what I have: " + ", ".join(parts) + "."
+
+
 def _is_quote_info_recall_question(user_text: str) -> bool:
     """Detect if user is asking to recall previously provided quote details."""
     normalized = re.sub(r"\s+", " ", (user_text or "").lower()).strip()
@@ -895,25 +1070,48 @@ def _is_quote_info_recall_question(user_text: str) -> bool:
 
 
 async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
-    """检测用户是否有报价意图"""
-    quote_keywords = [
-        "quote", "quotation", "price", "pricing", "estimate", "cost",
-        "get a quote", "need a quote", "want a quote", "request a quote"
-    ]
-    user_lower = user_text.lower()
+    """Keep compatibility for old callsites; now uses LLM semantic classification."""
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
 
-    # 检查当前消息
-    if any(keyword in user_lower for keyword in quote_keywords):
-        return True
+    if not openai_endpoint:
+        return False
 
-    # 检查对话历史（最近3条用户消息）
-    for msg in conversation_history[-3:]:
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "").lower()
-            if any(keyword in content for keyword in quote_keywords):
-                return True
+    try:
+        from openai import AzureOpenAI
 
-    return False
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        behavior = await _classify_user_behavior_with_llm(
+            client=client,
+            deployment=openai_deployment,
+            user_text=user_text,
+            conversation_history=conversation_history,
+            has_quote_state=False,
+            quote_complete=False,
+        )
+        return behavior == "quote_request"
+    except Exception:
+        return False
 
 
 async def _classify_user_behavior_with_llm(
@@ -939,13 +1137,15 @@ async def _classify_user_behavior_with_llm(
         "Return JSON only with field 'behavior'.\n"
         "Allowed behaviors:\n"
         "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
-        "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
+        "- recall_quote_info: user asks to repeat/recap one or more previously provided fields.\n"
+        "- modify_quote_info: user wants to change one or more previously provided quote fields.\n"
         "- general_qa: regular Q&A not about quote flow.\n"
         "Rules:\n"
         "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
-        "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
-        "3) If not quote related, choose general_qa.\n"
-        "4) Use conversation context, not keywords only."
+        "2) If user is explicitly changing/updating already provided fields, choose modify_quote_info.\n"
+        "3) If user is giving initial details for quote flow or asking for a quote, choose quote_request.\n"
+        "4) If not quote related, choose general_qa.\n"
+        "5) Use conversation context, not keywords only."
     )
 
     payload = {
@@ -969,7 +1169,7 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
-        if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
+        if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
             logger.info("LLM behavior classification: %s", behavior)
             return behavior
         logger.warning("Unknown behavior from classifier: %s", behavior)
