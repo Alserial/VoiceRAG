@@ -614,8 +614,13 @@ async def _extract_user_info_tool(
         
         extraction_prompt = f"""Extract user registration information from the following conversation.
 Return a JSON object with:
-- customer_name: User's name (if mentioned)
-- contact_info: Email address (if mentioned)
+- customer_name: User's name (if known from any prior user turn)
+- contact_info: Email address (if known from any prior user turn)
+
+Important rules:
+- Use the full conversation context, not just the latest message.
+- If the latest user message asks what they previously provided (for example: "what email did I give"), return the previously provided values from earlier turns.
+- Prefer the most recently provided valid value when multiple values exist.
 
 Conversation:
 {conversation_text}
