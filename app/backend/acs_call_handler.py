@@ -487,8 +487,8 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                 logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
                 logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
-            # 检查是否是报价确认（用户说 "confirm", "yes", "send" 等）
-            is_confirmation = _is_confirmation(user_text)
+            # 检查是否是报价确认（使用大模型语义判断，保留 very explicit yes/confirm 快捷判断）
+            is_confirmation = await _is_confirmation(user_text, updated_conversation, quote_state)
             logger.info("🔍 BRANCH: Confirmation check - user_text='%s', is_confirmation=%s, is_complete=%s", 
                        user_text, is_confirmation, quote_state.get("is_complete", False))
             
@@ -665,10 +665,19 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             logger.info("💾 Saved conversation history to call state (call: %s, messages: %d)", 
                        call_connection_id, len(conversation_history))
         
+        behavior = await _classify_user_behavior_with_llm(
+            client,
+            openai_deployment,
+            user_text,
+            conversation_history,
+            bool(quote_state),
+            bool(quote_state.get("is_complete")),
+        )
+
         # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
-        is_recall_question = _is_quote_info_recall_question(user_text)
-        logger.info("🔍 BRANCH: Recall question check - is_recall_question=%s, has_quote_state=%s", 
-                   is_recall_question, bool(quote_state))
+        is_recall_question = behavior == "recall_quote_info"
+        logger.info("🔍 BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
+                   behavior, is_recall_question, bool(quote_state))
         if quote_state and is_recall_question:
             logger.info("➡️  BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
             recap = _build_quote_confirmation_recap(quote_state)
@@ -685,10 +694,10 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
             return f"{recap} {follow_up}", False
 
-        # 检测是否是报价请求
-        is_quote_request = await _detect_quote_intent(user_text, conversation_history)
-        logger.info("🔍 BRANCH: Quote intent detection - is_quote_request=%s, call_connection_id=%s", 
-                   is_quote_request, call_connection_id is not None)
+        # 检测是否是报价请求（使用大模型语义判断）
+        is_quote_request = behavior == "quote_request"
+        logger.info("🔍 BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
+                   behavior, is_quote_request, call_connection_id is not None)
         quote_updated = False
         
         if is_quote_request and call_connection_id:
@@ -820,29 +829,87 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         return fallback, False
 
 
-def _is_confirmation(user_text: str) -> bool:
-    """检测用户是否确认（用于报价确认）"""
-    user_lower = user_text.lower().strip()
+async def _is_confirmation(user_text: str, conversation_history: list, quote_state: dict) -> bool:
+    """Use LLM to classify final quote confirmation (keep very explicit yes/confirm fast path)."""
+    user_lower = (user_text or "").lower().strip()
     normalized = re.sub(r"[^a-z\s]", " ", user_lower)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    # 仅接受明确确认短句，避免把“yes, but ...”这类修改请求误判成最终确认
-    explicit_confirmations = {
-        "confirm",
-        "yes",
-        "yes confirm",
-        "confirm yes",
-        "send",
-        "send it",
-        "ok",
-        "okay",
-        "proceed",
-        "go ahead",
-        "create",
-        "create it",
-        "submit",
-    }
-    return normalized in explicit_confirmations
+    if normalized in {"yes", "confirm"}:
+        return True
+
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint:
+        logger.warning("Confirmation classification skipped: missing AZURE_OPENAI_ENDPOINT")
+        return False
+
+    try:
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        recent_history = [
+            {
+                "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+                "content": msg.get("content", ""),
+            }
+            for msg in (conversation_history or [])[-6:]
+            if isinstance(msg, dict) and msg.get("content")
+        ]
+
+        payload = {
+            "latest_user_text": user_text,
+            "quote_state_complete": bool((quote_state or {}).get("is_complete")),
+            "recent_history": recent_history,
+            "task": "final_quote_confirmation",
+        }
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify whether the user is explicitly confirming final quote creation right now. "
+                        "Return JSON only with field 'state' and value confirm or other. "
+                        "Use semantics and context, not keywords only. "
+                        "If user is modifying details, asking questions, hesitating, or saying maybe, return other."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=48,
+        )
+
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        return result.get("state") == "confirm"
+    except Exception as e:
+        logger.warning("LLM confirmation classification failed: %s", str(e))
+        return False
 
 
 def _build_quote_confirmation_recap(quote_state: dict) -> str:
@@ -895,25 +962,48 @@ def _is_quote_info_recall_question(user_text: str) -> bool:
 
 
 async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
-    """检测用户是否有报价意图"""
-    quote_keywords = [
-        "quote", "quotation", "price", "pricing", "estimate", "cost",
-        "get a quote", "need a quote", "want a quote", "request a quote"
-    ]
-    user_lower = user_text.lower()
+    """Keep compatibility for old callsites; now uses LLM semantic classification."""
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
 
-    # 检查当前消息
-    if any(keyword in user_lower for keyword in quote_keywords):
-        return True
+    if not openai_endpoint:
+        return False
 
-    # 检查对话历史（最近3条用户消息）
-    for msg in conversation_history[-3:]:
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "").lower()
-            if any(keyword in content for keyword in quote_keywords):
-                return True
+    try:
+        from openai import AzureOpenAI
 
-    return False
+        if llm_key:
+            client = AzureOpenAI(
+                api_key=llm_key,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+        else:
+            from azure.identity import DefaultAzureCredential
+
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(
+                api_key=token,
+                api_version="2024-02-15-preview",
+                azure_endpoint=openai_endpoint,
+            )
+
+        behavior = await _classify_user_behavior_with_llm(
+            client=client,
+            deployment=openai_deployment,
+            user_text=user_text,
+            conversation_history=conversation_history,
+            has_quote_state=False,
+            quote_complete=False,
+        )
+        return behavior == "quote_request"
+    except Exception:
+        return False
 
 
 async def _classify_user_behavior_with_llm(

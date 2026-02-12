@@ -116,41 +116,75 @@ function App() {
         setUserRegistrationData(null);
     }, []);
 
-    // Listen for voice confirmation
-    const checkVoiceConfirmation = useCallback((transcript: string) => {
-        const confirmKeywords = ["confirm", "yes", "send", "ok", "okay", "proceed", "go ahead"];
-        const cancelKeywords = ["cancel", "no", "stop", "wait"];
-        
-        const lowerTranscript = transcript.toLowerCase();
-        
-        // Check for quote confirmation
-        if (confirmKeywords.some(keyword => lowerTranscript.includes(keyword))) {
+    // Listen for voice state via backend LLM classifier (except very explicit confirmations)
+    const checkVoiceConfirmation = useCallback(async (transcript: string) => {
+        const lowerTranscript = transcript.toLowerCase().trim();
+        const explicitConfirmSet = new Set(["yes", "confirm"]);
+        const pendingAction = quoteData ? "quote" : userRegistrationData ? "user_registration" : "none";
+
+        if (pendingAction === "none") {
+            return;
+        }
+
+        const handleConfirmForPendingAction = () => {
             if (quoteData) {
-                addDebugMessage("info", "检测到语音确认 - 报价", { transcript });
+                addDebugMessage("info", "检测到语音确认 - 报价", { transcript, source: "explicit_or_llm" });
                 handleQuoteConfirm().catch(err => {
                     console.error("Error in voice quote confirmation:", err);
                 });
                 return;
             }
-            // Check for user registration confirmation
             if (userRegistrationData) {
-                addDebugMessage("info", "检测到语音确认 - 用户注册", { transcript });
+                addDebugMessage("info", "检测到语音确认 - 用户注册", { transcript, source: "explicit_or_llm" });
                 handleUserRegistrationConfirm().catch(err => {
                     console.error("Error in voice user registration confirmation:", err);
                 });
-                return;
             }
-        } else if (cancelKeywords.some(keyword => lowerTranscript.includes(keyword))) {
+        };
+
+        const handleCancelForPendingAction = () => {
             if (quoteData) {
-                addDebugMessage("info", "检测到语音取消 - 报价", { transcript });
+                addDebugMessage("info", "检测到语音取消 - 报价", { transcript, source: "llm" });
                 handleQuoteCancel();
                 return;
             }
             if (userRegistrationData) {
-                addDebugMessage("info", "检测到语音取消 - 用户注册", { transcript });
+                addDebugMessage("info", "检测到语音取消 - 用户注册", { transcript, source: "llm" });
                 handleUserRegistrationCancel();
+            }
+        };
+
+        // Keep explicit confirms as fast path
+        if (explicitConfirmSet.has(lowerTranscript)) {
+            handleConfirmForPendingAction();
+            return;
+        }
+
+        try {
+            const response = await fetch("/api/utterance-state", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ transcript, pending_action: pendingAction }),
+            });
+
+            if (!response.ok) {
+                addDebugMessage("error", "语音状态识别失败", { transcript, status: response.status });
                 return;
             }
+
+            const result = await response.json();
+            addDebugMessage("info", "语音行为状态识别结果", { transcript, result });
+
+            if (result.state === "confirm") {
+                handleConfirmForPendingAction();
+            } else if (result.state === "cancel") {
+                handleCancelForPendingAction();
+            }
+        } catch (err) {
+            console.error("Error in utterance state classification:", err);
+            addDebugMessage("error", "语音状态识别异常", { transcript, error: String(err) });
         }
     }, [quoteData, userRegistrationData, handleQuoteConfirm, handleQuoteCancel, handleUserRegistrationConfirm, handleUserRegistrationCancel, addDebugMessage]);
 
@@ -205,7 +239,9 @@ function App() {
             });
             // Check for voice confirmation when quote or user registration is pending
             if (message.transcript && (quoteData || userRegistrationData)) {
-                checkVoiceConfirmation(message.transcript);
+                checkVoiceConfirmation(message.transcript).catch(err => {
+                    console.error("Error while checking voice confirmation:", err);
+                });
             }
         },
         onReceivedExtensionMiddleTierToolResponse: message => {
