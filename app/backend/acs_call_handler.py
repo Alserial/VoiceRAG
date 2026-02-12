@@ -900,20 +900,80 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
         "quote", "quotation", "price", "pricing", "estimate", "cost",
         "get a quote", "need a quote", "want a quote", "request a quote"
     ]
-    user_lower = user_text.lower()
-    
-    # 检查当前消息
-    if any(keyword in user_lower for keyword in quote_keywords):
-        return True
-    
-    # 检查对话历史（最近 3 条）
-    for msg in conversation_history[-3:]:
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content", "").lower()
-            if any(keyword in content for keyword in quote_keywords):
-                return True
-    
-    return False
+    if valid_items:
+        product_text = ", ".join(
+            f"{item.get('product_package')} x{item.get('quantity')}" for item in valid_items
+        )
+    else:
+        product_text = "not provided"
+
+    return (
+        f"Let me recap: name {customer_name}, contact {contact_info}, "
+        f"products {product_text}, expected start date {expected_start_date}, notes {notes}."
+    )
+
+
+async def _classify_user_behavior_with_llm(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    has_quote_state: bool,
+    quote_complete: bool,
+) -> str:
+    """Use LLM to classify the user's current intent into a branch behavior."""
+    recent_history = [
+        {
+            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+            "content": msg.get("content", ""),
+        }
+        for msg in conversation_history[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+
+    classifier_prompt = (
+        "Classify the user's intent for call-flow branching. "
+        "Return JSON only with field 'behavior'.\n"
+        "Allowed behaviors:\n"
+        "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
+        "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
+        "- general_qa: regular Q&A not about quote flow.\n"
+        "Rules:\n"
+        "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
+        "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
+        "3) If not quote related, choose general_qa.\n"
+        "4) Use conversation context, not keywords only."
+    )
+
+    payload = {
+        "has_quote_state": has_quote_state,
+        "quote_complete": quote_complete,
+        "recent_history": recent_history,
+        "latest_user_text": user_text,
+    }
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": classifier_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=64,
+        )
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        behavior = result.get("behavior")
+        if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
+            logger.info("LLM behavior classification: %s", behavior)
+            return behavior
+        logger.warning("Unknown behavior from classifier: %s", behavior)
+    except Exception as e:
+        logger.warning("LLM behavior classification failed, fallback to general_qa: %s", str(e))
+
+    return "general_qa"
 
 
 async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:
