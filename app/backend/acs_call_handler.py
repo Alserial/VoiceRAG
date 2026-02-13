@@ -17,6 +17,7 @@ Azure Communication Services (ACS) Call Automation Handler
 """
 
 import json
+import inspect
 import logging
 import os
 import re
@@ -113,16 +114,18 @@ def _create_media_streaming_options(stream_url: str) -> Any:
     """兼容不同 ACS SDK 版本构造 MediaStreamingOptions。"""
     try:
         from azure.communication.callautomation import (  # type: ignore
-            AudioChannelType,
             AudioFormat,
+            MediaStreamingAudioChannelType,
+            MediaStreamingContentType,
             MediaStreamingOptions,
-            MediaStreamingTransportType,
+            StreamingTransportType,
         )
 
         return MediaStreamingOptions(
             transport_url=stream_url,
-            transport_type=MediaStreamingTransportType.WEBSOCKET,
-            audio_channel_type=AudioChannelType.MIXED,
+            transport_type=StreamingTransportType.WEBSOCKET,
+            content_type=MediaStreamingContentType.AUDIO,
+            audio_channel_type=MediaStreamingAudioChannelType.MIXED,
             audio_format=AudioFormat.PCM24_K_MONO,
             enable_bidirectional=True,
             start_media_streaming=True,
@@ -132,6 +135,7 @@ def _create_media_streaming_options(stream_url: str) -> Any:
         return {
             "transport_url": stream_url,
             "transport_type": "websocket",
+            "content_type": "audio",
             "audio_channel_type": "mixed",
             "audio_format": "pcm24KMono",
             "enable_bidirectional": True,
@@ -148,20 +152,25 @@ async def start_realtime_bridge(call_connection_id: str, session_key: str) -> No
 
     call_connection = acs_client.get_call_connection(call_connection_id)
     stream_url = _build_realtime_ws_url(session_key)
-    options = _create_media_streaming_options(stream_url)
-
     logger.info("🌉 Starting ACS + GPT-4o Realtime bridge")
     logger.info("   call_connection_id=%s", call_connection_id)
     logger.info("   session_key=%s", session_key)
     logger.info("   stream_url=%s", stream_url)
 
     try:
+        start_media_streaming = None
         if hasattr(call_connection, "start_media_streaming"):
-            call_connection.start_media_streaming(options)  # type: ignore[misc]
+            start_media_streaming = call_connection.start_media_streaming  # type: ignore[assignment]
         elif hasattr(call_connection, "call_media") and hasattr(call_connection.call_media, "start_media_streaming"):
-            call_connection.call_media.start_media_streaming(options)  # type: ignore[misc]
+            start_media_streaming = call_connection.call_media.start_media_streaming  # type: ignore[assignment]
         else:
             raise AttributeError("Current ACS SDK does not expose start_media_streaming")
+
+        # SDK 1.5.0 的 start_media_streaming() 是 keyword-only，且不接受位置参数。
+        # 媒体流配置（transport_url 等）应在 answer_call(..., media_streaming=...) 阶段提供。
+        method_signature = inspect.signature(start_media_streaming)
+        logger.info("start_media_streaming signature: %s", method_signature)
+        start_media_streaming()  # type: ignore[misc]
 
         _active_acs_calls.setdefault(call_connection_id, {})["realtime_bridge"] = {
             "status": "started",
@@ -171,7 +180,18 @@ async def start_realtime_bridge(call_connection_id: str, session_key: str) -> No
         }
         logger.info("✅ ACS realtime bridge started")
     except Exception as e:
-        logger.error("❌ Failed to start ACS realtime bridge: %s", str(e))
+        error_text = str(e)
+        # 已启动媒体流时，不应视为失败（幂等触发常见于重复事件/重试）
+        if "Media streaming has already started" in error_text or "(8583)" in error_text:
+            _active_acs_calls.setdefault(call_connection_id, {})["realtime_bridge"] = {
+                "status": "already_started",
+                "session_key": session_key,
+                "stream_url": stream_url,
+                "started_at": time.time(),
+            }
+            logger.info("ℹ️ ACS realtime bridge already started for call=%s", call_connection_id)
+            return
+        logger.error("❌ Failed to start ACS realtime bridge: %s", error_text)
 
 
 def get_acs_client() -> Optional[CallAutomationClient]:
@@ -253,6 +273,10 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
             return {"error": "Callback URL not configured"}
         
         logger.info("   Callback URL: %s", callback_url)
+
+        stream_url = _build_realtime_ws_url(_extract_caller_id(event_data))
+        media_streaming_options = _create_media_streaming_options(stream_url)
+        logger.info("   Realtime Stream URL: %s", stream_url)
         
         # 准备 Cognitive Services 配置（用于在通话建立阶段启用 TTS 能力）
         cog_endpoint = os.environ.get("ACS_COGNITIVE_SERVICE_ENDPOINT", "").strip()
@@ -277,24 +301,42 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                 # 某些 SDK 版本在 answer_call 上直接暴露 cognitive_services_endpoint 参数
                 logger.info("📞 Answering call with cognitive_services_endpoint kwarg...")
                 try:
-                    answer_result = acs_client.answer_call(
-                        incoming_call_context=incoming_call_context,
-                        callback_url=callback_url,
-                        cognitive_services_endpoint=cog_endpoint,  # type: ignore[call-arg]
-                    )
+                    answer_kwargs: dict[str, Any] = {
+                        "incoming_call_context": incoming_call_context,
+                        "callback_url": callback_url,
+                        "cognitive_services_endpoint": cog_endpoint,
+                    }
+                    answer_call_signature = inspect.signature(acs_client.answer_call)
+                    if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                        answer_kwargs["media_streaming"] = media_streaming_options
+                        logger.info("   media_streaming options attached to answer_call")
+                    elif isinstance(media_streaming_options, dict):
+                        logger.warning("   media_streaming options unavailable as typed object; skipping for this SDK")
+
+                    answer_result = acs_client.answer_call(**answer_kwargs)
                 except TypeError:
                     logger.warning("answer_call() does not accept cognitive_services_endpoint; falling back to basic answer_call.")
-                    answer_result = acs_client.answer_call(
-                        incoming_call_context=incoming_call_context,
-                        callback_url=callback_url,
-                    )
+                    fallback_kwargs: dict[str, Any] = {
+                        "incoming_call_context": incoming_call_context,
+                        "callback_url": callback_url,
+                    }
+                    answer_call_signature = inspect.signature(acs_client.answer_call)
+                    if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                        fallback_kwargs["media_streaming"] = media_streaming_options
+                        logger.info("   media_streaming options attached to fallback answer_call")
+                    answer_result = acs_client.answer_call(**fallback_kwargs)
             else:
                 # 未配置认知服务终结点，使用最基础的 answer_call（仍可接通，但可能无法使用某些智能特性）
                 logger.warning("ACS_COGNITIVE_SERVICE_ENDPOINT not set; answering call without cognitive configuration.")
-                answer_result = acs_client.answer_call(
-                    incoming_call_context=incoming_call_context,
-                    callback_url=callback_url,
-                )
+                answer_kwargs: dict[str, Any] = {
+                    "incoming_call_context": incoming_call_context,
+                    "callback_url": callback_url,
+                }
+                answer_call_signature = inspect.signature(acs_client.answer_call)
+                if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                    answer_kwargs["media_streaming"] = media_streaming_options
+                    logger.info("   media_streaming options attached to answer_call")
+                answer_result = acs_client.answer_call(**answer_kwargs)
         except Exception as e:
             logger.error("❌ Error calling answer_call with cognitive configuration: %s", str(e))
             import traceback

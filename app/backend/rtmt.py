@@ -92,7 +92,10 @@ class RTMiddleTier:
             msg_type = message.get("type", "")
             if "input_audio" in msg_type or "transcription" in msg_type:
                 logger.debug("Received message type: %s, content: %s", msg_type, json.dumps(message)[:200])
-            match message["type"]:
+            match message.get("type"):
+                case None:
+                    logger.warning("Realtime server message missing 'type': keys=%s", list(message.keys()))
+                    return updated_message
                 case "session.created":
                     session = message["session"]
                     # Hide the instructions, tools and max tokens from clients, if we ever allow client-side 
@@ -118,18 +121,18 @@ class RTMiddleTier:
                     updated_message = json.dumps(message)
 
                 case "response.output_item.added":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         updated_message = None
 
                 case "conversation.item.created":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         item = message["item"]
                         if item["call_id"] not in self._tools_pending:
                             self._tools_pending[item["call_id"]] = RTToolCall(item["call_id"], message["previous_item_id"])
                         updated_message = None
-                    elif "item" in message and message["item"]["type"] == "function_call_output":
+                    elif "item" in message and message["item"].get("type") == "function_call_output":
                         updated_message = None
-                    elif "item" in message and message["item"]["type"] == "input_audio_transcription":
+                    elif "item" in message and message["item"].get("type") == "input_audio_transcription":
                         # Record user input transcription (when created as item)
                         session_id = getattr(client_ws, "session_id", None)
                         if session_id and session_id in self._conversation_logs:
@@ -197,7 +200,7 @@ class RTMiddleTier:
                     updated_message = None
 
                 case "response.output_item.done":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         item = message["item"]
                         tool_name = item["name"]
                         logger.info("Tool called: %s, call_id: %s, args: %s", tool_name, item.get("call_id"), item.get("arguments", "")[:200])
@@ -249,7 +252,7 @@ class RTMiddleTier:
                     if "response" in message:
                         replace = False
                         for i, output in enumerate(reversed(message["response"]["output"])):
-                            if output["type"] == "function_call":
+                            if output.get("type") == "function_call":
                                 message["response"]["output"].pop(i)
                                 replace = True
                         if replace:
@@ -299,7 +302,10 @@ class RTMiddleTier:
             if "input_audio" in msg_type or "transcription" in msg_type:
                 logger.debug("Processing message type: %s, full message: %s", msg_type, json.dumps(message)[:300])
             
-            match message["type"]:
+            match message.get("type"):
+                case None:
+                    logger.warning("Realtime client message missing 'type': keys=%s", list(message.keys()))
+                    return updated_message
                 case "session.update":
                     session = message["session"]
                     if self.system_message is not None:
@@ -321,17 +327,52 @@ class RTMiddleTier:
     async def _forward_messages(self, ws: web.WebSocketResponse):
         session_id = getattr(ws, "session_id", str(uuid4()))
         ws.session_id = session_id
-        
+
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
-            params = { "api-version": self.api_version, "deployment": self.deployment}
+            params = {"api-version": self.api_version, "deployment": self.deployment}
             headers = {}
             if "x-ms-client-request-id" in ws.headers:
                 headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
             if self.key is not None:
-                headers = { "api-key": self.key }
+                headers = {"api-key": self.key}
             else:
-                headers = { "Authorization": f"Bearer {self._token_provider()}" } # NOTE: no async version of token provider, maybe refresh token on a timer?
-            async with session.ws_connect("/openai/realtime", headers=headers, params=params) as target_ws:
+                headers = {"Authorization": f"Bearer {self._token_provider()}"}  # NOTE: no async version of token provider, maybe refresh token on a timer?
+
+            target_ws = None
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    target_ws = await session.ws_connect("/openai/realtime", headers=headers, params=params)
+                    break
+                except aiohttp.WSServerHandshakeError as exc:
+                    if exc.status == 429 and attempt < max_attempts:
+                        delay_seconds = min(8, 2 ** (attempt - 1))
+                        logger.warning(
+                            "Azure OpenAI realtime handshake hit 429 (attempt %d/%d). Retrying in %ss.",
+                            attempt,
+                            max_attempts,
+                            delay_seconds,
+                        )
+                        await asyncio.sleep(delay_seconds)
+                        continue
+                    logger.error(
+                        "Failed to connect to Azure OpenAI realtime websocket: status=%s, message=%s",
+                        exc.status,
+                        str(exc),
+                    )
+                    await ws.send_json({
+                        "type": "extension.middle_tier_error",
+                        "error": "realtime_handshake_failed",
+                        "status": exc.status,
+                    })
+                    await ws.close(code=1013, message=b"Upstream realtime unavailable")
+                    return
+
+            if target_ws is None:
+                await ws.close(code=1013, message=b"Upstream realtime unavailable")
+                return
+
+            async with target_ws:
                 async def from_client_to_server():
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -340,12 +381,12 @@ class RTMiddleTier:
                                 await target_ws.send_str(new_msg)
                         else:
                             print("Error: unexpected message type:", msg.type)
-                    
+
                     # Means it is gracefully closed by the client then time to close the target_ws
                     if target_ws:
                         print("Closing OpenAI's realtime socket connection.")
                         await target_ws.close()
-                        
+
                 async def from_server_to_client():
                     async for msg in target_ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -367,6 +408,19 @@ class RTMiddleTier:
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        # Enforce ACS-only access pattern: ACS media bridge must provide ?session=<caller-id>.
+        requested_session_id = request.query.get("session")
+        if not requested_session_id:
+            logger.warning("Rejecting /realtime connection without session (ACS-only enforcement)")
+            await ws.send_json({
+                "type": "extension.middle_tier_error",
+                "error": "realtime_session_required",
+                "message": "ACS-only mode: /realtime requires ?session=<id>",
+            })
+            await ws.close(code=1008, message=b"Session query parameter required")
+            return ws
+
+        ws.session_id = requested_session_id
         await self._forward_messages(ws)
         return ws
 
