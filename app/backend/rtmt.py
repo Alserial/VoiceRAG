@@ -367,6 +367,10 @@ class RTMiddleTier:
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        # Allow callers (for example ACS media bridge) to pin a stable session id.
+        requested_session_id = request.query.get("session")
+        if requested_session_id:
+            ws.session_id = requested_session_id
         await self._forward_messages(ws)
         return ws
 
