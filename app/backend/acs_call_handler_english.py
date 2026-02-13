@@ -700,11 +700,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         is_quote_request = behavior == "quote_request"
         logger.info("BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
                    behavior, is_quote_request, call_connection_id is not None)
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
-=======
         quote_updated = False
         
->>>>>>> main
         if is_quote_request and call_connection_id:
             logger.info("BRANCH: Entering QUOTE REQUEST branch")
             # Extract quote information
@@ -1123,17 +1120,6 @@ async def _classify_user_behavior_with_llm(
         "Return JSON only with field 'behavior'.\n"
         "Allowed behaviors:\n"
         "- quote_request: user wants a quote/pricing/estimate, or is providing/updating quote details.\n"
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
-        "- recall_quote_info: user asks to repeat/recap one or more previously provided fields.\n"
-        "- modify_quote_info: user wants to change one or more previously provided quote fields.\n"
-        "- general_qa: regular Q&A not about quote flow.\n"
-        "Rules:\n"
-        "1) If user is explicitly asking for previously provided details, choose recall_quote_info.\n"
-        "2) If user is explicitly changing/updating already provided fields, choose modify_quote_info.\n"
-        "3) If user is giving initial details for quote flow or asking for a quote, choose quote_request.\n"
-        "4) If not quote related, choose general_qa.\n"
-        "5) Use conversation context, not keywords only."
-=======
         "- recall_quote_info: user asks to repeat/recap what they already provided (name/contact/product/quantity/date/notes).\n"
         "- general_qa: regular Q&A not about quote flow.\n"
         "Rules:\n"
@@ -1141,7 +1127,6 @@ async def _classify_user_behavior_with_llm(
         "2) If user is giving or modifying details for quote flow, choose quote_request.\n"
         "3) If not quote related, choose general_qa.\n"
         "4) Use conversation context, not keywords only."
->>>>>>> main
     )
 
     payload = {
@@ -1165,11 +1150,7 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
-        if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
-=======
         if behavior in {"quote_request", "recall_quote_info", "general_qa"}:
->>>>>>> main
             logger.info("LLM behavior classification: %s", behavior)
             return behavior
         logger.warning("Unknown behavior from classifier: %s", behavior)
@@ -2191,4 +2172,3 @@ if __name__ == "__main__":
             logger.info("Please check your ACS_CONNECTION_STRING environment variable")
     
     asyncio.run(main())
-

@@ -673,35 +673,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             bool(quote_state),
             bool(quote_state.get("is_complete")),
         )
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
-        quote_updated = False
-
-        # 用户请求修改已提供信息
-        is_modify_request = behavior == "modify_quote_info"
-        if quote_state and is_modify_request:
-            logger.info("➡️  BRANCH: Entering QUOTE MODIFY branch")
-            quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
-            quote_updated = True
-            if call_connection_id in _active_acs_calls:
-                _active_acs_calls[call_connection_id]["quote_state"] = quote_state
-
-            missing_fields = quote_state.get("missing_fields", [])
-            if missing_fields:
-                follow_up = _generate_quote_collection_response(missing_fields, quote_state)
-                return f"Got it, I updated the quote details. {follow_up}", quote_updated
-
-            recap = _build_quote_confirmation_recap(quote_state)
-            return (
-                f"Got it, I updated the quote details. {recap} "
-                "Please say 'confirm' or 'yes' to create the quote, or tell me what you'd like to change.",
-                quote_updated,
-            )
-
-        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答（支持部分字段回顾）
-=======
 
         # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
->>>>>>> main
         is_recall_question = behavior == "recall_quote_info"
         logger.info("🔍 BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
                    behavior, is_recall_question, bool(quote_state))
@@ -726,11 +699,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         is_quote_request = behavior == "quote_request"
         logger.info("🔍 BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
                    behavior, is_quote_request, call_connection_id is not None)
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
-=======
         quote_updated = False
         
->>>>>>> main
         if is_quote_request and call_connection_id:
             logger.info("➡️  BRANCH: Entering QUOTE REQUEST branch")
             # 提取报价信息
@@ -1094,7 +1064,6 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
 
     try:
         from openai import AzureOpenAI
-<<<<<<< codex/refactor-user-behavior-detection-with-ai-model-l85coe
 
         if llm_key:
             client = AzureOpenAI(
@@ -1112,25 +1081,6 @@ async def _detect_quote_intent(user_text: str, conversation_history: list) -> bo
                 azure_endpoint=openai_endpoint,
             )
 
-=======
-
-        if llm_key:
-            client = AzureOpenAI(
-                api_key=llm_key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-        else:
-            from azure.identity import DefaultAzureCredential
-
-            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
-            client = AzureOpenAI(
-                api_key=token,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-
->>>>>>> main
         behavior = await _classify_user_behavior_with_llm(
             client=client,
             deployment=openai_deployment,
