@@ -321,17 +321,52 @@ class RTMiddleTier:
     async def _forward_messages(self, ws: web.WebSocketResponse):
         session_id = getattr(ws, "session_id", str(uuid4()))
         ws.session_id = session_id
-        
+
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
-            params = { "api-version": self.api_version, "deployment": self.deployment}
+            params = {"api-version": self.api_version, "deployment": self.deployment}
             headers = {}
             if "x-ms-client-request-id" in ws.headers:
                 headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
             if self.key is not None:
-                headers = { "api-key": self.key }
+                headers = {"api-key": self.key}
             else:
-                headers = { "Authorization": f"Bearer {self._token_provider()}" } # NOTE: no async version of token provider, maybe refresh token on a timer?
-            async with session.ws_connect("/openai/realtime", headers=headers, params=params) as target_ws:
+                headers = {"Authorization": f"Bearer {self._token_provider()}"}  # NOTE: no async version of token provider, maybe refresh token on a timer?
+
+            target_ws = None
+            max_attempts = 4
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    target_ws = await session.ws_connect("/openai/realtime", headers=headers, params=params)
+                    break
+                except aiohttp.WSServerHandshakeError as exc:
+                    if exc.status == 429 and attempt < max_attempts:
+                        delay_seconds = min(8, 2 ** (attempt - 1))
+                        logger.warning(
+                            "Azure OpenAI realtime handshake hit 429 (attempt %d/%d). Retrying in %ss.",
+                            attempt,
+                            max_attempts,
+                            delay_seconds,
+                        )
+                        await asyncio.sleep(delay_seconds)
+                        continue
+                    logger.error(
+                        "Failed to connect to Azure OpenAI realtime websocket: status=%s, message=%s",
+                        exc.status,
+                        str(exc),
+                    )
+                    await ws.send_json({
+                        "type": "extension.middle_tier_error",
+                        "error": "realtime_handshake_failed",
+                        "status": exc.status,
+                    })
+                    await ws.close(code=1013, message=b"Upstream realtime unavailable")
+                    return
+
+            if target_ws is None:
+                await ws.close(code=1013, message=b"Upstream realtime unavailable")
+                return
+
+            async with target_ws:
                 async def from_client_to_server():
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -340,12 +375,12 @@ class RTMiddleTier:
                                 await target_ws.send_str(new_msg)
                         else:
                             print("Error: unexpected message type:", msg.type)
-                    
+
                     # Means it is gracefully closed by the client then time to close the target_ws
                     if target_ws:
                         print("Closing OpenAI's realtime socket connection.")
                         await target_ws.close()
-                        
+
                 async def from_server_to_client():
                     async for msg in target_ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -367,6 +402,25 @@ class RTMiddleTier:
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        # Allow callers (for example ACS media bridge) to pin a stable session id.
+        requested_session_id = request.query.get("session")
+
+        # Optional ACS-only mode: only allow /realtime connections that provide a pinned
+        # session id (ACS bridge passes ?session=<caller-id>). This helps avoid accidental
+        # browser/client realtime connections consuming Azure OpenAI realtime quota.
+        acs_only_mode = os.environ.get("ACS_ONLY_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if acs_only_mode and not requested_session_id:
+            logger.warning("Rejecting /realtime connection without session in ACS_ONLY_MODE")
+            await ws.send_json({
+                "type": "extension.middle_tier_error",
+                "error": "realtime_session_required",
+                "message": "ACS_ONLY_MODE enabled: /realtime requires ?session=<id>",
+            })
+            await ws.close(code=1008, message=b"Session query parameter required")
+            return ws
+
+        if requested_session_id:
+            ws.session_id = requested_session_id
         await self._forward_messages(ws)
         return ws
 
