@@ -5,13 +5,15 @@ Azure Communication Services (ACS) Call Automation Handler
 这个模块实现了：
 1. 接收 ACS Call Automation 的 webhook 事件
 2. 自动接听来电
-3. 播放欢迎语音
+3. 建立 ACS + /realtime WebSocket 音频桥接（mixed-mono）
 4. 记录通话状态
 
 环境变量配置：
 - ACS_CONNECTION_STRING: Azure Communication Services 连接字符串
 - ACS_CALLBACK_URL: 你的公网可访问的回调 URL (例如: https://yourapp.com/api/acs/calls/events)
 - ACS_PHONE_NUMBER: 你的 ACS 电话号码 (例如: +1234567890)
+- ACS_REALTIME_WS_URL: 可选，显式指定媒体桥接 WebSocket 地址（默认根据 ACS_CALLBACK_URL 推导为 wss://<host>/realtime）
+- ACS_USE_LEGACY_RECOGNIZE: 可选，默认 false；仅用于回退到旧版 ACS 识别+TTS 流程
 """
 
 import json
@@ -20,6 +22,7 @@ import os
 import re
 import time
 from typing import Any, Optional
+from urllib.parse import quote, urlparse, urlunparse
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -65,6 +68,110 @@ _active_acs_calls: dict[str, dict[str, Any]] = {}
 
 # ACS 客户端（全局单例）
 _acs_client: Optional[CallAutomationClient] = None
+
+def _use_legacy_acs_recognize_flow() -> bool:
+    """是否启用旧版 ACS 识别+TTS 逻辑（默认关闭，改用 GPT-4o Realtime）。"""
+    return os.environ.get("ACS_USE_LEGACY_RECOGNIZE", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_caller_id(event_data: dict[str, Any]) -> str:
+    """从 ACS 事件中提取 callerId（优先 phone number）用于 Realtime 会话键。"""
+    data = event_data.get("data", {}) or {}
+    from_info = data.get("from", {}) or {}
+
+    caller_phone = (from_info.get("phoneNumber", {}) or {}).get("value")
+    caller_raw_id = from_info.get("rawId")
+    caller_communication_id = (from_info.get("communicationUser", {}) or {}).get("id")
+
+    return (
+        caller_phone
+        or caller_raw_id
+        or caller_communication_id
+        or data.get("callerId")
+        or "unknown-caller"
+    )
+
+
+def _build_realtime_ws_url(session_key: str) -> str:
+    """构造 ACS 媒体流目标 WebSocket（默认 /realtime，callerId 作为 session）。"""
+    explicit_ws_url = os.environ.get("ACS_REALTIME_WS_URL", "").strip()
+    if explicit_ws_url:
+        separator = "&" if "?" in explicit_ws_url else "?"
+        return f"{explicit_ws_url}{separator}session={quote(session_key)}"
+
+    callback_url = os.environ.get("ACS_CALLBACK_URL", "").strip()
+    if not callback_url:
+        raise ValueError("ACS_CALLBACK_URL is required to derive /realtime websocket url")
+
+    parsed = urlparse(callback_url)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    realtime_path = "/realtime"
+    return urlunparse((ws_scheme, parsed.netloc, realtime_path, "", f"session={quote(session_key)}", ""))
+
+
+def _create_media_streaming_options(stream_url: str) -> Any:
+    """兼容不同 ACS SDK 版本构造 MediaStreamingOptions。"""
+    try:
+        from azure.communication.callautomation import (  # type: ignore
+            AudioChannelType,
+            AudioFormat,
+            MediaStreamingOptions,
+            MediaStreamingTransportType,
+        )
+
+        return MediaStreamingOptions(
+            transport_url=stream_url,
+            transport_type=MediaStreamingTransportType.WEBSOCKET,
+            audio_channel_type=AudioChannelType.MIXED,
+            audio_format=AudioFormat.PCM24_K_MONO,
+            enable_bidirectional=True,
+            start_media_streaming=True,
+        )
+    except Exception:
+        logger.warning("MediaStreamingOptions types not available; fallback to dict payload.")
+        return {
+            "transport_url": stream_url,
+            "transport_type": "websocket",
+            "audio_channel_type": "mixed",
+            "audio_format": "pcm24KMono",
+            "enable_bidirectional": True,
+            "start_media_streaming": True,
+        }
+
+
+async def start_realtime_bridge(call_connection_id: str, session_key: str) -> None:
+    """启动 ACS -> /realtime WebSocket 媒体桥接。"""
+    acs_client = get_acs_client()
+    if not acs_client:
+        logger.error("ACS client not available, cannot start realtime bridge")
+        return
+
+    call_connection = acs_client.get_call_connection(call_connection_id)
+    stream_url = _build_realtime_ws_url(session_key)
+    options = _create_media_streaming_options(stream_url)
+
+    logger.info("🌉 Starting ACS + GPT-4o Realtime bridge")
+    logger.info("   call_connection_id=%s", call_connection_id)
+    logger.info("   session_key=%s", session_key)
+    logger.info("   stream_url=%s", stream_url)
+
+    try:
+        if hasattr(call_connection, "start_media_streaming"):
+            call_connection.start_media_streaming(options)  # type: ignore[misc]
+        elif hasattr(call_connection, "call_media") and hasattr(call_connection.call_media, "start_media_streaming"):
+            call_connection.call_media.start_media_streaming(options)  # type: ignore[misc]
+        else:
+            raise AttributeError("Current ACS SDK does not expose start_media_streaming")
+
+        _active_acs_calls.setdefault(call_connection_id, {})["realtime_bridge"] = {
+            "status": "started",
+            "session_key": session_key,
+            "stream_url": stream_url,
+            "started_at": time.time(),
+        }
+        logger.info("✅ ACS realtime bridge started")
+    except Exception as e:
+        logger.error("❌ Failed to start ACS realtime bridge: %s", str(e))
 
 
 def get_acs_client() -> Optional[CallAutomationClient]:
@@ -216,6 +323,7 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                 "caller_info": from_info,  # 保存完整的 from_info，用于兜底
                 "recipient_phone": recipient_phone,
                 "recipient_raw_id": recipient_raw_id,
+                "caller_session_key": _extract_caller_id(event_data),
                 "status": "answered",
                 "started_at": time.time()
             }
@@ -254,9 +362,8 @@ async def handle_call_connected_event(event_data: dict[str, Any]) -> None:
             _active_acs_calls[call_connection_id]["status"] = "connected"
             logger.info("   Updated call status to 'connected'")
             
-            # 播放欢迎语音（固定文案 / 之后可换成 GPT 文本）
-            # 识别在欢迎语播放完成后自动启动（在 handle_play_completed_event 中处理）
-            await play_welcome_message(call_connection_id)
+            session_key = _active_acs_calls[call_connection_id].get("caller_session_key") or "unknown-caller"
+            await start_realtime_bridge(call_connection_id, str(session_key))
         else:
             logger.warning("   Call connection ID not found in active calls")
         
@@ -1985,13 +2092,25 @@ async def handle_acs_webhook(request: web.Request) -> web.Response:
             elif event_type == "Microsoft.Communication.PlayFailed":
                 await handle_play_failed_event(event_data)
             
-            # 处理语音识别完成事件（电话 Q&A 的入口）
-            elif event_type == "Microsoft.Communication.RecognizeCompleted":
-                await handle_recognize_completed(event_data)
+            # 处理媒体流建立事件
+            elif event_type == "Microsoft.Communication.MediaStreamingStarted":
+                data = event_data.get("data", {}) or {}
+                call_connection_id = data.get("callConnectionId")
+                logger.info("✅ Media streaming started for call: %s", call_connection_id)
 
-            # 处理语音识别失败事件
+            # 处理语音识别完成事件（旧版 ACS 识别+TTS 流程，默认关闭）
+            elif event_type == "Microsoft.Communication.RecognizeCompleted":
+                if _use_legacy_acs_recognize_flow():
+                    await handle_recognize_completed(event_data)
+                else:
+                    logger.info("Ignoring RecognizeCompleted because ACS_USE_LEGACY_RECOGNIZE is disabled; using GPT-4o Realtime bridge.")
+
+            # 处理语音识别失败事件（旧版流程）
             elif event_type == "Microsoft.Communication.RecognizeFailed":
-                await handle_recognize_failed_event(event_data)
+                if _use_legacy_acs_recognize_flow():
+                    await handle_recognize_failed_event(event_data)
+                else:
+                    logger.info("Ignoring RecognizeFailed because ACS_USE_LEGACY_RECOGNIZE is disabled; using GPT-4o Realtime bridge.")
             
             # 其他事件类型
             else:
