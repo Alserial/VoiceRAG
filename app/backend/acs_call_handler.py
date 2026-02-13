@@ -180,7 +180,18 @@ async def start_realtime_bridge(call_connection_id: str, session_key: str) -> No
         }
         logger.info("✅ ACS realtime bridge started")
     except Exception as e:
-        logger.error("❌ Failed to start ACS realtime bridge: %s", str(e))
+        error_text = str(e)
+        # 已启动媒体流时，不应视为失败（幂等触发常见于重复事件/重试）
+        if "Media streaming has already started" in error_text or "(8583)" in error_text:
+            _active_acs_calls.setdefault(call_connection_id, {})["realtime_bridge"] = {
+                "status": "already_started",
+                "session_key": session_key,
+                "stream_url": stream_url,
+                "started_at": time.time(),
+            }
+            logger.info("ℹ️ ACS realtime bridge already started for call=%s", call_connection_id)
+            return
+        logger.error("❌ Failed to start ACS realtime bridge: %s", error_text)
 
 
 def get_acs_client() -> Optional[CallAutomationClient]:

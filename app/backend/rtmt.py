@@ -92,7 +92,10 @@ class RTMiddleTier:
             msg_type = message.get("type", "")
             if "input_audio" in msg_type or "transcription" in msg_type:
                 logger.debug("Received message type: %s, content: %s", msg_type, json.dumps(message)[:200])
-            match message["type"]:
+            match message.get("type"):
+                case None:
+                    logger.warning("Realtime server message missing 'type': keys=%s", list(message.keys()))
+                    return updated_message
                 case "session.created":
                     session = message["session"]
                     # Hide the instructions, tools and max tokens from clients, if we ever allow client-side 
@@ -118,18 +121,18 @@ class RTMiddleTier:
                     updated_message = json.dumps(message)
 
                 case "response.output_item.added":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         updated_message = None
 
                 case "conversation.item.created":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         item = message["item"]
                         if item["call_id"] not in self._tools_pending:
                             self._tools_pending[item["call_id"]] = RTToolCall(item["call_id"], message["previous_item_id"])
                         updated_message = None
-                    elif "item" in message and message["item"]["type"] == "function_call_output":
+                    elif "item" in message and message["item"].get("type") == "function_call_output":
                         updated_message = None
-                    elif "item" in message and message["item"]["type"] == "input_audio_transcription":
+                    elif "item" in message and message["item"].get("type") == "input_audio_transcription":
                         # Record user input transcription (when created as item)
                         session_id = getattr(client_ws, "session_id", None)
                         if session_id and session_id in self._conversation_logs:
@@ -197,7 +200,7 @@ class RTMiddleTier:
                     updated_message = None
 
                 case "response.output_item.done":
-                    if "item" in message and message["item"]["type"] == "function_call":
+                    if "item" in message and message["item"].get("type") == "function_call":
                         item = message["item"]
                         tool_name = item["name"]
                         logger.info("Tool called: %s, call_id: %s, args: %s", tool_name, item.get("call_id"), item.get("arguments", "")[:200])
@@ -249,7 +252,7 @@ class RTMiddleTier:
                     if "response" in message:
                         replace = False
                         for i, output in enumerate(reversed(message["response"]["output"])):
-                            if output["type"] == "function_call":
+                            if output.get("type") == "function_call":
                                 message["response"]["output"].pop(i)
                                 replace = True
                         if replace:
@@ -299,7 +302,10 @@ class RTMiddleTier:
             if "input_audio" in msg_type or "transcription" in msg_type:
                 logger.debug("Processing message type: %s, full message: %s", msg_type, json.dumps(message)[:300])
             
-            match message["type"]:
+            match message.get("type"):
+                case None:
+                    logger.warning("Realtime client message missing 'type': keys=%s", list(message.keys()))
+                    return updated_message
                 case "session.update":
                     session = message["session"]
                     if self.system_message is not None:
