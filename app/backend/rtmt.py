@@ -404,21 +404,6 @@ class RTMiddleTier:
         await ws.prepare(request)
         # Allow callers (for example ACS media bridge) to pin a stable session id.
         requested_session_id = request.query.get("session")
-
-        # Optional ACS-only mode: only allow /realtime connections that provide a pinned
-        # session id (ACS bridge passes ?session=<caller-id>). This helps avoid accidental
-        # browser/client realtime connections consuming Azure OpenAI realtime quota.
-        acs_only_mode = os.environ.get("ACS_ONLY_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
-        if acs_only_mode and not requested_session_id:
-            logger.warning("Rejecting /realtime connection without session in ACS_ONLY_MODE")
-            await ws.send_json({
-                "type": "extension.middle_tier_error",
-                "error": "realtime_session_required",
-                "message": "ACS_ONLY_MODE enabled: /realtime requires ?session=<id>",
-            })
-            await ws.close(code=1008, message=b"Session query parameter required")
-            return ws
-
         if requested_session_id:
             ws.session_id = requested_session_id
         await self._forward_messages(ws)
