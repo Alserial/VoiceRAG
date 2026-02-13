@@ -408,19 +408,10 @@ class RTMiddleTier:
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        # Enforce ACS-only access pattern: ACS media bridge must provide ?session=<caller-id>.
+        # Allow callers (for example ACS media bridge) to pin a stable session id.
         requested_session_id = request.query.get("session")
-        if not requested_session_id:
-            logger.warning("Rejecting /realtime connection without session (ACS-only enforcement)")
-            await ws.send_json({
-                "type": "extension.middle_tier_error",
-                "error": "realtime_session_required",
-                "message": "ACS-only mode: /realtime requires ?session=<id>",
-            })
-            await ws.close(code=1008, message=b"Session query parameter required")
-            return ws
-
-        ws.session_id = requested_session_id
+        if requested_session_id:
+            ws.session_id = requested_session_id
         await self._forward_messages(ws)
         return ws
 
