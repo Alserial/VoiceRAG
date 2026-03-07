@@ -16,6 +16,7 @@ Azure Communication Services (ACS) Call Automation Handler
 - ACS_USE_LEGACY_RECOGNIZE: 可选，默认 false；仅用于回退到旧版 ACS 识别+TTS 流程
 """
 
+import asyncio
 import json
 import inspect
 import logging
@@ -458,6 +459,15 @@ async def handle_play_completed_event(event_data: dict[str, Any]) -> None:
                 # 回答播放完成，重新启动识别，实现多轮对话
                 logger.info("Answer playback completed, restarting speech recognition for next question...")
                 await start_speech_recognition(call_connection_id)
+            elif operation_context == "answer-tts-stream":
+                # 流式回答的一段播完，播下一段或结束并重新启动识别
+                logger.info("[STREAM] PlayCompleted (answer-tts-stream), call=%s", call_connection_id)
+                if call_connection_id in _active_acs_calls:
+                    _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
+                started = await _play_next_answer_chunk(call_connection_id)
+                if not started:
+                    logger.info("[STREAM] No more chunks, restarting speech recognition for next turn")
+                    await start_speech_recognition(call_connection_id)
             else:
                 # 其他播放完成事件（可能是错误提示等），不重新启动识别
                 logger.info("Play completed for context: %s (not restarting recognition)", operation_context)
@@ -603,8 +613,8 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             else:
                 logger.info("📋 NO QUOTE STATE (call: %s) - Regular conversation", call_connection_id)
             
-            # 先更新报价状态（提取信息）
-            answer_text, quote_updated = await generate_answer_text_with_gpt(
+            # 先更新报价状态（提取信息）；普通问答为流式播报，返回 already_played 表示是否已边生成边播
+            answer_text, quote_updated, already_played = await generate_answer_text_with_gpt(
                 user_text, call_connection_id
             )
             
@@ -688,12 +698,15 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
         else:
             logger.info("➡️  BRANCH: Entering SIMPLE MODE branch (no call_connection_id)")
             # 没有 call_connection_id，使用简单模式
-            answer_text, _ = await generate_answer_text_with_gpt(user_text, None)
+            answer_text, _, already_played = await generate_answer_text_with_gpt(user_text, None)
+            already_played = False  # 简单模式无流式播报
 
-        # 播放回答
-        if call_connection_id:
+        # 播放回答（流式分支已在 generate 中边生成边播，此处跳过）
+        if call_connection_id and not already_played:
             await play_answer_message(call_connection_id, answer_text)
-        else:
+        elif call_connection_id and already_played:
+            logger.info("[STREAM] Answer already played via stream, skipping play_answer_message")
+        elif not call_connection_id:
             logger.warning("No call_connection_id in RecognizeCompleted event; cannot play answer.")
 
     except Exception as e:
@@ -733,7 +746,54 @@ async def handle_recognize_failed_event(event_data: dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool]:
+# 流式回答分块：按句或按长度切分，减少首字延迟
+_STREAM_MIN_CHUNK_LEN = 25
+_STREAM_MAX_CHUNK_LEN = 80
+_SENTENCE_END_RE = re.compile(r"[.!?]\s*")
+
+
+def _flush_stream_buffer(buffer: str, call_connection_id: Optional[str]) -> str:
+    """
+    将 buffer 中可播报的句子/片段取出，加入队列并触发播放，返回剩余部分。
+    """
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return buffer
+    remainder = buffer
+    while True:
+        remainder = remainder.lstrip()
+        if len(remainder) < _STREAM_MIN_CHUNK_LEN:
+            return remainder
+        # 优先在句号、问号、感叹号处切分
+        match = _SENTENCE_END_RE.search(remainder)
+        if match:
+            end = match.end()
+            chunk = remainder[:end].strip()
+            remainder = remainder[end:]
+            if len(chunk) >= _STREAM_MIN_CHUNK_LEN:
+                _ensure_answer_stream_state(call_connection_id)
+                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(chunk)
+                qlen = len(_active_acs_calls[call_connection_id]["answer_chunk_queue"])
+                logger.info("[STREAM] Flush chunk (sentence) -> queue len=%d, text=%s", qlen, chunk[:60] + ("..." if len(chunk) > 60 else ""))
+                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
+                continue
+        # 无句号则按长度在空格处切
+        if len(remainder) >= _STREAM_MAX_CHUNK_LEN:
+            idx = remainder.rfind(" ", _STREAM_MIN_CHUNK_LEN, _STREAM_MAX_CHUNK_LEN + 1)
+            if idx <= 0:
+                idx = min(_STREAM_MAX_CHUNK_LEN, len(remainder))
+            chunk = remainder[: idx + 1 if idx > 0 else idx].strip()
+            remainder = remainder[idx + 1 if idx > 0 else idx :].lstrip()
+            if chunk:
+                _ensure_answer_stream_state(call_connection_id)
+                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(chunk)
+                qlen = len(_active_acs_calls[call_connection_id]["answer_chunk_queue"])
+                logger.info("[STREAM] Flush chunk (length) -> queue len=%d, text=%s", qlen, chunk[:60] + ("..." if len(chunk) > 60 else ""))
+                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
+            continue
+        return remainder
+
+
+async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool, bool]:
     """
     使用 Azure OpenAI 根据用户语音转成的文本生成回答（电话版 Q&A 核心逻辑）。
     
@@ -742,8 +802,10 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
     - 收集报价信息
     - 生成自然对话回答
     
+    普通问答分支使用流式输出，边生成边加入 TTS 队列播报，降低首字延迟。
+    
     Returns:
-        tuple[str, bool]: (回答文本, 报价状态是否更新)
+        tuple[str, bool, bool]: (回答文本, 报价状态是否更新, 是否已通过流式播报无需再 play_answer_message)
     """
     # 如果 GPT 不可用，就回个固定文案，避免电话静音
     fallback = "I am sorry, I could not process your question. Please try again later."
@@ -754,7 +816,7 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         from openai import AzureOpenAI
     except Exception as e:
         logger.warning("Azure OpenAI SDK not available, using fallback answer. Error: %s", str(e))
-        return fallback, False
+        return fallback, False, False
 
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     openai_deployment = (
@@ -769,7 +831,7 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using fallback answer.")
-        return fallback, False
+        return fallback, False, False
 
     if llm_key:
         credential = AzureKeyCredential(llm_key)
@@ -837,12 +899,13 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     f"{recap} Please say 'confirm' or 'yes' to create the quote, "
                     "or tell me what you'd like to change.",
                     False,
+                    False,
                 )
 
             logger.info("➡️  SUB-BRANCH: Quote incomplete, answering requested recap and asking for missing fields")
             missing_fields = quote_state.get("missing_fields", [])
             follow_up = _generate_quote_collection_response(missing_fields, quote_state)
-            return f"{recap} {follow_up}", False
+            return f"{recap} {follow_up}", False, False
 
         # 检测是否是报价请求（使用大模型语义判断）
         is_quote_request = behavior == "quote_request"
@@ -958,25 +1021,58 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     ],
                     {"role": "user", "content": user_text},
                 ]
-                response = client.chat.completions.create(
+                # 普通问答：流式输出，边生成边加入 TTS 队列播报，降低首字延迟
+                logger.info("[STREAM] Starting GPT stream for call=%s (regular Q&A)", call_connection_id)
+                stream = client.chat.completions.create(
                     model=openai_deployment,
                     messages=context_messages,
                     temperature=0.4,
                     max_tokens=128,
+                    stream=True,
                 )
-                text = (response.choices[0].message.content or "").strip()
-                if not text:
-                    logger.warning("GPT returned empty answer text, using fallback.")
-                    return fallback, False
-                answer_text = text
+                full_parts: list[str] = []
+                buffer = ""
+                chunk_count = 0
+                for chunk in stream:
+                    delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+                    if not delta:
+                        continue
+                    chunk_count += 1
+                    if chunk_count <= 3 or chunk_count % 20 == 0:
+                        logger.info("[STREAM] GPT delta #%d: %s", chunk_count, repr(delta[:40]) + ("..." if len(delta) > 40 else ""))
+                    full_parts.append(delta)
+                    buffer += delta
+                    buffer = _flush_stream_buffer(buffer, call_connection_id)
+                full_text = "".join(full_parts).strip()
+                total_chunks = len(_active_acs_calls.get(call_connection_id, {}).get("answer_chunk_queue", []))
+                logger.info("[STREAM] GPT stream finished: total_deltas=%d, full_len=%d, queue_chunks_so_far=%d", chunk_count, len(full_text), total_chunks)
+                # 剩余 buffer 作为最后一段播报
+                if buffer.strip():
+                    _ensure_answer_stream_state(call_connection_id)
+                    _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(buffer.strip())
+                    logger.info("[STREAM] Last buffer queued: %s", buffer.strip()[:60] + ("..." if len(buffer.strip()) > 60 else ""))
+                    asyncio.create_task(_play_next_answer_chunk(call_connection_id))
+                if not full_text:
+                    logger.warning("GPT stream returned empty answer text, using fallback.")
+                    return fallback, False, False
+                # 更新对话历史（流式已播报，不需要再 play_answer_message）
+                if call_connection_id and call_connection_id in _active_acs_calls:
+                    conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
+                    conv.append({"role": "assistant", "content": full_text})
+                    if len(conv) > 10:
+                        conv = conv[-10:]
+                    _active_acs_calls[call_connection_id]["conversation_history"] = conv
+                    _active_acs_calls[call_connection_id]["last_answer"] = full_text
+                logger.info("[STREAM] Returning streamed answer (already_played=True), full_text=%s", full_text[:80] + ("..." if len(full_text) > 80 else ""))
+                return full_text, quote_updated, True
 
         logger.info("Answer text from GPT: %s", answer_text)
-        return answer_text, quote_updated
+        return answer_text, quote_updated, False
     except Exception as e:
         logger.error("Failed to generate answer text via Azure OpenAI: %s", str(e))
         import traceback
         logger.error("Traceback: %s", traceback.format_exc())
-        return fallback, False
+        return fallback, False, False
 
 
 async def _is_confirmation(user_text: str, conversation_history: list, quote_state: dict) -> bool:
@@ -2003,6 +2099,68 @@ async def play_answer_message(call_connection_id: str, answer_text: str) -> None
         logger.error("❌ Error in play_answer_message: %s", str(e))
         import traceback
         logger.error("Traceback: %s", traceback.format_exc())
+
+
+def _ensure_answer_stream_state(call_connection_id: str) -> None:
+    """确保通话有流式回答队列和播放状态（用于 GPT 流式 + 分块播报）。"""
+    if call_connection_id not in _active_acs_calls:
+        return
+    if "answer_chunk_queue" not in _active_acs_calls[call_connection_id]:
+        _active_acs_calls[call_connection_id]["answer_chunk_queue"] = []
+    if "answer_stream_playing" not in _active_acs_calls[call_connection_id]:
+        _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
+
+
+async def _play_next_answer_chunk(call_connection_id: str) -> bool:
+    """
+    从 answer_chunk_queue 取出一段并播放（用于流式回答边收边播）。
+    若队列为空或正在播放则直接返回。
+    Returns True 表示已开始播放一段，False 表示未播放（队列空或正在播）。
+    """
+    acs_client = get_acs_client()
+    if not acs_client:
+        return False
+    if call_connection_id not in _active_acs_calls:
+        return False
+    call_info = _active_acs_calls[call_connection_id]
+    queue = call_info.get("answer_chunk_queue", [])
+    if call_info.get("answer_stream_playing"):
+        logger.debug("[STREAM] _play_next_answer_chunk skipped: already playing")
+        return False
+    if not queue:
+        logger.debug("[STREAM] _play_next_answer_chunk skipped: queue empty")
+        return False
+    chunk = queue.pop(0).strip()
+    if not chunk:
+        return await _play_next_answer_chunk(call_connection_id)
+    try:
+        call_connection = acs_client.get_call_connection(call_connection_id)
+        try:
+            from azure.communication.callautomation import TextSource
+            text_source = TextSource(
+                text=chunk,
+                voice_name="en-US-JennyNeural",
+                source_locale="en-US",
+            )
+        except ImportError:
+            from azure.communication.callautomation.models import TextSource  # type: ignore
+            text_source = TextSource(
+                text=chunk,
+                voice_name="en-US-JennyNeural",
+                source_locale="en-US",
+            )
+        call_connection.play_media(
+            text_source,
+            operation_context="answer-tts-stream",
+        )
+        _active_acs_calls[call_connection_id]["answer_stream_playing"] = True
+        queue_left = len(_active_acs_calls[call_connection_id].get("answer_chunk_queue", []))
+        logger.info("[STREAM] Playing chunk (queue left=%d): %s", queue_left, chunk[:50] + ("..." if len(chunk) > 50 else ""))
+        return True
+    except Exception as e:
+        logger.error("❌ Error playing stream chunk: %s", str(e))
+        _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
+        return False
 
 
 async def speak_error_message(call_connection_id: Optional[str], debug_tag: str = "") -> None:
