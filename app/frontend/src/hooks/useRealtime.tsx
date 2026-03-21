@@ -102,6 +102,18 @@ export default function useRealTime({
         sendJsonMessage(command);
     };
 
+    const speakAssistantMessage = (text: string) => {
+        if (!text.trim()) return;
+
+        sendJsonMessage({
+            type: "response.create",
+            response: {
+                modalities: ["audio", "text"],
+                instructions: `Say exactly this sentence in English: ${text}`
+            }
+        });
+    };
+
     const onMessageReceived = (event: MessageEvent<any>) => {
         onWebSocketMessage?.(event);
 
@@ -156,5 +168,5 @@ export default function useRealTime({
         }
     };
 
-    return { startSession, addUserAudio, inputAudioBufferClear };
+    return { startSession, addUserAudio, inputAudioBufferClear, speakAssistantMessage };
 }

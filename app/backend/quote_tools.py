@@ -254,20 +254,7 @@ async def _extract_quote_info_tool(
         # Get available products
         from salesforce_service import get_salesforce_service
         sf_service = get_salesforce_service()
-        products = []
-        
-        if sf_service.is_available():
-            try:
-                result = sf_service.sf.query(
-                    "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
-                )
-                if result["totalSize"] > 0:
-                    products = [
-                        {"id": record["Id"], "name": record["Name"]}
-                        for record in result["records"]
-                    ]
-            except Exception as e:
-                logger.error("Error fetching products: %s", str(e))
+        products = _get_products()
         
         # Use LLM to extract information from conversation
         from openai import AzureOpenAI
@@ -509,6 +496,7 @@ Example format (multiple products):
             "products_available": product_names,
             "is_complete": len(missing_fields) == 0,
         }
+        _store_quote_state(rtmt, session_id, result)
         
         logger.info("Quote extraction result: missing_fields=%s, is_complete=%s, extracted_data=%s", missing_fields, result["is_complete"], json.dumps(extracted_data)[:200])
         
@@ -556,6 +544,120 @@ _user_registration_tool_schema = {
     }
 }
 
+_update_quote_info_tool_schema = {
+    "type": "function",
+    "name": "update_quote_info",
+    "description": "Update the current quote information when the user wants to change or correct quote details such as customer name, email, products, quantity, expected start date, or notes.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "customer_name": {"type": ["string", "null"]},
+            "contact_info": {"type": ["string", "null"]},
+            "quote_items": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product_package": {"type": "string"},
+                        "quantity": {"type": ["number", "integer", "null"]}
+                    },
+                    "required": ["product_package"],
+                    "additionalProperties": False
+                }
+            },
+            "expected_start_date": {"type": ["string", "null"]},
+            "notes": {"type": ["string", "null"]},
+            "replace_quote_items": {"type": "boolean"}
+        },
+        "additionalProperties": False
+    }
+}
+
+_send_quote_email_tool_schema = {
+    "type": "function",
+    "name": "send_quote_email",
+    "description": "Create the quote from the current collected quote state and send the quote email to the customer. Use this only when the quote details are complete and the user asks to send or resend the quote email.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "contact_info": {"type": ["string", "null"]},
+            "email_address": {"type": ["string", "null"]}
+        },
+        "additionalProperties": False
+    }
+}
+
+
+def _default_quote_state() -> Dict[str, Any]:
+    return {
+        "extracted": {
+            "customer_name": None,
+            "contact_info": None,
+            "quote_items": [],
+            "expected_start_date": None,
+            "notes": None,
+        },
+        "missing_fields": ["customer_name", "contact_info", "quote_items"],
+        "products_available": [],
+        "is_complete": False,
+    }
+
+
+def _store_quote_state(rtmt: RTMiddleTier, session_id: str, state: Dict[str, Any]) -> None:
+    rtmt._quote_states[session_id] = state
+
+
+def _store_user_state(rtmt: RTMiddleTier, session_id: str, state: Dict[str, Any]) -> None:
+    rtmt._user_states[session_id] = state
+
+
+def _recompute_quote_state(extracted_data: Dict[str, Any], product_names: List[str]) -> Dict[str, Any]:
+    extracted_data.setdefault("customer_name", None)
+    extracted_data.setdefault("contact_info", None)
+    extracted_data.setdefault("quote_items", [])
+    extracted_data.setdefault("expected_start_date", None)
+    extracted_data.setdefault("notes", None)
+
+    valid_items = [
+        item for item in extracted_data.get("quote_items", [])
+        if isinstance(item, dict)
+        and item.get("product_package")
+        and item.get("quantity") is not None
+        and item.get("quantity") > 0
+    ]
+
+    missing_fields = []
+    if not extracted_data.get("customer_name"):
+        missing_fields.append("customer_name")
+    if not extracted_data.get("contact_info"):
+        missing_fields.append("contact_info")
+    if not valid_items:
+        missing_fields.append("quote_items")
+
+    return {
+        "extracted": extracted_data,
+        "missing_fields": missing_fields,
+        "products_available": product_names,
+        "is_complete": len(missing_fields) == 0,
+    }
+
+
+def _get_products() -> List[Dict[str, str]]:
+    from salesforce_service import get_salesforce_service
+
+    sf_service = get_salesforce_service()
+    products: List[Dict[str, str]] = []
+    if sf_service.is_available():
+        try:
+            result = sf_service.sf.query(
+                "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
+            )
+            if result["totalSize"] > 0:
+                products = [{"id": record["Id"], "name": record["Name"]} for record in result["records"]]
+        except Exception as e:
+            logger.error("Error fetching products: %s", str(e))
+    return products
+
 
 async def _extract_user_info_tool(
     rtmt: RTMiddleTier,
@@ -580,6 +682,7 @@ async def _extract_user_info_tool(
                 },
                 "is_complete": False,
             }
+            _store_user_state(rtmt, session_id, result)
             return ToolResult(json.dumps(result), ToolResultDirection.TO_SERVER)
         
         conversation_text = "\n".join([
@@ -674,6 +777,7 @@ Example format:
             },
             "is_complete": is_complete,
         }
+        _store_user_state(rtmt, session_id, result)
         
         logger.info("User info extraction result: is_complete=%s, name=%s, email=%s", 
                    is_complete, extracted_data.get("customer_name"), extracted_data.get("contact_info"))
@@ -691,6 +795,166 @@ Example format:
             "is_complete": False,
         }
         return ToolResult(json.dumps(fallback), ToolResultDirection.TO_SERVER)
+
+
+async def _update_quote_info_tool(
+    rtmt: RTMiddleTier,
+    session_id: str,
+    args: Any
+) -> ToolResult:
+    logger.info("update_quote_info tool called with session_id=%s, args=%s", session_id, args)
+
+    current_state = rtmt._quote_states.get(session_id, _default_quote_state())
+    extracted = dict(current_state.get("extracted", {}))
+    args = args or {}
+
+    for field in ["customer_name", "expected_start_date", "notes"]:
+        if field in args and args.get(field) is not None:
+            extracted[field] = args.get(field)
+
+    if "contact_info" in args and args.get("contact_info") is not None:
+        normalized_email = normalize_email(str(args.get("contact_info")))
+        extracted["contact_info"] = normalized_email or args.get("contact_info")
+
+    incoming_items = args.get("quote_items")
+    replace_items = bool(args.get("replace_quote_items", True))
+    if isinstance(incoming_items, list):
+        cleaned_items = []
+        products = _get_products()
+        for item in incoming_items:
+            if not isinstance(item, dict):
+                continue
+            product_name = item.get("product_package")
+            quantity = item.get("quantity")
+            if not product_name:
+                continue
+            matched_product = _find_best_product_match(product_name, products) if products else None
+            cleaned_items.append({
+                "product_package": matched_product or product_name,
+                "quantity": quantity if quantity is not None else 1,
+            })
+
+        if replace_items:
+            extracted["quote_items"] = cleaned_items
+        else:
+            existing_items = extracted.get("quote_items", []) or []
+            merged_items = [item for item in existing_items if isinstance(item, dict)]
+            for new_item in cleaned_items:
+                updated = False
+                for existing_item in merged_items:
+                    if existing_item.get("product_package") == new_item.get("product_package"):
+                        existing_item["quantity"] = new_item.get("quantity")
+                        updated = True
+                        break
+                if not updated:
+                    merged_items.append(new_item)
+            extracted["quote_items"] = merged_items
+
+    product_names = [p["name"] for p in _get_products()]
+    updated_state = _recompute_quote_state(extracted, product_names)
+    _store_quote_state(rtmt, session_id, updated_state)
+    return ToolResult(json.dumps(updated_state), ToolResultDirection.TO_CLIENT)
+
+
+async def _send_quote_email_tool(
+    rtmt: RTMiddleTier,
+    session_id: str,
+    args: Any
+) -> ToolResult:
+    logger.info("send_quote_email tool called with session_id=%s, args=%s", session_id, args)
+    args = args or {}
+    quote_state = rtmt._quote_states.get(session_id, _default_quote_state())
+
+    if not quote_state.get("is_complete"):
+        response = {
+            "success": False,
+            "error": "Quote information is incomplete",
+            "quote_state": quote_state,
+        }
+        return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
+
+    extracted = quote_state.get("extracted", {})
+    customer_name = extracted.get("customer_name")
+    contact_info = args.get("email_address") or args.get("contact_info") or extracted.get("contact_info")
+    quote_items = extracted.get("quote_items", [])
+    expected_start_date = extracted.get("expected_start_date")
+    notes = extracted.get("notes")
+
+    if not customer_name or not contact_info or not quote_items:
+        response = {
+            "success": False,
+            "error": "Missing customer_name, contact_info, or quote_items",
+            "quote_state": quote_state,
+        }
+        return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
+
+    from salesforce_service import get_salesforce_service
+    from email_service import send_quote_email
+
+    sf_service = get_salesforce_service()
+    quote_result = None
+
+    try:
+        account_id = None
+        opportunity_id = None
+        if sf_service.is_available():
+            account_id = sf_service.create_or_get_account(customer_name, contact_info)
+            if account_id:
+                sf_service.create_or_get_contact(account_id, customer_name, contact_info)
+                if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true":
+                    opportunity_id = sf_service.create_opportunity(account_id, f"Opportunity for {customer_name}")
+
+            quote_result = sf_service.create_quote(
+                account_id=account_id,
+                opportunity_id=opportunity_id,
+                customer_name=customer_name,
+                quote_items=quote_items,
+                expected_start_date=expected_start_date,
+                notes=notes,
+            )
+
+        if not quote_result:
+            quote_id = str(os.urandom(8).hex())
+            quote_result = {
+                "quote_id": quote_id,
+                "quote_number": quote_id[:8],
+                "quote_url": f"https://example.com/quotes/{quote_id}",
+            }
+
+        product_summary = ", ".join([f"{item.get('product_package')} (x{item.get('quantity')})" for item in quote_items])
+        total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
+        email_sent = False
+        email_error = None
+
+        if "@" in str(contact_info):
+            try:
+                email_sent = await send_quote_email(
+                    to_email=contact_info,
+                    customer_name=customer_name,
+                    quote_url=quote_result["quote_url"],
+                    product_package=product_summary,
+                    quantity=str(total_quantity),
+                    expected_start_date=expected_start_date,
+                    notes=notes,
+                )
+            except Exception as e:
+                email_error = str(e)
+
+        response = {
+            "success": True,
+            "quote_id": quote_result.get("quote_id"),
+            "quote_number": quote_result.get("quote_number"),
+            "quote_url": quote_result.get("quote_url"),
+            "email_sent": email_sent,
+            "email_error": email_error,
+        }
+        return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
+    except Exception as e:
+        response = {
+            "success": False,
+            "error": str(e),
+        }
+        return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
 
 
 def attach_quote_extraction_tool(rtmt: RTMiddleTier) -> None:
@@ -736,5 +1000,30 @@ def attach_user_registration_tool(rtmt: RTMiddleTier) -> None:
     rtmt.tools["extract_user_info"] = Tool(
         schema=_user_registration_tool_schema,
         target=tool_handler
+    )
+
+
+def attach_quote_management_tools(rtmt: RTMiddleTier) -> None:
+    async def update_tool_handler(args: Any, session_id: str = None) -> ToolResult:
+        if not session_id:
+            session_id = getattr(rtmt, "_current_session_id", None)
+        if not session_id:
+            return ToolResult(json.dumps({"error": "Session ID not available"}), ToolResultDirection.TO_SERVER)
+        return await _update_quote_info_tool(rtmt, session_id, args)
+
+    async def send_email_tool_handler(args: Any, session_id: str = None) -> ToolResult:
+        if not session_id:
+            session_id = getattr(rtmt, "_current_session_id", None)
+        if not session_id:
+            return ToolResult(json.dumps({"error": "Session ID not available"}), ToolResultDirection.TO_SERVER)
+        return await _send_quote_email_tool(rtmt, session_id, args)
+
+    rtmt.tools["update_quote_info"] = Tool(
+        schema=_update_quote_info_tool_schema,
+        target=update_tool_handler,
+    )
+    rtmt.tools["send_quote_email"] = Tool(
+        schema=_send_quote_email_tool_schema,
+        target=send_email_tool_handler,
     )
 

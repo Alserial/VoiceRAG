@@ -13,7 +13,7 @@ Azure Communication Services (ACS) Call Automation Handler
 - ACS_CALLBACK_URL: 你的公网可访问的回调 URL (例如: https://yourapp.com/api/acs/calls/events)
 - ACS_PHONE_NUMBER: 你的 ACS 电话号码 (例如: +1234567890)
 - ACS_REALTIME_WS_URL: 可选，显式指定媒体桥接 WebSocket 地址（默认根据 ACS_CALLBACK_URL 推导为 wss://<host>/realtime）
-- ACS_USE_LEGACY_RECOGNIZE: 可选，默认 false；仅用于回退到旧版 ACS 识别+TTS 流程
+- ACS_USE_LEGACY_RECOGNIZE: 可选，默认 true；控制是否使用旧版 ACS 识别+TTS 流程
 """
 
 import asyncio
@@ -72,8 +72,13 @@ _active_acs_calls: dict[str, dict[str, Any]] = {}
 _acs_client: Optional[CallAutomationClient] = None
 
 def _use_legacy_acs_recognize_flow() -> bool:
-    """是否启用旧版 ACS 识别+TTS 逻辑（默认关闭，改用 GPT-4o Realtime）。"""
-    return os.environ.get("ACS_USE_LEGACY_RECOGNIZE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    """是否启用旧版 ACS 识别+TTS 逻辑（默认开启）。"""
+    return os.environ.get("ACS_USE_LEGACY_RECOGNIZE", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _use_acs_realtime_bridge() -> bool:
+    """ACS 电话线路是否启用 Realtime 媒体桥接。"""
+    return not _use_legacy_acs_recognize_flow()
 
 
 def _extract_caller_id(event_data: dict[str, Any]) -> str:
@@ -275,9 +280,13 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
         
         logger.info("   Callback URL: %s", callback_url)
 
-        stream_url = _build_realtime_ws_url(_extract_caller_id(event_data))
-        media_streaming_options = _create_media_streaming_options(stream_url)
-        logger.info("   Realtime Stream URL: %s", stream_url)
+        media_streaming_options = None
+        if _use_acs_realtime_bridge():
+            stream_url = _build_realtime_ws_url(_extract_caller_id(event_data))
+            media_streaming_options = _create_media_streaming_options(stream_url)
+            logger.info("   Realtime Stream URL: %s", stream_url)
+        else:
+            logger.info("   ACS legacy recognize flow enabled; skipping realtime media streaming setup")
         
         # 准备 Cognitive Services 配置（用于在通话建立阶段启用 TTS 能力）
         cog_endpoint = os.environ.get("ACS_COGNITIVE_SERVICE_ENDPOINT", "").strip()
@@ -308,7 +317,7 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                         "cognitive_services_endpoint": cog_endpoint,
                     }
                     answer_call_signature = inspect.signature(acs_client.answer_call)
-                    if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                    if media_streaming_options is not None and "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
                         answer_kwargs["media_streaming"] = media_streaming_options
                         logger.info("   media_streaming options attached to answer_call")
                     elif isinstance(media_streaming_options, dict):
@@ -322,7 +331,7 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                         "callback_url": callback_url,
                     }
                     answer_call_signature = inspect.signature(acs_client.answer_call)
-                    if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                    if media_streaming_options is not None and "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
                         fallback_kwargs["media_streaming"] = media_streaming_options
                         logger.info("   media_streaming options attached to fallback answer_call")
                     answer_result = acs_client.answer_call(**fallback_kwargs)
@@ -334,7 +343,7 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                     "callback_url": callback_url,
                 }
                 answer_call_signature = inspect.signature(acs_client.answer_call)
-                if "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
+                if media_streaming_options is not None and "media_streaming" in answer_call_signature.parameters and not isinstance(media_streaming_options, dict):
                     answer_kwargs["media_streaming"] = media_streaming_options
                     logger.info("   media_streaming options attached to answer_call")
                 answer_result = acs_client.answer_call(**answer_kwargs)
@@ -404,9 +413,13 @@ async def handle_call_connected_event(event_data: dict[str, Any]) -> None:
         if call_connection_id and call_connection_id in _active_acs_calls:
             _active_acs_calls[call_connection_id]["status"] = "connected"
             logger.info("   Updated call status to 'connected'")
-            
-            session_key = _active_acs_calls[call_connection_id].get("caller_session_key") or "unknown-caller"
-            await start_realtime_bridge(call_connection_id, str(session_key))
+
+            if _use_acs_realtime_bridge():
+                session_key = _active_acs_calls[call_connection_id].get("caller_session_key") or "unknown-caller"
+                await start_realtime_bridge(call_connection_id, str(session_key))
+            else:
+                logger.info("Legacy ACS recognize flow enabled, playing welcome message instead of starting realtime bridge")
+                await play_welcome_message(call_connection_id)
         else:
             logger.warning("   Call connection ID not found in active calls")
         
@@ -703,7 +716,9 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
 
         # 播放回答（流式分支已在 generate 中边生成边播，此处跳过）
         if call_connection_id and not already_played:
-            await play_answer_message(call_connection_id, answer_text)
+            queued = _queue_answer_text_for_tts(call_connection_id, answer_text)
+            if not queued:
+                await play_answer_message(call_connection_id, answer_text)
         elif call_connection_id and already_played:
             logger.info("[STREAM] Answer already played via stream, skipping play_answer_message")
         elif not call_connection_id:
@@ -791,6 +806,58 @@ def _flush_stream_buffer(buffer: str, call_connection_id: Optional[str]) -> str:
                 asyncio.create_task(_play_next_answer_chunk(call_connection_id))
             continue
         return remainder
+
+
+def _chunk_text_for_tts(answer_text: str) -> list[str]:
+    """将完整回答切成较短 TTS 片段，优先按句切分。"""
+    remainder = (answer_text or "").strip()
+    if not remainder:
+        return []
+
+    chunks: list[str] = []
+    while remainder:
+        remainder = remainder.lstrip()
+        if not remainder:
+            break
+
+        match = _SENTENCE_END_RE.search(remainder)
+        if match and match.end() <= _STREAM_MAX_CHUNK_LEN:
+            chunk = remainder[:match.end()].strip()
+            remainder = remainder[match.end():]
+            if chunk:
+                chunks.append(chunk)
+            continue
+
+        if len(remainder) <= _STREAM_MAX_CHUNK_LEN:
+            chunks.append(remainder)
+            break
+
+        idx = remainder.rfind(" ", _STREAM_MIN_CHUNK_LEN, _STREAM_MAX_CHUNK_LEN + 1)
+        if idx <= 0:
+            idx = _STREAM_MAX_CHUNK_LEN
+        chunk = remainder[:idx].strip()
+        remainder = remainder[idx:].lstrip()
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks
+
+
+def _queue_answer_text_for_tts(call_connection_id: str, answer_text: str) -> bool:
+    """将回答加入 TTS 队列，实现旧版 ACS 链路的分块即时播报。"""
+    if call_connection_id not in _active_acs_calls:
+        return False
+
+    chunks = _chunk_text_for_tts(answer_text)
+    if not chunks:
+        return False
+
+    _ensure_answer_stream_state(call_connection_id)
+    _active_acs_calls[call_connection_id]["answer_chunk_queue"] = chunks
+    _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
+    logger.info("[STREAM] Queued %d TTS chunk(s) for call=%s", len(chunks), call_connection_id)
+    asyncio.create_task(_play_next_answer_chunk(call_connection_id))
+    return True
 
 
 async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool, bool]:
@@ -1294,6 +1361,35 @@ def _is_quote_info_recall_question(user_text: str) -> bool:
     return any(trigger in normalized for trigger in recall_triggers)
 
 
+def _looks_like_quote_request(user_text: str) -> bool:
+    """Fast-path detection for explicit quote/pricing intent in phone transcripts."""
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (user_text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    strong_phrases = [
+        "want a quote",
+        "need a quote",
+        "get a quote",
+        "request a quote",
+        "looking for a quote",
+        "price estimate",
+        "pricing quote",
+        "need pricing",
+        "want pricing",
+        "how much",
+        "price for",
+        "cost for",
+        "quotation",
+    ]
+    if any(phrase in normalized for phrase in strong_phrases):
+        return True
+
+    tokens = set(normalized.split())
+    return "quote" in tokens or "pricing" in tokens or "quotation" in tokens
+
+
 async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
     """Keep compatibility for old callsites; now uses LLM semantic classification."""
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -1348,6 +1444,14 @@ async def _classify_user_behavior_with_llm(
     quote_complete: bool,
 ) -> str:
     """Use LLM to classify the user's current intent into a branch behavior."""
+    if _looks_like_quote_request(user_text):
+        logger.info("Heuristic behavior classification: quote_request")
+        return "quote_request"
+
+    if _is_quote_info_recall_question(user_text):
+        logger.info("Heuristic behavior classification: recall_quote_info")
+        return "recall_quote_info"
+
     recent_history = [
         {
             "role": ("assistant" if msg.get("role") == "assistant" else "user"),
@@ -1394,6 +1498,9 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
+        if behavior == "general_qa" and _looks_like_quote_request(user_text):
+            logger.info("Overriding LLM behavior general_qa -> quote_request due to explicit quote wording")
+            return "quote_request"
         if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
             logger.info("LLM behavior classification: %s", behavior)
             return behavior

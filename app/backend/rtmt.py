@@ -71,6 +71,8 @@ class RTMiddleTier:
     _conversation_logs = {}  # Store conversation logs per session
     _quote_triggered = {}    # Track quote trigger per session to avoid duplicates
     _user_registered = {}    # Track user registration status per session
+    _quote_states = {}       # Track structured quote state per session
+    _user_states = {}        # Track structured user registration state per session
 
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
         self.endpoint = endpoint
@@ -372,7 +374,7 @@ class RTMiddleTier:
                 await ws.close(code=1013, message=b"Upstream realtime unavailable")
                 return
 
-            async with target_ws:
+            try:
                 async def from_client_to_server():
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -382,10 +384,8 @@ class RTMiddleTier:
                         else:
                             print("Error: unexpected message type:", msg.type)
 
-                    # Means it is gracefully closed by the client then time to close the target_ws
-                    if target_ws:
-                        print("Closing OpenAI's realtime socket connection.")
-                        await target_ws.close()
+                    print("Closing OpenAI's realtime socket connection.")
+                    await target_ws.close()
 
                 async def from_server_to_client():
                     async for msg in target_ws:
@@ -404,6 +404,9 @@ class RTMiddleTier:
                 finally:
                     # Save conversation and send email when session ends
                     await self._save_and_send_conversation(session_id)
+            finally:
+                if not target_ws.closed:
+                    await target_ws.close()
 
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()

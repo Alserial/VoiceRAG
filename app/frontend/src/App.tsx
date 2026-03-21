@@ -20,12 +20,18 @@ import UserRegistrationConfirmation, { UserRegistrationData } from "@/components
 
 function App() {
     const [isRecording, setIsRecording] = useState(false);
+    const [realtimeSessionId, setRealtimeSessionId] = useState<string | null>(null);
     const [groundingFiles, setGroundingFiles] = useState<GroundingFile[]>([]);
     const [selectedFile, setSelectedFile] = useState<GroundingFile | null>(null);
     const [quoteData, setQuoteData] = useState<QuoteData | null>(null);
     const [userRegistrationData, setUserRegistrationData] = useState<UserRegistrationData | null>(null);
     const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
     const messageIdCounter = useRef(0);
+    const quoteFlowControlsRef = useRef({
+        stopAudioPlayer: () => {},
+        inputAudioBufferClear: () => {},
+        speakAssistantMessage: (_text: string) => {},
+    });
 
     // Helper function to add debug messages
     const addDebugMessage = useCallback((type: DebugMessage["type"], title: string, data: any) => {
@@ -48,6 +54,11 @@ function App() {
         const payload = updatedQuote ?? quoteData;
         if (!payload) return;
 
+        quoteFlowControlsRef.current.stopAudioPlayer();
+        quoteFlowControlsRef.current.inputAudioBufferClear();
+        setQuoteData(null);
+        quoteFlowControlsRef.current.speakAssistantMessage("I've received your confirmation. I'm processing your quote now.");
+
         try {
             addDebugMessage("info", "发送报价确认请求", { quote_data: payload });
             const response = await fetch("/api/quotes/confirm", {
@@ -55,20 +66,19 @@ function App() {
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ quote_data: payload }),
+                body: JSON.stringify({ quote_data: payload, session_id: realtimeSessionId }),
             });
 
             if (!response.ok) {
                 const error = await response.json();
                 addDebugMessage("error", "报价确认失败", { error: error.error || "Failed to send quote" });
+                setQuoteData(payload);
                 throw new Error(error.error || "Failed to send quote");
             }
 
             const result = await response.json();
             console.log("Quote sent successfully:", result);
             addDebugMessage("info", "报价确认成功", result);
-            // Close the dialog after successful confirmation
-            setQuoteData(null);
         } catch (error) {
             console.error("Error confirming quote:", error);
             addDebugMessage("error", "报价确认异常", { error: String(error) });
@@ -84,6 +94,11 @@ function App() {
         const payload = updatedData ?? userRegistrationData;
         if (!payload) return;
 
+        quoteFlowControlsRef.current.stopAudioPlayer();
+        quoteFlowControlsRef.current.inputAudioBufferClear();
+        setUserRegistrationData(null);
+        quoteFlowControlsRef.current.speakAssistantMessage("I've received your confirmation. I'm saving your information now.");
+
         try {
             addDebugMessage("info", "发送用户注册请求", payload);
             const response = await fetch("/api/salesforce/register-user", {
@@ -91,7 +106,7 @@ function App() {
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify(payload),
+                body: JSON.stringify({ ...payload, session_id: realtimeSessionId }),
             });
 
             if (!response.ok) {
@@ -103,11 +118,10 @@ function App() {
             const result = await response.json();
             console.log("User registered successfully:", result);
             addDebugMessage("info", "用户注册成功", result);
-            // Close the dialog after successful registration
-            setUserRegistrationData(null);
         } catch (error) {
             console.error("Error registering user:", error);
             addDebugMessage("error", "用户注册异常", { error: String(error) });
+            setUserRegistrationData(payload);
             throw error;
         }
     }, [userRegistrationData, addDebugMessage]);
@@ -188,7 +202,7 @@ function App() {
         }
     }, [quoteData, userRegistrationData, handleQuoteConfirm, handleQuoteCancel, handleUserRegistrationConfirm, handleUserRegistrationCancel, addDebugMessage]);
 
-    const { startSession, addUserAudio, inputAudioBufferClear } = useRealTime({
+    const { startSession, addUserAudio, inputAudioBufferClear, speakAssistantMessage } = useRealTime({
         enableInputAudioTranscription: true,  // Enable input audio transcription to capture user input
         onWebSocketOpen: () => {
             console.log("WebSocket connection opened");
@@ -205,6 +219,9 @@ function App() {
         onWebSocketMessage: (event) => {
             try {
                 const message = JSON.parse(event.data);
+                if (message.type === "session.created" && message.session?.id) {
+                    setRealtimeSessionId(message.session.id);
+                }
                 // Only log important message types to avoid too much noise
                 const importantTypes = [
                     "response.done",
@@ -278,7 +295,7 @@ function App() {
             }
 
             // Handle quote extraction state
-            if (message.tool_name === "extract_quote_info") {
+            if (message.tool_name === "extract_quote_info" || message.tool_name === "update_quote_info") {
                 if (result.extracted) {
                     const extracted = result.extracted;
                     const quoteItems =
@@ -309,7 +326,7 @@ function App() {
                     if (result.is_complete) {
                         console.log("Setting quote data (complete):", quoteInfo);
                         setQuoteData(quoteInfo);
-                        addDebugMessage("extracted_info", "提取报价信息 (完整)", {
+                        addDebugMessage("extracted_info", message.tool_name === "update_quote_info" ? "更新报价信息 (完整)" : "提取报价信息 (完整)", {
                             ...quoteInfo,
                             quote_items: extracted.quote_items,
                             raw_extracted: extracted,
@@ -317,7 +334,7 @@ function App() {
                     } else {
                         console.log("Quote info incomplete; missing fields:", result.missing_fields);
                         // Still update collected info for display, but don't show confirmation dialog
-                        addDebugMessage("extracted_info", "提取报价信息 (不完整)", {
+                        addDebugMessage("extracted_info", message.tool_name === "update_quote_info" ? "更新报价信息 (不完整)" : "提取报价信息 (不完整)", {
                             ...quoteInfo,
                             quote_items: extracted.quote_items,
                             missing_fields: result.missing_fields,
@@ -332,6 +349,11 @@ function App() {
                         products_available: result.products_available || [],
                     });
                 }
+                return;
+            }
+
+            if (message.tool_name === "send_quote_email") {
+                addDebugMessage("info", "报价邮件发送结果", result);
                 return;
             }
 
@@ -351,6 +373,10 @@ function App() {
 
     const { reset: resetAudioPlayer, play: playAudio, stop: stopAudioPlayer } = useAudioPlayer();
     const { start: startAudioRecording, stop: stopAudioRecording } = useAudioRecorder({ onAudioRecorded: addUserAudio });
+
+    quoteFlowControlsRef.current.stopAudioPlayer = stopAudioPlayer;
+    quoteFlowControlsRef.current.inputAudioBufferClear = inputAudioBufferClear;
+    quoteFlowControlsRef.current.speakAssistantMessage = speakAssistantMessage;
 
     const onToggleListening = async () => {
         if (!isRecording) {
@@ -430,6 +456,10 @@ function App() {
                     initialUserData={userRegistrationData}
                     onConfirm={handleUserRegistrationConfirm}
                     onCancel={handleUserRegistrationCancel}
+                    onDataChange={(updatedData) => {
+                        setUserRegistrationData(updatedData);
+                        addDebugMessage("extracted_info", "用户修改注册信息", updatedData);
+                    }}
                 />
             )}
 

@@ -45,52 +45,52 @@ export default function DebugPanel({ messages, onClear }: DebugPanelProps) {
             const data = msg.data;
             
             // Handle user registration data
-            if (data.customer_name !== undefined) {
+            if (info.customer_name === undefined && data.customer_name !== undefined) {
                 info.customer_name = data.customer_name || null;
             }
-            if (data.contact_info !== undefined) {
+            if (info.contact_info === undefined && data.contact_info !== undefined) {
                 info.contact_info = data.contact_info || null;
             }
             
             // Handle quote data (may have extracted object)
             if (data.extracted) {
                 const extracted = data.extracted;
-                if (extracted.customer_name !== undefined) {
+                if (info.customer_name === undefined && extracted.customer_name !== undefined) {
                     info.customer_name = extracted.customer_name || null;
                 }
-                if (extracted.contact_info !== undefined) {
+                if (info.contact_info === undefined && extracted.contact_info !== undefined) {
                     info.contact_info = extracted.contact_info || null;
                 }
-                if (extracted.product_package !== undefined) {
+                if (info.product_package === undefined && extracted.product_package !== undefined) {
                     info.product_package = extracted.product_package || null;
                 }
-                if (extracted.quantity !== undefined) {
+                if (info.quantity === undefined && extracted.quantity !== undefined) {
                     info.quantity = extracted.quantity || null;
                 }
-                if (extracted.quote_items !== undefined) {
+                if (info.quote_items === undefined && extracted.quote_items !== undefined) {
                     info.quote_items = extracted.quote_items || null;
                 }
-                if (extracted.expected_start_date !== undefined) {
+                if (info.expected_start_date === undefined && extracted.expected_start_date !== undefined) {
                     info.expected_start_date = extracted.expected_start_date || null;
                 }
-                if (extracted.notes !== undefined) {
+                if (info.notes === undefined && extracted.notes !== undefined) {
                     info.notes = extracted.notes || null;
                 }
             } else {
                 // Direct fields
-                if (data.product_package !== undefined) {
+                if (info.product_package === undefined && data.product_package !== undefined) {
                     info.product_package = data.product_package || null;
                 }
-                if (data.quantity !== undefined) {
+                if (info.quantity === undefined && data.quantity !== undefined) {
                     info.quantity = data.quantity || null;
                 }
-                if (data.quote_items !== undefined) {
+                if (info.quote_items === undefined && data.quote_items !== undefined) {
                     info.quote_items = data.quote_items || null;
                 }
-                if (data.expected_start_date !== undefined) {
+                if (info.expected_start_date === undefined && data.expected_start_date !== undefined) {
                     info.expected_start_date = data.expected_start_date || null;
                 }
-                if (data.notes !== undefined) {
+                if (info.notes === undefined && data.notes !== undefined) {
                     info.notes = data.notes || null;
                 }
             }

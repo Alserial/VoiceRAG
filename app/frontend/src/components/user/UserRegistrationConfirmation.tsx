@@ -11,16 +11,26 @@ type UserRegistrationConfirmationProps = {
     initialUserData: UserRegistrationData;
     onConfirm: (data?: UserRegistrationData) => Promise<void>;
     onCancel: () => void;
+    onDataChange?: (data: UserRegistrationData) => void;
 };
 
 export default function UserRegistrationConfirmation({ 
     initialUserData, 
     onConfirm, 
-    onCancel 
+    onCancel,
+    onDataChange
 }: UserRegistrationConfirmationProps) {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [userData, setUserData] = useState<UserRegistrationData>(initialUserData);
+
+    const updateUserData = (updater: (prev: UserRegistrationData) => UserRegistrationData) => {
+        setUserData(prev => {
+            const updated = updater(prev);
+            onDataChange?.(updated);
+            return updated;
+        });
+    };
 
     const handleConfirm = async () => {
         setIsSubmitting(true);
@@ -64,7 +74,7 @@ export default function UserRegistrationConfirmation({
                         <input
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             value={userData.customer_name}
-                            onChange={e => setUserData(prev => ({ ...prev, customer_name: e.target.value }))}
+                            onChange={e => updateUserData(prev => ({ ...prev, customer_name: e.target.value }))}
                         />
                     </div>
 
@@ -77,7 +87,7 @@ export default function UserRegistrationConfirmation({
                             className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
                             type="email"
                             value={userData.contact_info}
-                            onChange={e => setUserData(prev => ({ ...prev, contact_info: e.target.value }))}
+                            onChange={e => updateUserData(prev => ({ ...prev, contact_info: e.target.value }))}
                         />
                     </div>
                 </div>

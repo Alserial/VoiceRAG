@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from ragtools import attach_rag_tools
 from rtmt import RTMiddleTier
-from quote_tools import attach_quote_extraction_tool, attach_user_registration_tool
+from quote_tools import attach_quote_extraction_tool, attach_quote_management_tools, attach_user_registration_tool
 from teams_calling import TeamsCaller
 
 from openai import AzureOpenAI
@@ -57,6 +57,8 @@ async def create_app():
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     openai_deployment = os.environ.get("AZURE_OPENAI_REALTIME_DEPLOYMENT")
     
+    rtmt = None
+
     if openai_endpoint and openai_deployment:
         rtmt = RTMiddleTier(
             credentials=llm_credential,
@@ -88,17 +90,28 @@ async def create_app():
             - If is_complete = false: Ask for the missing information (either name or email, whichever is missing).
             - If is_complete = true: The system will show a confirmation dialog. BEFORE asking for confirmation, repeat all collected registration details (name + email), then say: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
             - If user asks what they previously provided (for example: "what name did I give?" or "what email did I enter?"), call 'extract_user_info' again and answer using the extracted values. Do NOT reply with "I don't know" if the values exist in conversation history.
+            - If the user says they want to change, update, or correct their name or email, call 'extract_user_info' again and use the most recently provided valid value.
             - IMPORTANT: Only proceed with other tasks (search, quote requests) AFTER user registration is complete (is_complete = true and user has confirmed).
             
             ROLE OF 'extract_quote_info' (state evaluator):
             - Called multiple times; may return empty/partial info.
             - Returns structured state only: {"extracted": {...}, "missing_fields": [...], "is_complete": bool, "products_available": [...]}.
             - It never asks the user anything; you decide what to ask based on missing_fields.
+
+            ROLE OF 'update_quote_info':
+            - Use this when the user explicitly changes or corrects quote details that were already collected.
+            - You may update customer_name, contact_info, quote_items, expected_start_date, or notes.
+            - After calling it, use the returned state to confirm the new values or ask only for any remaining missing fields.
+
+            ROLE OF 'send_quote_email':
+            - Use this when the quote details are already complete and the user explicitly asks you to send, resend, or email the quote.
+            - This tool creates the quote from the current collected state and sends the quote email to the customer.
+            - After success, tell the user the quote has been created and the email has been sent.
             
             WHEN TO CALL THE TOOL:
             - If the user mentions anything about quotes/pricing (quote, quotation, price estimate, price, cost, pricing, estimate, get/need/want a quote), immediately call 'extract_quote_info'. Do not ask questions before the first call.
             - After each user reply, call the tool again to re-evaluate state until is_complete = true.
-            - If the user says they want to change/update a specific field (e.g., email/contact info/product/quantity/start date/notes), gather that field only, then call the tool again. Do NOT re-ask already known fields unless the user says they also need to change them.
+            - If the user says they want to change/update a specific quote field (e.g., email/contact info/product/quantity/start date/notes), gather that field only, then call 'update_quote_info'. Do NOT re-ask already known fields unless the user says they also need to change them.
             
             HOW TO USE THE RESULT:
             - If is_complete = false: Ask only for the missing_fields, one at a time, very concise.
@@ -114,7 +127,8 @@ async def create_app():
             - If is_complete = true: First restate all collected quote details (customer_name, contact_info, each quote_items product + quantity, expected_start_date, notes), then tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
             
             CONFIRMATION:
-            - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, proceed with sending the quote (the system will handle the send).
+            - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, proceed with sending the quote.
+            - If the user explicitly asks you to email or resend the quote and the quote is complete, call 'send_quote_email'.
             
             KNOWLEDGE BASE:
             - For non-quote questions, first use the 'search' tool. If info is found, cite with 'report_grounding'. If not found, politely say it’s not in the knowledge base. Do not invent information.
@@ -139,12 +153,82 @@ async def create_app():
         attach_quote_extraction_tool(rtmt)
         # Attach user registration tool
         attach_user_registration_tool(rtmt)
+        attach_quote_management_tools(rtmt)
         logger.info("Quote extraction tool and user registration tool attached. Available tools: %s", list(rtmt.tools.keys()))
 
         rtmt.attach_to_app(app, "/realtime")
         logger.info("RTMiddleTier initialized with Azure OpenAI")
     else:
         logger.warning("Azure OpenAI configuration not found. Voice features will be disabled. Quote API is still available.")
+
+    def _sync_realtime_session_state(
+        session_id: str | None,
+        user_data: dict | None = None,
+        quote_data: dict | None = None,
+    ) -> None:
+        if not rtmt or not session_id:
+            return
+
+        conversation = rtmt._conversation_logs.setdefault(
+            session_id,
+            {"session_id": session_id, "start_time": "", "messages": []},
+        )
+        messages = conversation.setdefault("messages", [])
+
+        if user_data:
+            extracted = {
+                "customer_name": user_data.get("customer_name"),
+                "contact_info": user_data.get("contact_info"),
+            }
+            rtmt._user_states[session_id] = {
+                "extracted": extracted,
+                "is_complete": bool(extracted.get("customer_name") and extracted.get("contact_info")),
+            }
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"My confirmed name is {extracted.get('customer_name')}. "
+                    f"My confirmed email is {extracted.get('contact_info')}."
+                ),
+            })
+
+        if quote_data:
+            extracted = {
+                "customer_name": quote_data.get("customer_name"),
+                "contact_info": quote_data.get("contact_info"),
+                "quote_items": quote_data.get("quote_items", []),
+                "expected_start_date": quote_data.get("expected_start_date"),
+                "notes": quote_data.get("notes"),
+            }
+            valid_items = [
+                item for item in extracted["quote_items"]
+                if isinstance(item, dict) and item.get("product_package") and item.get("quantity")
+            ]
+            missing_fields = []
+            if not extracted.get("customer_name"):
+                missing_fields.append("customer_name")
+            if not extracted.get("contact_info"):
+                missing_fields.append("contact_info")
+            if not valid_items:
+                missing_fields.append("quote_items")
+            rtmt._quote_states[session_id] = {
+                "extracted": extracted,
+                "missing_fields": missing_fields,
+                "products_available": rtmt._quote_states.get(session_id, {}).get("products_available", []),
+                "is_complete": len(missing_fields) == 0,
+            }
+            product_summary = ", ".join(
+                [f"{item.get('product_package')} x{item.get('quantity')}" for item in extracted["quote_items"] if isinstance(item, dict)]
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"My confirmed quote details are: name {extracted.get('customer_name')}, "
+                    f"email {extracted.get('contact_info')}, products {product_summary or 'none'}, "
+                    f"expected start date {extracted.get('expected_start_date') or 'not provided'}, "
+                    f"notes {extracted.get('notes') or 'none'}."
+                ),
+            })
 
     def _classify_utterance_state(transcript: str, pending_action: str | None = None) -> dict:
         """Use LLM to classify user utterance into state used for UI branching."""
@@ -393,6 +477,7 @@ async def create_app():
         payload = await request.json()
         customer_name = payload.get("customer_name")
         contact_info = payload.get("contact_info")
+        session_id = payload.get("session_id")
         
         if not customer_name or not contact_info:
             return web.json_response(
@@ -430,6 +515,13 @@ async def create_app():
             
             logger.info("User registered to Salesforce: %s (Account: %s, Contact: %s)", 
                        customer_name, account_id, contact_id)
+            _sync_realtime_session_state(
+                session_id,
+                user_data={
+                    "customer_name": customer_name,
+                    "contact_info": contact_info,
+                },
+            )
             
             return web.json_response(result)
             
@@ -446,6 +538,7 @@ async def create_app():
         """Handle quote confirmation - creates quote and sends email."""
         payload = await request.json()
         quote_data = payload.get("quote_data", {})
+        session_id = payload.get("session_id")
         
         if not quote_data:
             return web.json_response(
@@ -562,6 +655,8 @@ async def create_app():
                 logger.error("Error sending email: %s", str(e))
                 email_error = str(e)
         
+        _sync_realtime_session_state(session_id, quote_data=quote_data)
+
         return web.json_response({
             "success": True,
             "quote_id": quote_result.get("quote_id"),
