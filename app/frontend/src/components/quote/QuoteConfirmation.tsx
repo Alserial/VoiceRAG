@@ -5,8 +5,12 @@ import { Button } from "@/components/ui/button";
 export type QuoteData = {
     customer_name: string;
     contact_info: string;
-    product_package: string;
-    quantity: number | null;
+    quote_items: Array<{
+        product_package: string;
+        quantity: number | null;
+    }>;
+    product_package?: string;
+    quantity?: number | null;
     expected_start_date?: string | null;
     notes?: string | null;
 };
@@ -86,28 +90,57 @@ export default function QuoteConfirmation({ initialQuoteData, onConfirm, onCance
                     </div>
 
                     <div className="border-b pb-3">
-                        <label className="text-sm font-medium text-gray-500">Product/Package</label>
-                        <input
-                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                            value={quoteData.product_package}
-                            onChange={e => updateQuoteData(prev => ({ ...prev, product_package: e.target.value }))}
-                        />
-                    </div>
-
-                    <div className="border-b pb-3">
-                        <label className="text-sm font-medium text-gray-500">Quantity</label>
-                        <input
-                            className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                            type="number"
-                            min={1}
-                            value={quoteData.quantity ?? ""}
-                            onChange={e =>
-                                updateQuoteData(prev => ({
-                                    ...prev,
-                                    quantity: e.target.value === "" ? null : Number(e.target.value),
-                                }))
-                            }
-                        />
+                        <label className="text-sm font-medium text-gray-500">Products</label>
+                        <div className="mt-2 space-y-3">
+                            {quoteData.quote_items.map((item, index) => (
+                                <div key={index} className="rounded border border-gray-200 p-3">
+                                    <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-400">
+                                        Item {index + 1}
+                                    </div>
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                        <div>
+                                            <label className="text-sm font-medium text-gray-500">Product/Package</label>
+                                            <input
+                                                className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                                value={item.product_package}
+                                                onChange={e =>
+                                                    updateQuoteData(prev => ({
+                                                        ...prev,
+                                                        quote_items: prev.quote_items.map((quoteItem, quoteIndex) =>
+                                                            quoteIndex === index
+                                                                ? { ...quoteItem, product_package: e.target.value }
+                                                                : quoteItem
+                                                        ),
+                                                    }))
+                                                }
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="text-sm font-medium text-gray-500">Quantity</label>
+                                            <input
+                                                className="mt-1 w-full rounded border border-gray-300 px-3 py-2 text-gray-900 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                                type="number"
+                                                min={1}
+                                                value={item.quantity ?? ""}
+                                                onChange={e =>
+                                                    updateQuoteData(prev => ({
+                                                        ...prev,
+                                                        quote_items: prev.quote_items.map((quoteItem, quoteIndex) =>
+                                                            quoteIndex === index
+                                                                ? {
+                                                                      ...quoteItem,
+                                                                      quantity: e.target.value === "" ? null : Number(e.target.value),
+                                                                  }
+                                                                : quoteItem
+                                                        ),
+                                                    }))
+                                                }
+                                            />
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
                     </div>
 
                     <div className="border-b pb-3">

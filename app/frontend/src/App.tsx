@@ -281,27 +281,27 @@ function App() {
             if (message.tool_name === "extract_quote_info") {
                 if (result.extracted) {
                     const extracted = result.extracted;
-                    
-                    // Handle quote_items array (multiple products support)
-                    let productPackage = "";
-                    let quantity: number | null = null;
-                    
-                    if (extracted.quote_items && Array.isArray(extracted.quote_items) && extracted.quote_items.length > 0) {
-                        // Use the first product for display (supporting multiple products)
-                        const firstItem = extracted.quote_items[0];
-                        productPackage = firstItem.product_package || "";
-                        quantity = firstItem.quantity ?? null;
-                    } else if (extracted.product_package) {
-                        // Fallback to legacy format
-                        productPackage = extracted.product_package || "";
-                        quantity = extracted.quantity ?? null;
-                    }
-                    
+                    const quoteItems =
+                        extracted.quote_items && Array.isArray(extracted.quote_items) && extracted.quote_items.length > 0
+                            ? extracted.quote_items.map(item => ({
+                                  product_package: item.product_package || "",
+                                  quantity: item.quantity ?? null,
+                              }))
+                            : extracted.product_package
+                              ? [
+                                    {
+                                        product_package: extracted.product_package || "",
+                                        quantity: extracted.quantity ?? null,
+                                    },
+                                ]
+                              : [];
+
                     const quoteInfo = {
                         customer_name: extracted.customer_name || "",
                         contact_info: extracted.contact_info || "",
-                        product_package: productPackage,
-                        quantity: quantity,
+                        quote_items: quoteItems,
+                        product_package: quoteItems[0]?.product_package || "",
+                        quantity: quoteItems[0]?.quantity ?? null,
                         expected_start_date: extracted.expected_start_date ?? null,
                         notes: extracted.notes ?? null,
                     };
