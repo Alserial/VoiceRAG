@@ -581,7 +581,8 @@ _send_quote_email_tool_schema = {
         "type": "object",
         "properties": {
             "contact_info": {"type": ["string", "null"]},
-            "email_address": {"type": ["string", "null"]}
+            "email_address": {"type": ["string", "null"]},
+            "force_resend": {"type": "boolean"}
         },
         "additionalProperties": False
     }
@@ -600,6 +601,13 @@ def _default_quote_state() -> Dict[str, Any]:
         "missing_fields": ["customer_name", "contact_info", "quote_items"],
         "products_available": [],
         "is_complete": False,
+        "delivery": {
+            "quote_id": None,
+            "quote_number": None,
+            "quote_url": None,
+            "email_sent": False,
+            "email_error": None,
+        },
     }
 
 
@@ -874,6 +882,8 @@ async def _send_quote_email_tool(
         return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
 
     extracted = quote_state.get("extracted", {})
+    delivery = quote_state.get("delivery", {})
+    force_resend = bool(args.get("force_resend", False))
     customer_name = extracted.get("customer_name")
     contact_info = args.get("email_address") or args.get("contact_info") or extracted.get("contact_info")
     quote_items = extracted.get("quote_items", [])
@@ -885,6 +895,18 @@ async def _send_quote_email_tool(
             "success": False,
             "error": "Missing customer_name, contact_info, or quote_items",
             "quote_state": quote_state,
+        }
+        return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
+
+    if delivery.get("email_sent") and not force_resend:
+        response = {
+            "success": True,
+            "quote_id": delivery.get("quote_id"),
+            "quote_number": delivery.get("quote_number"),
+            "quote_url": delivery.get("quote_url"),
+            "email_sent": True,
+            "email_error": None,
+            "message": "Quote email was already sent for this session",
         }
         return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
 
@@ -948,6 +970,14 @@ async def _send_quote_email_tool(
             "email_sent": email_sent,
             "email_error": email_error,
         }
+        quote_state["delivery"] = {
+            "quote_id": quote_result.get("quote_id"),
+            "quote_number": quote_result.get("quote_number"),
+            "quote_url": quote_result.get("quote_url"),
+            "email_sent": email_sent,
+            "email_error": email_error,
+        }
+        _store_quote_state(rtmt, session_id, quote_state)
         return ToolResult(json.dumps(response), ToolResultDirection.TO_CLIENT)
     except Exception as e:
         response = {

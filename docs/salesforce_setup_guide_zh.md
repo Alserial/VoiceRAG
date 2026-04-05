@@ -22,6 +22,7 @@
 ### 1.2 配置 Quotes 相关对象
 
 确保以下标准对象已启用：
+
 - **Account**（客户）
 - **Contact**（联系人）
 - **Opportunity**（商机）
@@ -46,6 +47,7 @@
 ### 2.2 在 QuoteLineItem 上创建字段
 
 如果需要存储额外信息：
+
 1. 进入 **Setup** → **Object Manager** → **Quote Line Item**
 2. 创建需要的自定义字段
 
@@ -88,7 +90,7 @@
    - **Contact Email**: 你的邮箱
    - **Enable OAuth Settings**: 勾选
    - **Callback URL**: `http://localhost:8765`（开发环境）或你的生产环境 URL
-   - **Selected OAuth Scopes**: 
+   - **Selected OAuth Scopes**:
      - `Full access (full)`
      - `Perform requests on your behalf at any time (refresh_token, offline_access)`
 4. 点击 **Save**
@@ -96,6 +98,7 @@
 ### 4.2 获取凭据
 
 保存后，你会看到：
+
 - **Consumer Key**（客户端 ID）
 - **Consumer Secret**（客户端密钥）
 
@@ -119,6 +122,7 @@
 ### 5.2 分配权限
 
 确保用户有以下权限：
+
 - **Quote** 对象的 Create, Read, Edit, Delete
 - **Account** 对象的 Create, Read, Edit
 - **Contact** 对象的 Create, Read, Edit
@@ -134,6 +138,7 @@
 这是最简单的方式，适合服务器端应用：
 
 **需要的凭据：**
+
 - **Username**: 集成用户的用户名
 - **Password**: 集成用户的密码
 - **Security Token**: 用户的 Security Token（在用户设置中重置密码后获取）
@@ -222,19 +227,20 @@ SALESFORCE_OPPORTUNITY_STAGE=Prospecting
 
 ### 检查清单
 
-- [ ] Quotes 功能已启用
-- [ ] 产品和价格表已配置
-- [ ] Connected App 已创建并获取凭据
-- [ ] 集成用户已创建并分配权限
-- [ ] Security Token 已获取
-- [ ] 环境变量已配置
-- [ ] 测试连接成功
+- [ ]  Quotes 功能已启用
+- [ ]  产品和价格表已配置
+- [ ]  Connected App 已创建并获取凭据
+- [ ]  集成用户已创建并分配权限
+- [ ]  Security Token 已获取
+- [ ]  环境变量已配置
+- [ ]  测试连接成功
 
 ## 常见问题
 
 ### Q: 如何找到我的 Salesforce 实例 URL？
 
 **A**: 登录 Salesforce 后，查看浏览器地址栏。URL 格式通常是：
+
 - Production: `https://yourcompany.my.salesforce.com`
 - Sandbox: `https://yourcompany--sandboxname.sandbox.my.salesforce.com`
 
@@ -253,6 +259,7 @@ SALESFORCE_OPPORTUNITY_STAGE=Prospecting
 ## 下一步
 
 完成设置后，VoiceRAG 应用将能够：
+
 1. 在 Salesforce 中创建 Quote 记录
 2. 关联 Account 和 Contact
 3. 添加 Quote Line Items
@@ -260,5 +267,3 @@ SALESFORCE_OPPORTUNITY_STAGE=Prospecting
 5. （可选）自动发送邮件通知
 
 参考 `docs/salesforce_integration_guide_zh.md` 了解代码实现细节。
-
-

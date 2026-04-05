@@ -22,12 +22,28 @@ import inspect
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any, Optional
 from urllib.parse import quote, urlparse, urlunparse
 
 from aiohttp import web
 from dotenv import load_dotenv
+from email_service import send_conversation_email
+from quote_tools import (
+    _quote_extraction_tool_schema,
+    _send_quote_email_tool_schema,
+    _update_quote_info_tool_schema,
+)
+from quote_workflow import (
+    build_quote_confirmation_recap as shared_build_quote_confirmation_recap,
+    build_quote_state,
+    build_quote_targeted_recap as shared_build_quote_targeted_recap,
+    create_quote_from_extracted,
+    fetch_available_products,
+    generate_quote_collection_response as shared_generate_quote_collection_response,
+    normalize_and_match_quote_extracted_data,
+)
 
 # 先获取 logger，供后续导入失败时使用
 logging.basicConfig(level=logging.INFO)
@@ -114,6 +130,232 @@ def _build_realtime_ws_url(session_key: str) -> str:
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     realtime_path = "/realtime"
     return urlunparse((ws_scheme, parsed.netloc, realtime_path, "", f"session={quote(session_key)}", ""))
+
+
+def _default_quote_delivery() -> dict[str, Any]:
+    return {
+        "quote_id": None,
+        "quote_number": None,
+        "quote_url": None,
+        "email_sent": False,
+        "email_error": None,
+    }
+
+
+def _enrich_quote_state_with_delivery(quote_state: Optional[dict[str, Any]]) -> dict[str, Any]:
+    state = dict(quote_state or {})
+    state["delivery"] = {
+        **_default_quote_delivery(),
+        **dict(state.get("delivery") or {}),
+    }
+    state.setdefault("extracted", {})
+    state.setdefault("missing_fields", ["customer_name", "contact_info", "quote_items"])
+    state.setdefault("products_available", [])
+    state.setdefault("is_complete", False)
+    return state
+
+
+def _store_acs_quote_state(
+    call_connection_id: Optional[str],
+    quote_state: dict[str, Any],
+    conversation_history: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    stored_state = _enrich_quote_state_with_delivery(quote_state)
+    if call_connection_id and call_connection_id in _active_acs_calls:
+        _active_acs_calls[call_connection_id]["quote_state"] = stored_state
+        if conversation_history is not None:
+            _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+    return stored_state
+
+
+def _append_assistant_message(call_connection_id: Optional[str], answer_text: str) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls or not answer_text:
+        return
+
+    conversation_history = _active_acs_calls[call_connection_id].get("conversation_history", [])
+    conversation_history.append({"role": "assistant", "content": answer_text})
+    if len(conversation_history) > 10:
+        conversation_history = conversation_history[-10:]
+    _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
+    _active_acs_calls[call_connection_id]["last_answer"] = answer_text
+
+
+def _get_pending_quote_update(call_connection_id: Optional[str]) -> dict[str, Any]:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return {}
+    return dict(_active_acs_calls[call_connection_id].get("pending_quote_update") or {})
+
+
+def _set_pending_quote_update(call_connection_id: Optional[str], pending_update: dict[str, Any]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id]["pending_quote_update"] = pending_update
+
+
+def _clear_pending_quote_update(call_connection_id: Optional[str]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id].pop("pending_quote_update", None)
+
+
+def _get_pending_quote_recap(call_connection_id: Optional[str]) -> dict[str, Any]:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return {}
+    return dict(_active_acs_calls[call_connection_id].get("pending_quote_recap") or {})
+
+
+def _set_pending_quote_recap(call_connection_id: Optional[str], pending_recap: dict[str, Any]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id]["pending_quote_recap"] = pending_recap
+
+
+def _clear_pending_quote_recap(call_connection_id: Optional[str]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id].pop("pending_quote_recap", None)
+
+
+def _is_awaiting_quote_confirmation(call_connection_id: Optional[str]) -> bool:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return False
+    return bool(_active_acs_calls[call_connection_id].get("awaiting_quote_confirmation"))
+
+
+def _set_awaiting_quote_confirmation(call_connection_id: Optional[str], value: bool = True) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id]["awaiting_quote_confirmation"] = value
+
+
+def _clear_awaiting_quote_confirmation(call_connection_id: Optional[str]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id].pop("awaiting_quote_confirmation", None)
+
+
+def _get_empty_recognition_count(call_connection_id: Optional[str]) -> int:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return 0
+    return int(_active_acs_calls[call_connection_id].get("empty_recognition_count", 0) or 0)
+
+
+def _set_empty_recognition_count(call_connection_id: Optional[str], count: int) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id]["empty_recognition_count"] = max(0, int(count))
+
+
+def _reset_empty_recognition_count(call_connection_id: Optional[str]) -> None:
+    _set_empty_recognition_count(call_connection_id, 0)
+
+
+def _build_acs_progress_summary(call_connection_id: str) -> str:
+    call_info = _active_acs_calls.get(call_connection_id, {})
+    quote_state = _enrich_quote_state_with_delivery(call_info.get("quote_state"))
+    extracted = quote_state.get("extracted", {})
+    conversation_history = call_info.get("conversation_history", [])
+
+    lines = [
+        f"ACS call progress summary for call {call_connection_id}",
+        "",
+        "Collected quote details:",
+        f"- customer_name: {extracted.get('customer_name') or 'not provided'}",
+        f"- contact_info: {extracted.get('contact_info') or 'not provided'}",
+    ]
+
+    quote_items = extracted.get("quote_items") or []
+    if quote_items:
+        lines.append("- quote_items:")
+        for item in quote_items:
+            if isinstance(item, dict):
+                lines.append(
+                    f"  - {item.get('product_package') or 'unknown product'} x {item.get('quantity') or 'unknown quantity'}"
+                )
+    else:
+        lines.append("- quote_items: not provided")
+
+    lines.extend(
+        [
+            f"- expected_start_date: {extracted.get('expected_start_date') or 'not provided'}",
+            f"- notes: {extracted.get('notes') or 'not provided'}",
+            f"- missing_fields: {', '.join(quote_state.get('missing_fields', [])) or 'none'}",
+            "",
+            "Recent conversation:",
+        ]
+    )
+
+    for message in conversation_history[-10:]:
+        if isinstance(message, dict):
+            role = str(message.get("role", "unknown")).upper()
+            content = str(message.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+async def _send_acs_progress_email_if_available(call_connection_id: str) -> bool:
+    call_info = _active_acs_calls.get(call_connection_id, {})
+    quote_state = _enrich_quote_state_with_delivery(call_info.get("quote_state"))
+    contact_info = str(quote_state.get("extracted", {}).get("contact_info") or "").strip()
+    if "@" not in contact_info:
+        logger.info("Skipping ACS progress email because no valid email is available for call %s", call_connection_id)
+        return False
+
+    temp_path = None
+    try:
+        summary_text = _build_acs_progress_summary(call_connection_id)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as temp_file:
+            temp_file.write(summary_text)
+            temp_path = temp_file.name
+
+        sent = await send_conversation_email(contact_info, temp_path, call_connection_id)
+        logger.info("ACS progress email send result for %s: %s", call_connection_id, sent)
+        return sent
+    except Exception as e:
+        logger.error("Failed to send ACS progress email for %s: %s", call_connection_id, str(e))
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logger.warning("Failed to remove temporary ACS progress summary file: %s", temp_path)
+
+
+async def _hang_up_acs_call(call_connection_id: str) -> None:
+    acs_client = get_acs_client()
+    if not acs_client:
+        logger.warning("ACS client not available, cannot hang up call %s", call_connection_id)
+        return
+
+    try:
+        call_connection_client = acs_client.get_call_connection(call_connection_id)
+        call_connection_client.hang_up(is_for_everyone=True)
+        logger.info("ACS call hung up programmatically: %s", call_connection_id)
+    except Exception as e:
+        logger.error("Failed to hang up ACS call %s: %s", call_connection_id, str(e))
+
+
+async def _end_call_after_repeated_empty_input(call_connection_id: str) -> None:
+    logger.info("Ending ACS call after repeated empty recognition events: %s", call_connection_id)
+    await _send_acs_progress_email_if_available(call_connection_id)
+    if call_connection_id in _active_acs_calls:
+        _active_acs_calls[call_connection_id]["hangup_after_playback"] = True
+    await play_answer_message(
+        call_connection_id,
+        "I haven't heard a response for a while, so I'll end the call now. I'll email your current progress if I have your email address. Goodbye.",
+    )
+
+
+def _is_explicit_quote_confirmation(user_text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (user_text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    return normalized in {"confirm", "yes"}
 
 
 def _create_media_streaming_options(stream_url: str) -> Any:
@@ -470,8 +712,12 @@ async def handle_play_completed_event(event_data: dict[str, Any]) -> None:
                 await start_speech_recognition(call_connection_id)
             elif operation_context == "answer-tts":
                 # 回答播放完成，重新启动识别，实现多轮对话
-                logger.info("Answer playback completed, restarting speech recognition for next question...")
-                await start_speech_recognition(call_connection_id)
+                if _active_acs_calls[call_connection_id].get("hangup_after_playback"):
+                    logger.info("Answer playback completed and hangup_after_playback is set; ending call.")
+                    await _hang_up_acs_call(call_connection_id)
+                else:
+                    logger.info("Answer playback completed, restarting speech recognition for next question...")
+                    await start_speech_recognition(call_connection_id)
             elif operation_context == "answer-tts-stream":
                 # 流式回答的一段播完，播下一段或结束并重新启动识别
                 logger.info("[STREAM] PlayCompleted (answer-tts-stream), call=%s", call_connection_id)
@@ -573,15 +819,22 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
         if not user_text:
             # 再从整个 event_data 里兜底找一次
             user_text = _find_transcript(event_data)
+        user_text = (user_text or "").strip()
 
         if not user_text:
             logger.warning("RecognizeCompleted received but no transcript text found.")
             if call_connection_id:
-                logger.info("Restarting speech recognition because transcript was empty.")
-                await start_speech_recognition(call_connection_id)
+                empty_count = _get_empty_recognition_count(call_connection_id) + 1
+                _set_empty_recognition_count(call_connection_id, empty_count)
+                logger.info("Transcript was empty; consecutive empty recognition count=%d", empty_count)
+                if empty_count >= 10:
+                    await _end_call_after_repeated_empty_input(call_connection_id)
+                else:
+                    await play_answer_message(call_connection_id, "I didn't catch that. Could you please say that again?")
             return
 
         logger.info("User said (transcript): %s", user_text)
+        _reset_empty_recognition_count(call_connection_id)
 
         # 初始化通话的报价状态（如果还没有）
         if call_connection_id and call_connection_id not in _active_acs_calls:
@@ -659,55 +912,11 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
                 logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
                 logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
             
-            # 检查是否是报价确认（使用大模型语义判断，保留 very explicit yes/confirm 快捷判断）
-            is_confirmation = await _is_confirmation(user_text, updated_conversation, quote_state)
-            logger.info("🔍 BRANCH: Confirmation check - user_text='%s', is_confirmation=%s, is_complete=%s", 
-                       user_text, is_confirmation, quote_state.get("is_complete", False))
-            
-            if quote_state.get("is_complete") and is_confirmation:
-                logger.info("➡️  BRANCH: Entering QUOTE CONFIRMATION branch (creating quote)")
-                # 用户确认报价，创建报价
-                logger.info("=" * 80)
-                logger.info("📋 USER CONFIRMED QUOTE REQUEST - Creating quote in Salesforce...")
-                logger.info("  Call ID: %s", call_connection_id)
-                extracted = quote_state.get("extracted", {})
-                logger.info("  Quote Details:")
-                logger.info("    - Customer: %s", extracted.get("customer_name"))
-                logger.info("    - Contact: %s", extracted.get("contact_info"))
-                quote_items = extracted.get("quote_items", [])
-                for item in quote_items:
-                    logger.info("    - Product: %s x %s", item.get("product_package"), item.get("quantity"))
-                logger.info("=" * 80)
-                quote_result = await create_quote_from_state(call_connection_id, quote_state)
-                if quote_result:
-                    logger.info("➡️  SUB-BRANCH: Quote creation SUCCESS")
-                    answer_text = (
-                        f"Great! I've created your quote. "
-                        f"The quote number is {quote_result.get('quote_number', 'N/A')}. "
-                        f"An email with the quote details has been sent to your email address. "
-                        f"Is there anything else I can help you with?"
-                    )
-                    # 清除报价状态
-                    if call_connection_id in _active_acs_calls:
-                        _active_acs_calls[call_connection_id].pop("quote_state", None)
-                        logger.info("🧹 Cleared quote_state after successful creation")
-                else:
-                    logger.info("➡️  SUB-BRANCH: Quote creation FAILED")
-                    answer_text = (
-                        "I'm sorry, I couldn't create the quote at this time. "
-                        "Please try again later or contact our support team."
-                    )
-            elif quote_updated and quote_state.get("is_complete"):
-                logger.info("➡️  BRANCH: Entering QUOTE COMPLETE (waiting for confirmation) branch")
-                # 报价信息已完整，确认前先完整复述
-                recap = _build_quote_confirmation_recap(quote_state)
-                answer_text = (
-                    f"{recap} "
-                    "Please say 'confirm' or 'yes' to create the quote, "
-                    "or let me know if you'd like to make any changes."
-                )
-            else:
-                logger.info("➡️  BRANCH: Entering REGULAR FLOW branch (no confirmation needed)")
+            logger.info(
+                "🔍 ACS response generated via tool-planned flow or regular Q&A - quote_updated=%s, quote_complete=%s",
+                quote_updated,
+                quote_state.get("is_complete", False),
+            )
         else:
             logger.info("➡️  BRANCH: Entering SIMPLE MODE branch (no call_connection_id)")
             # 没有 call_connection_id，使用简单模式
@@ -942,7 +1151,209 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
             logger.info("💾 Saved conversation history to call state (call: %s, messages: %d)", 
                        call_connection_id, len(conversation_history))
+
+        quote_state = _enrich_quote_state_with_delivery(quote_state) if quote_state else {}
+        if (
+            call_connection_id
+            and quote_state.get("is_complete")
+            and not quote_state.get("missing_fields")
+            and _is_explicit_quote_confirmation(user_text)
+        ):
+            logger.info("➡️  BRANCH: Explicit quote confirmation detected; sending quote email directly")
+            tool_result = await _execute_acs_quote_tool_call(
+                "send_quote_email",
+                {},
+                call_connection_id,
+                conversation_history,
+                quote_state,
+            )
+            quote_state = _enrich_quote_state_with_delivery(tool_result.get("quote_state"))
+            if tool_result.get("success"):
+                quote_result = tool_result.get("quote_result") or tool_result.get("quote_state", {}).get("delivery", {})
+                if tool_result.get("already_sent"):
+                    answer_text = "Your quote email was already sent. If you want me to resend it, just say resend the quote email."
+                else:
+                    answer_text = (
+                        f"Great, I've processed your confirmation. "
+                        f"Your quote number is {quote_result.get('quote_number', 'N/A')}. "
+                        "I've sent the quote email. Is there anything else I can help you with?"
+                    )
+                    if call_connection_id in _active_acs_calls:
+                        _active_acs_calls[call_connection_id].pop("quote_state", None)
+                _clear_pending_quote_update(call_connection_id)
+                _clear_pending_quote_recap(call_connection_id)
+                _clear_awaiting_quote_confirmation(call_connection_id)
+            else:
+                answer_text = "I wasn't able to send the quote just now. Please try again in a moment."
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from explicit confirmation flow: %s", answer_text)
+            return answer_text, False, False
+
+        pending_recap = _get_pending_quote_recap(call_connection_id)
+        if call_connection_id and pending_recap and quote_state:
+            logger.info("➡️  BRANCH: Resolving pending quote recap: %s", pending_recap)
+            recap_request = await _extract_quote_recap_request(
+                client,
+                openai_deployment,
+                user_text,
+                conversation_history,
+                pending_fields=pending_recap.get("requested_fields", []),
+            )
+            requested_fields = recap_request.get("requested_fields", [])
+            if recap_request.get("wants_all"):
+                requested_fields = []
+            if recap_request.get("needs_clarification") and not requested_fields:
+                _set_pending_quote_recap(call_connection_id, pending_recap)
+                answer_text = _build_quote_recap_follow_up(pending_recap.get("requested_fields", []))
+                _append_assistant_message(call_connection_id, answer_text)
+                logger.info("Answer text from pending-recap follow-up: %s", answer_text)
+                return answer_text, False, False
+
+            _clear_pending_quote_recap(call_connection_id)
+            recap = _build_quote_targeted_recap(quote_state, requested_fields)
+            if quote_state.get("is_complete"):
+                _set_awaiting_quote_confirmation(call_connection_id)
+                answer_text = (
+                    f"{recap} Please say 'confirm' or 'yes' to create the quote, "
+                    "or tell me what you'd like to change."
+                )
+            else:
+                follow_up = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+                answer_text = f"{recap} {follow_up}"
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from pending-recap resolution: %s", answer_text)
+            return answer_text, False, False
+
+        pending_update = _get_pending_quote_update(call_connection_id)
+        if call_connection_id and pending_update:
+            logger.info("➡️  BRANCH: Resolving pending quote update: %s", pending_update)
+            update_request = await _extract_quote_update_request(
+                client,
+                openai_deployment,
+                user_text,
+                conversation_history,
+                quote_state,
+                pending_fields=pending_update.get("requested_fields", []),
+            )
+            requested_fields = update_request.get("requested_fields", []) or pending_update.get("requested_fields", [])
+            update_arguments = dict(update_request.get("updates", {}))
+            missing_requested_fields = [
+                field for field in requested_fields
+                if field not in update_arguments or update_arguments.get(field) in (None, "", [])
+            ]
+            if update_arguments:
+                tool_result = await _execute_acs_quote_tool_call(
+                    "update_quote_info",
+                    update_arguments,
+                    call_connection_id,
+                    conversation_history,
+                    quote_state,
+                )
+                quote_state = _enrich_quote_state_with_delivery(tool_result.get("quote_state"))
+                quote_updated = bool(tool_result.get("quote_updated"))
+                remaining_fields = [
+                    field for field in requested_fields
+                    if field not in update_arguments or update_arguments.get(field) in (None, "", [])
+                ]
+                if remaining_fields:
+                    _set_pending_quote_update(call_connection_id, {"requested_fields": remaining_fields})
+                    answer_text = _build_quote_update_follow_up(remaining_fields)
+                    _append_assistant_message(call_connection_id, answer_text)
+                    logger.info("Answer text from partial pending-update resolution: %s", answer_text)
+                    return answer_text, quote_updated, False
+
+                _clear_pending_quote_update(call_connection_id)
+                if quote_state.get("missing_fields"):
+                    _clear_awaiting_quote_confirmation(call_connection_id)
+                    answer_text = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+                else:
+                    _clear_pending_quote_recap(call_connection_id)
+                    include_recap = not _is_awaiting_quote_confirmation(call_connection_id)
+                    answer_text = _build_quote_confirmation_prompt(
+                        quote_state,
+                        include_recap=include_recap,
+                    )
+                    _set_awaiting_quote_confirmation(call_connection_id)
+                _append_assistant_message(call_connection_id, answer_text)
+                logger.info("Answer text from pending-update resolution: %s", answer_text)
+                return answer_text, quote_updated, False
+
+            _set_pending_quote_update(call_connection_id, {"requested_fields": requested_fields or pending_update.get("requested_fields", [])})
+            answer_text = _build_quote_update_follow_up(requested_fields or pending_update.get("requested_fields", []))
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from pending-update follow-up: %s", answer_text)
+            return answer_text, False, False
         
+        planned_tool_call = await _plan_acs_quote_tool_call(
+            client,
+            openai_deployment,
+            user_text,
+            conversation_history,
+            quote_state,
+        )
+        quote_updated = False
+
+        if planned_tool_call and call_connection_id:
+            logger.info("➡️  BRANCH: Entering ACS TOOL-CALLING quote flow")
+            tool_result = await _execute_acs_quote_tool_call(
+                planned_tool_call["name"],
+                planned_tool_call.get("arguments", {}),
+                call_connection_id,
+                conversation_history,
+                quote_state,
+            )
+            quote_state = _enrich_quote_state_with_delivery(tool_result.get("quote_state"))
+            quote_updated = bool(tool_result.get("quote_updated"))
+
+            if planned_tool_call["name"] == "send_quote_email":
+                if tool_result.get("success"):
+                    quote_result = tool_result.get("quote_result") or {}
+                    if tool_result.get("already_sent"):
+                        answer_text = (
+                            "Your quote email was already sent. "
+                            "If you want me to resend it, just say resend the quote email."
+                        )
+                    else:
+                        answer_text = (
+                            f"Great, I've processed your confirmation. "
+                            f"Your quote number is {quote_result.get('quote_number', 'N/A')}. "
+                            "I've sent the quote email. Is there anything else I can help you with?"
+                        )
+                        if call_connection_id in _active_acs_calls:
+                            _active_acs_calls[call_connection_id].pop("quote_state", None)
+                    _clear_awaiting_quote_confirmation(call_connection_id)
+                else:
+                    if quote_state.get("is_complete"):
+                        answer_text = (
+                            "I wasn't able to send the quote just now. "
+                            "Please try again in a moment."
+                        )
+                    else:
+                        recap = _build_quote_targeted_recap(quote_state, [])
+                        follow_up = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+                        answer_text = f"{recap} {follow_up}"
+
+                _append_assistant_message(call_connection_id, answer_text)
+                logger.info("Answer text from GPT tool flow: %s", answer_text)
+                return answer_text, quote_updated, False
+
+            missing_fields = quote_state.get("missing_fields", [])
+            if missing_fields:
+                _clear_awaiting_quote_confirmation(call_connection_id)
+                answer_text = _generate_quote_collection_response(missing_fields, quote_state)
+            else:
+                _clear_pending_quote_recap(call_connection_id)
+                include_recap = not _is_awaiting_quote_confirmation(call_connection_id)
+                answer_text = _build_quote_confirmation_prompt(
+                    quote_state,
+                    include_recap=include_recap,
+                )
+                _set_awaiting_quote_confirmation(call_connection_id)
+
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from GPT tool flow: %s", answer_text)
+            return answer_text, quote_updated, False
+
         behavior = await _classify_user_behavior_with_llm(
             client,
             openai_deployment,
@@ -952,186 +1363,192 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             bool(quote_state.get("is_complete")),
         )
 
-        # 用户询问"之前填写了什么"时，优先用当前已提取状态回答
-        is_recall_question = behavior == "recall_quote_info"
-        logger.info("🔍 BRANCH: Recall question check - behavior=%s, is_recall_question=%s, has_quote_state=%s", 
-                   behavior, is_recall_question, bool(quote_state))
-        if quote_state and is_recall_question:
+        if call_connection_id and behavior in {"quote_request", "modify_quote_info"}:
+            logger.info(
+                "➡️  BRANCH: LLM classified quote intent but planner returned no tool call; forcing fallback tool execution. behavior=%s",
+                behavior,
+            )
+            if behavior == "modify_quote_info":
+                update_request = await _extract_quote_update_request(
+                    client,
+                    openai_deployment,
+                    user_text,
+                    conversation_history,
+                    quote_state,
+                )
+                requested_fields = update_request.get("requested_fields", [])
+                update_arguments = dict(update_request.get("updates", {}))
+                missing_requested_fields = [
+                    field for field in requested_fields
+                    if field not in update_arguments or update_arguments.get(field) in (None, "", [])
+                ]
+                if requested_fields and missing_requested_fields:
+                    if update_arguments:
+                        tool_result = await _execute_acs_quote_tool_call(
+                            "update_quote_info",
+                            update_arguments,
+                            call_connection_id,
+                            conversation_history,
+                            quote_state,
+                        )
+                        quote_state = _enrich_quote_state_with_delivery(tool_result.get("quote_state"))
+                        quote_updated = bool(tool_result.get("quote_updated"))
+                    _set_pending_quote_update(call_connection_id, {"requested_fields": missing_requested_fields})
+                    answer_text = _build_quote_update_follow_up(missing_requested_fields)
+                    _append_assistant_message(call_connection_id, answer_text)
+                    logger.info("Answer text from modify follow-up flow: %s", answer_text)
+                    return answer_text, quote_updated, False
+                tool_result = await _execute_acs_quote_tool_call(
+                    "update_quote_info",
+                    update_arguments,
+                    call_connection_id,
+                    conversation_history,
+                    quote_state,
+                )
+            else:
+                tool_result = await _execute_acs_quote_tool_call(
+                    "extract_quote_info",
+                    {},
+                    call_connection_id,
+                    conversation_history,
+                    quote_state,
+                )
+            quote_state = _enrich_quote_state_with_delivery(tool_result.get("quote_state"))
+            quote_updated = bool(tool_result.get("quote_updated"))
+
+            if quote_state.get("missing_fields"):
+                _clear_awaiting_quote_confirmation(call_connection_id)
+                answer_text = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+            else:
+                _clear_pending_quote_recap(call_connection_id)
+                include_recap = not _is_awaiting_quote_confirmation(call_connection_id)
+                answer_text = _build_quote_confirmation_prompt(
+                    quote_state,
+                    include_recap=include_recap,
+                )
+                _set_awaiting_quote_confirmation(call_connection_id)
+
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from fallback quote flow: %s", answer_text)
+            return answer_text, quote_updated, False
+
+        if quote_state and behavior == "recall_quote_info":
             logger.info("➡️  BRANCH: Entering QUOTE RECALL branch (user asking for quote info)")
-            requested_fields = await _extract_recap_requested_fields(user_text, conversation_history)
+            recap_request = await _extract_quote_recap_request(
+                client,
+                openai_deployment,
+                user_text,
+                conversation_history,
+            )
+            requested_fields = recap_request.get("requested_fields", [])
+            if recap_request.get("wants_all"):
+                requested_fields = []
+            if recap_request.get("needs_clarification") and requested_fields:
+                _set_pending_quote_recap(call_connection_id, {"requested_fields": requested_fields})
+                answer_text = _build_quote_recap_follow_up(requested_fields)
+                _append_assistant_message(call_connection_id, answer_text)
+                logger.info("Answer text from recap clarification flow: %s", answer_text)
+                return answer_text, False, False
+            if recap_request.get("needs_clarification") and not requested_fields:
+                _set_pending_quote_recap(
+                    call_connection_id,
+                    {"requested_fields": ["customer_name", "contact_info", "quote_items", "expected_start_date", "notes"]},
+                )
+                answer_text = _build_quote_recap_follow_up([])
+                _append_assistant_message(call_connection_id, answer_text)
+                logger.info("Answer text from recap clarification flow: %s", answer_text)
+                return answer_text, False, False
             recap = _build_quote_targeted_recap(quote_state, requested_fields)
             if quote_state.get("is_complete"):
-                logger.info("➡️  SUB-BRANCH: Quote is complete, answering requested recap and asking for confirmation")
-                return (
-                    f"{recap} Please say 'confirm' or 'yes' to create the quote, "
-                    "or tell me what you'd like to change.",
-                    False,
-                    False,
-                )
-
-            logger.info("➡️  SUB-BRANCH: Quote incomplete, answering requested recap and asking for missing fields")
-            missing_fields = quote_state.get("missing_fields", [])
-            follow_up = _generate_quote_collection_response(missing_fields, quote_state)
-            return f"{recap} {follow_up}", False, False
-
-        # 检测是否是报价请求（使用大模型语义判断）
-        is_quote_request = behavior == "quote_request"
-        logger.info("🔍 BRANCH: Quote intent detection - behavior=%s, is_quote_request=%s, call_connection_id=%s", 
-                   behavior, is_quote_request, call_connection_id is not None)
-        quote_updated = False
-        
-        if is_quote_request and call_connection_id:
-            logger.info("➡️  BRANCH: Entering QUOTE REQUEST branch")
-            # 提取报价信息
-            logger.info("=" * 80)
-            logger.info("📋 QUOTE REQUEST DETECTED - Extracting quote information...")
-            logger.info("  Call ID: %s", call_connection_id)
-            logger.info("  Conversation history length: %d", len(conversation_history))
-            logger.info("  Current quote state: %s", json.dumps(quote_state, ensure_ascii=False, default=str)[:200])
-            logger.info("=" * 80)
-            
-            quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
-            quote_updated = True
-            
-            # 打印提取结果
-            logger.info("📋 QUOTE EXTRACTION RESULT:")
-            extracted = quote_state.get("extracted", {})
-            logger.info("  - Extracted Customer Name: %s", extracted.get("customer_name") or "None")
-            logger.info("  - Extracted Contact Info: %s", extracted.get("contact_info") or "None")
-            quote_items = extracted.get("quote_items", [])
-            logger.info("  - Extracted Quote Items: %d items", len(quote_items))
-            for idx, item in enumerate(quote_items, 1):
-                logger.info("      [%d] %s x %s", idx, item.get("product_package"), item.get("quantity"))
-            logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
-            logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
-            
-            # 更新通话状态
-            if call_connection_id in _active_acs_calls:
-                _active_acs_calls[call_connection_id]["quote_state"] = quote_state
-                _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
-                logger.info("✅ Updated call state with quote information")
-            
-            # 根据缺失字段生成回答
-            missing_fields = quote_state.get("missing_fields", [])
-            if missing_fields:
-                logger.info("➡️  SUB-BRANCH: Quote collection - missing fields, asking for: %s", missing_fields)
-                answer_text = _generate_quote_collection_response(missing_fields, quote_state)
-            else:
-                logger.info("➡️  SUB-BRANCH: Quote collection - all fields complete, asking for confirmation")
-                # 信息已完整，确认前先复述完整信息
-                recap = _build_quote_confirmation_recap(quote_state)
+                _clear_awaiting_quote_confirmation(call_connection_id)
                 answer_text = (
-                    f"{recap} "
-                    "Please say 'confirm' or 'yes' to create the quote."
+                    f"{recap} Please say 'confirm' or 'yes' to create the quote, "
+                    "or tell me what you'd like to change."
                 )
-        else:
-            logger.info("➡️  BRANCH: Entering NON-QUOTE-REQUEST branch (regular Q&A or continuing quote collection)")
-            # 普通问答或继续收集报价信息
-            if quote_state and not quote_state.get("is_complete"):
-                logger.info("➡️  SUB-BRANCH: Continuing quote collection (quote_state exists but incomplete)")
-                # 正在收集报价信息，继续提取
-                logger.info("📋 CONTINUING QUOTE COLLECTION - Extracting additional information...")
-                logger.info("  Call ID: %s", call_connection_id)
-                logger.info("  Previous missing fields: %s", quote_state.get("missing_fields", []))
-                
-                quote_state = await _extract_quote_info_phone(conversation_history, quote_state)
-                quote_updated = True
-                
-                # 打印更新后的状态
-                logger.info("📋 QUOTE COLLECTION UPDATE:")
-                extracted = quote_state.get("extracted", {})
-                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
-                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
-                quote_items = extracted.get("quote_items", [])
-                logger.info("  - Quote Items: %d items", len(quote_items))
-                for item in quote_items:
-                    logger.info("      * %s x %s", item.get("product_package"), item.get("quantity"))
-                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
-                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
-                
-                if call_connection_id and call_connection_id in _active_acs_calls:
-                    _active_acs_calls[call_connection_id]["quote_state"] = quote_state
-                    logger.info("✅ Updated call state with new quote information")
-                
-                missing_fields = quote_state.get("missing_fields", [])
-                if missing_fields:
-                    logger.info("➡️  SUB-SUB-BRANCH: Still missing fields, asking for: %s", missing_fields)
-                    answer_text = _generate_quote_collection_response(missing_fields, quote_state)
-                else:
-                    logger.info("➡️  SUB-SUB-BRANCH: All fields complete, asking for confirmation")
-                    recap = _build_quote_confirmation_recap(quote_state)
-                    answer_text = (
-                        f"{recap} "
-                        "Please say 'confirm' or 'yes' to create the quote."
-                    )
             else:
-                logger.info("➡️  SUB-BRANCH: Regular Q&A (no quote_state or quote_state is complete)")
-                # 普通问答
-                system_prompt = (
-                    "You are a helpful support assistant speaking on a phone call. "
-                    "Answer briefly and clearly in natural English. "
-                    "Keep each answer under 3 sentences. "
-                    "If the user asks about quotes, pricing, or estimates, help them request a quote."
-                )
-                
-                logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
-                logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
-                context_messages = [
-                    {"role": "system", "content": system_prompt},
-                    *[
-                        {
-                            "role": "assistant" if m.get("role") == "assistant" else "user",
-                            "content": m.get("content", ""),
-                        }
-                        for m in conversation_history[-6:]
-                        if isinstance(m, dict) and m.get("content")
-                    ],
-                    {"role": "user", "content": user_text},
-                ]
-                # 普通问答：流式输出，边生成边加入 TTS 队列播报，降低首字延迟
-                logger.info("[STREAM] Starting GPT stream for call=%s (regular Q&A)", call_connection_id)
-                stream = client.chat.completions.create(
-                    model=openai_deployment,
-                    messages=context_messages,
-                    temperature=0.4,
-                    max_tokens=128,
-                    stream=True,
-                )
-                full_parts: list[str] = []
-                buffer = ""
-                chunk_count = 0
-                for chunk in stream:
-                    delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
-                    if not delta:
-                        continue
-                    chunk_count += 1
-                    if chunk_count <= 3 or chunk_count % 20 == 0:
-                        logger.info("[STREAM] GPT delta #%d: %s", chunk_count, repr(delta[:40]) + ("..." if len(delta) > 40 else ""))
-                    full_parts.append(delta)
-                    buffer += delta
-                    buffer = _flush_stream_buffer(buffer, call_connection_id)
-                full_text = "".join(full_parts).strip()
-                total_chunks = len(_active_acs_calls.get(call_connection_id, {}).get("answer_chunk_queue", []))
-                logger.info("[STREAM] GPT stream finished: total_deltas=%d, full_len=%d, queue_chunks_so_far=%d", chunk_count, len(full_text), total_chunks)
-                # 剩余 buffer 作为最后一段播报
-                if buffer.strip():
-                    _ensure_answer_stream_state(call_connection_id)
-                    _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(buffer.strip())
-                    logger.info("[STREAM] Last buffer queued: %s", buffer.strip()[:60] + ("..." if len(buffer.strip()) > 60 else ""))
-                    asyncio.create_task(_play_next_answer_chunk(call_connection_id))
-                if not full_text:
-                    logger.warning("GPT stream returned empty answer text, using fallback.")
-                    return fallback, False, False
-                # 更新对话历史（流式已播报，不需要再 play_answer_message）
-                if call_connection_id and call_connection_id in _active_acs_calls:
-                    conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
-                    conv.append({"role": "assistant", "content": full_text})
-                    if len(conv) > 10:
-                        conv = conv[-10:]
-                    _active_acs_calls[call_connection_id]["conversation_history"] = conv
-                    _active_acs_calls[call_connection_id]["last_answer"] = full_text
-                logger.info("[STREAM] Returning streamed answer (already_played=True), full_text=%s", full_text[:80] + ("..." if len(full_text) > 80 else ""))
-                return full_text, quote_updated, True
+                follow_up = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+                answer_text = f"{recap} {follow_up}"
+
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from GPT recall flow: %s", answer_text)
+            return answer_text, False, False
+
+        if quote_state and not quote_state.get("is_complete"):
+            logger.info("➡️  BRANCH: Quote state exists but no tool call was planned; ask for remaining missing info")
+            _clear_awaiting_quote_confirmation(call_connection_id)
+            answer_text = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("Answer text from GPT pending-quote flow: %s", answer_text)
+            return answer_text, False, False
+
+        else:
+            logger.info("➡️  SUB-BRANCH: Regular Q&A (no quote_state or quote_state is complete)")
+            # 普通问答
+            system_prompt = (
+                "You are a helpful support assistant speaking on a phone call. "
+                "Answer briefly and clearly in natural English. "
+                "Keep each answer under 3 sentences. "
+                "If the user asks about quotes, pricing, or estimates, help them request a quote."
+            )
+
+            logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
+            logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
+            context_messages = [
+                {"role": "system", "content": system_prompt},
+                *[
+                    {
+                        "role": "assistant" if m.get("role") == "assistant" else "user",
+                        "content": m.get("content", ""),
+                    }
+                    for m in conversation_history[-6:]
+                    if isinstance(m, dict) and m.get("content")
+                ],
+                {"role": "user", "content": user_text},
+            ]
+            # 普通问答：流式输出，边生成边加入 TTS 队列播报，降低首字延迟
+            logger.info("[STREAM] Starting GPT stream for call=%s (regular Q&A)", call_connection_id)
+            stream = client.chat.completions.create(
+                model=openai_deployment,
+                messages=context_messages,
+                temperature=0.4,
+                max_tokens=128,
+                stream=True,
+            )
+            full_parts: list[str] = []
+            buffer = ""
+            chunk_count = 0
+            for chunk in stream:
+                delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
+                if not delta:
+                    continue
+                chunk_count += 1
+                if chunk_count <= 3 or chunk_count % 20 == 0:
+                    logger.info("[STREAM] GPT delta #%d: %s", chunk_count, repr(delta[:40]) + ("..." if len(delta) > 40 else ""))
+                full_parts.append(delta)
+                buffer += delta
+                buffer = _flush_stream_buffer(buffer, call_connection_id)
+            full_text = "".join(full_parts).strip()
+            total_chunks = len(_active_acs_calls.get(call_connection_id, {}).get("answer_chunk_queue", []))
+            logger.info("[STREAM] GPT stream finished: total_deltas=%d, full_len=%d, queue_chunks_so_far=%d", chunk_count, len(full_text), total_chunks)
+            # 剩余 buffer 作为最后一段播报
+            if buffer.strip():
+                _ensure_answer_stream_state(call_connection_id)
+                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(buffer.strip())
+                logger.info("[STREAM] Last buffer queued: %s", buffer.strip()[:60] + ("..." if len(buffer.strip()) > 60 else ""))
+                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
+            if not full_text:
+                logger.warning("GPT stream returned empty answer text, using fallback.")
+                return fallback, False, False
+            # 更新对话历史（流式已播报，不需要再 play_answer_message）
+            if call_connection_id and call_connection_id in _active_acs_calls:
+                conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
+                conv.append({"role": "assistant", "content": full_text})
+                if len(conv) > 10:
+                    conv = conv[-10:]
+                _active_acs_calls[call_connection_id]["conversation_history"] = conv
+                _active_acs_calls[call_connection_id]["last_answer"] = full_text
+            logger.info("[STREAM] Returning streamed answer (already_played=True), full_text=%s", full_text[:80] + ("..." if len(full_text) > 80 else ""))
+            return full_text, quote_updated, True
 
         logger.info("Answer text from GPT: %s", answer_text)
         return answer_text, quote_updated, False
@@ -1142,113 +1559,9 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         return fallback, False, False
 
 
-async def _is_confirmation(user_text: str, conversation_history: list, quote_state: dict) -> bool:
-    """Use LLM to classify final quote confirmation (keep very explicit yes/confirm fast path)."""
-    user_lower = (user_text or "").lower().strip()
-    normalized = re.sub(r"[^a-z\s]", " ", user_lower)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    if normalized in {"yes", "confirm"}:
-        return True
-
-    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-    openai_deployment = (
-        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
-        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-        or "gpt-4o-mini"
-    )
-    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
-
-    if not openai_endpoint:
-        logger.warning("Confirmation classification skipped: missing AZURE_OPENAI_ENDPOINT")
-        return False
-
-    try:
-        from openai import AzureOpenAI
-
-        if llm_key:
-            client = AzureOpenAI(
-                api_key=llm_key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-        else:
-            from azure.identity import DefaultAzureCredential
-
-            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
-            client = AzureOpenAI(
-                api_key=token,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-
-        recent_history = [
-            {
-                "role": ("assistant" if msg.get("role") == "assistant" else "user"),
-                "content": msg.get("content", ""),
-            }
-            for msg in (conversation_history or [])[-6:]
-            if isinstance(msg, dict) and msg.get("content")
-        ]
-
-        payload = {
-            "latest_user_text": user_text,
-            "quote_state_complete": bool((quote_state or {}).get("is_complete")),
-            "recent_history": recent_history,
-            "task": "final_quote_confirmation",
-        }
-
-        response = client.chat.completions.create(
-            model=openai_deployment,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify whether the user is explicitly confirming final quote creation right now. "
-                        "Return JSON only with field 'state' and value confirm or other. "
-                        "Use semantics and context, not keywords only. "
-                        "If user is modifying details, asking questions, hesitating, or saying maybe, return other."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            max_tokens=48,
-        )
-
-        content = (response.choices[0].message.content or "{}").strip()
-        result = json.loads(content)
-        return result.get("state") == "confirm"
-    except Exception as e:
-        logger.warning("LLM confirmation classification failed: %s", str(e))
-        return False
-
-
 def _build_quote_confirmation_recap(quote_state: dict) -> str:
     """Build a concise recap sentence for collected quote info."""
-    extracted = quote_state.get("extracted", {}) if isinstance(quote_state, dict) else {}
-    customer_name = extracted.get("customer_name") or "not provided"
-    contact_info = extracted.get("contact_info") or "not provided"
-    expected_start_date = extracted.get("expected_start_date") or "not provided"
-    notes = extracted.get("notes") or "none"
-
-    quote_items = extracted.get("quote_items") or []
-    valid_items = [
-        item for item in quote_items
-        if isinstance(item, dict) and item.get("product_package") and item.get("quantity")
-    ]
-    if valid_items:
-        product_text = ", ".join(
-            f"{item.get('product_package')} x{item.get('quantity')}" for item in valid_items
-        )
-    else:
-        product_text = "not provided"
-
-    return (
-        f"Let me recap: name {customer_name}, contact {contact_info}, "
-        f"products {product_text}, expected start date {expected_start_date}, notes {notes}."
-    )
+    return shared_build_quote_confirmation_recap(quote_state)
 
 
 async def _extract_recap_requested_fields(user_text: str, conversation_history: list) -> list[str]:
@@ -1312,127 +1625,357 @@ async def _extract_recap_requested_fields(user_text: str, conversation_history: 
     return []
 
 
-def _build_quote_targeted_recap(quote_state: dict, requested_fields: list[str]) -> str:
-    """Build recap text for requested fields; if none specified, fallback to full recap."""
-    if not requested_fields:
-        return _build_quote_confirmation_recap(quote_state)
+async def _extract_quote_recap_request(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    pending_fields: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    payload = {
+        "latest_user_text": user_text,
+        "recent_history": [
+            {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": m.get("content", "")}
+            for m in (conversation_history or [])[-6:]
+            if isinstance(m, dict) and m.get("content")
+        ],
+        "pending_fields": pending_fields or [],
+    }
 
-    extracted = quote_state.get("extracted", {}) if isinstance(quote_state, dict) else {}
-    parts = []
-    if "customer_name" in requested_fields:
-        parts.append(f"name {extracted.get('customer_name') or 'not provided'}")
-    if "contact_info" in requested_fields:
-        parts.append(f"contact {extracted.get('contact_info') or 'not provided'}")
-    if "quote_items" in requested_fields:
-        items = extracted.get("quote_items") or []
-        valid_items = [it for it in items if isinstance(it, dict) and it.get("product_package") and it.get("quantity")]
-        product_text = ", ".join(f"{it.get('product_package')} x{it.get('quantity')}" for it in valid_items) if valid_items else "not provided"
-        parts.append(f"products {product_text}")
-    if "expected_start_date" in requested_fields:
-        parts.append(f"expected start date {extracted.get('expected_start_date') or 'not provided'}")
-    if "notes" in requested_fields:
-        parts.append(f"notes {extracted.get('notes') or 'none'}")
-
-    if not parts:
-        return _build_quote_confirmation_recap(quote_state)
-    return "Here is what I have: " + ", ".join(parts) + "."
-
-
-def _is_quote_info_recall_question(user_text: str) -> bool:
-    """Detect if user is asking to recall previously provided quote details."""
-    normalized = re.sub(r"\s+", " ", (user_text or "").lower()).strip()
-    if not normalized:
-        return False
-
-    recall_triggers = [
-        "what did i provide",
-        "what info did i provide",
-        "what information did i provide",
-        "what did i say",
-        "what do you have",
-        "what details do you have",
-        "repeat",
-        "recap",
-        "my email",
-        "my contact",
-        "my name",
-        "what is my",
-    ]
-    return any(trigger in normalized for trigger in recall_triggers)
-
-
-def _looks_like_quote_request(user_text: str) -> bool:
-    """Fast-path detection for explicit quote/pricing intent in phone transcripts."""
-    normalized = re.sub(r"[^a-z0-9\s]", " ", (user_text or "").lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        return False
-
-    strong_phrases = [
-        "want a quote",
-        "need a quote",
-        "get a quote",
-        "request a quote",
-        "looking for a quote",
-        "price estimate",
-        "pricing quote",
-        "need pricing",
-        "want pricing",
-        "how much",
-        "price for",
-        "cost for",
-        "quotation",
-    ]
-    if any(phrase in normalized for phrase in strong_phrases):
-        return True
-
-    tokens = set(normalized.split())
-    return "quote" in tokens or "pricing" in tokens or "quotation" in tokens
-
-
-async def _detect_quote_intent(user_text: str, conversation_history: list) -> bool:
-    """Keep compatibility for old callsites; now uses LLM semantic classification."""
-    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-    openai_deployment = (
-        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
-        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-        or "gpt-4o-mini"
+    prompt = (
+        "Identify which quote fields the user wants to hear recapped. "
+        "Return JSON only with keys requested_fields, wants_all, and needs_clarification. "
+        "Allowed field values: customer_name, contact_info, quote_items, expected_start_date, notes. "
+        "Set wants_all=true when the user clearly asks for all quote details. "
+        "Set needs_clarification=true when the user asks for a recap but does not make clear which fields they want, and they are not clearly asking for all details. "
+        "If pending_fields is provided, treat the latest user turn as a clarification of which of those fields they want."
     )
-    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
-
-    if not openai_endpoint:
-        return False
 
     try:
-        from openai import AzureOpenAI
-
-        if llm_key:
-            client = AzureOpenAI(
-                api_key=llm_key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-        else:
-            from azure.identity import DefaultAzureCredential
-
-            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
-            client = AzureOpenAI(
-                api_key=token,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint,
-            )
-
-        behavior = await _classify_user_behavior_with_llm(
-            client=client,
-            deployment=openai_deployment,
-            user_text=user_text,
-            conversation_history=conversation_history,
-            has_quote_state=False,
-            quote_complete=False,
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=96,
         )
-        return behavior == "quote_request"
-    except Exception:
-        return False
+        result = json.loads((response.choices[0].message.content or "{}").strip())
+        requested_fields = result.get("requested_fields")
+        if not isinstance(requested_fields, list):
+            requested_fields = []
+        allowed = {"customer_name", "contact_info", "quote_items", "expected_start_date", "notes"}
+        requested_fields = [field for field in requested_fields if field in allowed]
+        return {
+            "requested_fields": requested_fields,
+            "wants_all": bool(result.get("wants_all")),
+            "needs_clarification": bool(result.get("needs_clarification")) and not bool(result.get("wants_all")),
+        }
+    except Exception as e:
+        logger.warning("Failed to extract quote recap request: %s", str(e))
+        return {"requested_fields": pending_fields or [], "wants_all": False, "needs_clarification": not bool(pending_fields)}
+
+
+async def _extract_quote_update_request(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    quote_state: dict,
+    pending_fields: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Extract which quote fields the user wants to modify and any new values they already provided."""
+    payload = {
+        "latest_user_text": user_text,
+        "recent_history": [
+            {"role": ("assistant" if m.get("role") == "assistant" else "user"), "content": m.get("content", "")}
+            for m in (conversation_history or [])[-6:]
+            if isinstance(m, dict) and m.get("content")
+        ],
+        "current_quote_state": _enrich_quote_state_with_delivery(quote_state),
+        "pending_fields": pending_fields or [],
+    }
+
+    prompt = (
+        "Extract quote modification intent from the latest phone-call turn. "
+        "Return JSON only with these keys: requested_fields, updates, has_new_value. "
+        "requested_fields must contain any of: customer_name, contact_info, quote_items, expected_start_date, notes. "
+        "updates may contain only those same fields. "
+        "If the user says they want to change a field but does not provide the new value yet, include the field in requested_fields, leave it out of updates, and set has_new_value to false. "
+        "If pending_fields is provided, treat the latest user text as the likely new value for those fields unless impossible."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=200,
+        )
+        content = (response.choices[0].message.content or "{}").strip()
+        result = json.loads(content)
+        requested_fields = result.get("requested_fields")
+        updates = result.get("updates")
+        if not isinstance(requested_fields, list):
+            requested_fields = []
+        if not isinstance(updates, dict):
+            updates = {}
+        allowed = {"customer_name", "contact_info", "quote_items", "expected_start_date", "notes"}
+        filtered_fields = [field for field in requested_fields if field in allowed]
+        filtered_updates = {key: value for key, value in updates.items() if key in allowed}
+        if filtered_updates.get("contact_info"):
+            normalized = normalize_and_match_quote_extracted_data(
+                {},
+                {"contact_info": filtered_updates["contact_info"]},
+                [],
+            ).get("contact_info")
+            filtered_updates["contact_info"] = normalized or filtered_updates["contact_info"]
+        return {
+            "requested_fields": filtered_fields,
+            "updates": filtered_updates,
+            "has_new_value": bool(result.get("has_new_value")) or bool(filtered_updates),
+        }
+    except Exception as e:
+        logger.warning("Failed to extract quote update request: %s", str(e))
+        return {"requested_fields": pending_fields or [], "updates": {}, "has_new_value": False}
+
+
+def _build_quote_update_follow_up(requested_fields: list[str]) -> str:
+    if not requested_fields:
+        return "Sure, what would you like to change in the quote details?"
+
+    field = requested_fields[0]
+    prompts = {
+        "customer_name": "Sure, what name should I update it to?",
+        "contact_info": "Sure, what email address should I update it to?",
+        "quote_items": "Sure, which product or quantity would you like to change?",
+        "expected_start_date": "Sure, what should the new start date be?",
+        "notes": "Sure, what notes should I update?",
+    }
+    return prompts.get(field, "Sure, what would you like to change it to?")
+
+
+def _build_quote_recap_follow_up(requested_fields: list[str]) -> str:
+    if requested_fields:
+        field_labels = {
+            "customer_name": "name",
+            "contact_info": "contact email",
+            "quote_items": "products",
+            "expected_start_date": "expected start date",
+            "notes": "notes",
+        }
+        readable = [field_labels.get(field, field) for field in requested_fields]
+        return f"Sure, which details would you like me to recap first: {', '.join(readable)}?"
+    return "Sure, which quote details would you like me to recap: name, contact email, products, start date, or notes?"
+
+
+def _build_quote_confirmation_prompt(quote_state: dict, include_recap: bool = True) -> str:
+    if include_recap:
+        recap = _build_quote_confirmation_recap(quote_state)
+        return (
+            f"{recap} "
+            "Please say 'confirm' or 'yes' to create the quote, or tell me what you'd like to change."
+        )
+    return "Please say 'confirm' or 'yes' to create the quote, or tell me what you'd like to change."
+
+
+def _build_quote_targeted_recap(quote_state: dict, requested_fields: list[str]) -> str:
+    """Build recap text for requested fields; if none specified, fallback to full recap."""
+    return shared_build_quote_targeted_recap(quote_state, requested_fields)
+
+
+async def _plan_acs_quote_tool_call(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    quote_state: dict,
+) -> Optional[dict[str, Any]]:
+    """Ask the model to decide whether the ACS quote workflow should call a tool."""
+    state = _enrich_quote_state_with_delivery(quote_state)
+    tools = [_quote_extraction_tool_schema, _update_quote_info_tool_schema, _send_quote_email_tool_schema]
+    recent_history = [
+        {
+            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-8:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+    payload = {
+        "current_quote_state": state,
+        "recent_history": recent_history,
+        "latest_user_text": user_text,
+    }
+
+    planner_prompt = (
+        "You are deciding whether the latest phone-call turn should trigger a quote workflow tool. "
+        "Use tools only for quote workflow actions. "
+        "Tool rules: "
+        "1) Use extract_quote_info when the user requests a quote or provides quote details in free-form speech. "
+        "If the user says things like 'I need a quote', 'I want pricing', 'can I get a quote', "
+        "'quote', 'quotation', 'estimate', 'how much', 'price', or 'cost', you should call extract_quote_info immediately. "
+        "2) Use update_quote_info when the user explicitly changes or corrects already-collected quote fields. "
+        "3) Use send_quote_email when the quote is complete and the user explicitly confirms, sends, proceeds, or asks to resend the quote email. "
+        "4) Do not call any tool for general Q&A or for quote recap questions such as asking what details were already provided. "
+        "5) Prefer the smallest necessary tool action for the latest turn. "
+        "6) When the latest turn starts a quote flow, prefer calling a tool instead of answering conversationally."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": planner_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.0,
+            max_tokens=128,
+        )
+        message = response.choices[0].message
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            return None
+
+        tool_call = tool_calls[0]
+        function = getattr(tool_call, "function", None)
+        if not function or not getattr(function, "name", None):
+            return None
+
+        arguments_text = getattr(function, "arguments", "") or "{}"
+        try:
+            arguments = json.loads(arguments_text)
+        except json.JSONDecodeError:
+            logger.warning("Invalid tool arguments from ACS quote planner: %s", arguments_text)
+            arguments = {}
+
+        planned_call = {
+            "name": function.name,
+            "arguments": arguments,
+        }
+        logger.info("ACS tool planner selected tool: %s", planned_call)
+        return planned_call
+    except Exception as e:
+        logger.warning("ACS quote tool planning failed: %s", str(e))
+        return None
+
+
+async def _execute_acs_quote_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+    call_connection_id: Optional[str],
+    conversation_history: list,
+    quote_state: dict,
+) -> dict[str, Any]:
+    """Execute an ACS quote tool call against local call state."""
+    state = _enrich_quote_state_with_delivery(quote_state)
+    arguments = arguments or {}
+
+    if tool_name == "extract_quote_info":
+        updated_state = await _extract_quote_info_phone(conversation_history, state)
+        updated_state["delivery"] = dict(state.get("delivery") or _default_quote_delivery())
+        updated_state = _store_acs_quote_state(call_connection_id, updated_state, conversation_history)
+        return {"tool_name": tool_name, "quote_state": updated_state, "quote_updated": True}
+
+    if tool_name == "update_quote_info":
+        meaningful_update = any(
+            arguments.get(field) not in (None, "", [])
+            for field in ["customer_name", "contact_info", "quote_items", "expected_start_date", "notes"]
+        )
+        if not meaningful_update:
+            updated_state = await _extract_quote_info_phone(conversation_history, state)
+            updated_state["delivery"] = dict(state.get("delivery") or _default_quote_delivery())
+            updated_state = _store_acs_quote_state(call_connection_id, updated_state, conversation_history)
+            return {"tool_name": tool_name, "quote_state": updated_state, "quote_updated": True}
+
+        products = fetch_available_products()
+        product_names = [product["name"] for product in products]
+        extracted = normalize_and_match_quote_extracted_data(
+            state.get("extracted", {}),
+            arguments,
+            products,
+            replace_quote_items=bool(arguments.get("replace_quote_items", True)),
+        )
+        updated_state = build_quote_state(extracted, product_names)
+        updated_state["delivery"] = dict(state.get("delivery") or _default_quote_delivery())
+        updated_state = _store_acs_quote_state(call_connection_id, updated_state, conversation_history)
+        return {"tool_name": tool_name, "quote_state": updated_state, "quote_updated": True}
+
+    if tool_name == "send_quote_email":
+        send_state = state
+        override_email = arguments.get("email_address") or arguments.get("contact_info")
+        if override_email:
+            extracted = dict(send_state.get("extracted", {}))
+            extracted["contact_info"] = override_email
+            products = fetch_available_products()
+            product_names = [product["name"] for product in products]
+            send_state = build_quote_state(
+                normalize_and_match_quote_extracted_data(extracted, {}, products),
+                product_names,
+            )
+            send_state["delivery"] = dict(state.get("delivery") or _default_quote_delivery())
+
+        if not send_state.get("is_complete"):
+            send_state = _store_acs_quote_state(call_connection_id, send_state, conversation_history)
+            return {
+                "tool_name": tool_name,
+                "success": False,
+                "error": "Quote information is incomplete",
+                "quote_state": send_state,
+                "quote_updated": False,
+            }
+
+        delivery = dict(send_state.get("delivery") or _default_quote_delivery())
+        force_resend = bool(arguments.get("force_resend", False))
+        if delivery.get("email_sent") and not force_resend:
+            send_state["delivery"] = delivery
+            send_state = _store_acs_quote_state(call_connection_id, send_state, conversation_history)
+            return {
+                "tool_name": tool_name,
+                "success": True,
+                "already_sent": True,
+                "quote_state": send_state,
+                "quote_result": delivery,
+                "quote_updated": False,
+            }
+
+        quote_result = await create_quote_from_extracted(send_state.get("extracted", {}), fallback_to_mock=False)
+        if not quote_result:
+            send_state = _store_acs_quote_state(call_connection_id, send_state, conversation_history)
+            return {
+                "tool_name": tool_name,
+                "success": False,
+                "error": "Quote creation failed",
+                "quote_state": send_state,
+                "quote_updated": False,
+            }
+
+        send_state["delivery"] = {
+            **delivery,
+            "quote_id": quote_result.get("quote_id"),
+            "quote_number": quote_result.get("quote_number"),
+            "quote_url": quote_result.get("quote_url"),
+            "email_sent": bool(quote_result.get("email_sent")),
+            "email_error": quote_result.get("email_error"),
+        }
+        send_state = _store_acs_quote_state(call_connection_id, send_state, conversation_history)
+        return {
+            "tool_name": tool_name,
+            "success": True,
+            "quote_state": send_state,
+            "quote_result": quote_result,
+            "quote_updated": False,
+        }
+
+    return {"tool_name": tool_name, "success": False, "error": f"Unsupported tool: {tool_name}", "quote_state": state}
 
 
 async def _classify_user_behavior_with_llm(
@@ -1444,14 +1987,6 @@ async def _classify_user_behavior_with_llm(
     quote_complete: bool,
 ) -> str:
     """Use LLM to classify the user's current intent into a branch behavior."""
-    if _looks_like_quote_request(user_text):
-        logger.info("Heuristic behavior classification: quote_request")
-        return "quote_request"
-
-    if _is_quote_info_recall_question(user_text):
-        logger.info("Heuristic behavior classification: recall_quote_info")
-        return "recall_quote_info"
-
     recent_history = [
         {
             "role": ("assistant" if msg.get("role") == "assistant" else "user"),
@@ -1498,9 +2033,6 @@ async def _classify_user_behavior_with_llm(
         content = (response.choices[0].message.content or "{}").strip()
         result = json.loads(content)
         behavior = result.get("behavior")
-        if behavior == "general_qa" and _looks_like_quote_request(user_text):
-            logger.info("Overriding LLM behavior general_qa -> quote_request due to explicit quote wording")
-            return "quote_request"
         if behavior in {"quote_request", "recall_quote_info", "modify_quote_info", "general_qa"}:
             logger.info("LLM behavior classification: %s", behavior)
             return behavior
@@ -1530,30 +2062,13 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
         logger.info("  Conversation text length: %d characters", len(conversation_text))
         
         # 获取可用产品
-        from salesforce_service import get_salesforce_service
-        sf_service = get_salesforce_service()
-        products = []
-        
-        if sf_service.is_available():
-            try:
-                logger.info("📦 Fetching available products from Salesforce...")
-                result = sf_service.sf.query(
-                    "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
-                )
-                if result["totalSize"] > 0:
-                    products = [
-                        {"id": record["Id"], "name": record["Name"]}
-                        for record in result["records"]
-                    ]
-                    logger.info("  Found %d available products", len(products))
-                    product_names = [p["name"] for p in products[:5]]  # 只打印前 5 个
-                    logger.info("  Sample products: %s", ", ".join(product_names))
-                else:
-                    logger.warning("  No products found in Salesforce")
-            except Exception as e:
-                logger.error("❌ Error fetching products: %s", str(e))
+        products = fetch_available_products()
+        product_names = [p["name"] for p in products]
+        if products:
+            logger.info("  Found %d available products", len(products))
+            logger.info("  Sample products: %s", ", ".join(product_names[:5]))
         else:
-            logger.warning("⚠️  Salesforce service not available, cannot fetch products")
+            logger.warning("  No products found in Salesforce")
         
         # 使用 GPT 提取信息
         from azure.core.credentials import AzureKeyCredential
@@ -1580,7 +2095,6 @@ async def _extract_quote_info_phone(conversation_history: list, current_state: d
         else:
             credential = DefaultAzureCredential()
         
-        product_names = [p["name"] for p in products] if products else []
         product_list_text = ", ".join(product_names) if product_names else "No products available"
         
         # 合并当前已提取的信息
@@ -1637,118 +2151,19 @@ Merge with current extracted data - only update fields where new information is 
         new_extracted = json.loads(response.choices[0].message.content)
         logger.info("  Extracted data: %s", json.dumps(new_extracted, ensure_ascii=False, default=str)[:300])
         
-        # 合并提取的数据（新数据覆盖旧数据）
         logger.info("🔄 Merging extracted data with current state...")
-        for key in ["customer_name", "contact_info", "expected_start_date", "notes"]:
-            old_value = extracted_data.get(key)
-            new_value = new_extracted.get(key)
-            if new_value:
-                extracted_data[key] = new_value
-                if old_value != new_value:
-                    logger.info("    Updated %s: '%s' -> '%s'", key, old_value, new_value)
-        
-        # 合并 quote_items（追加新项）
-        if new_extracted.get("quote_items"):
-            existing_items = extracted_data.get("quote_items", [])
-            new_items = new_extracted["quote_items"]
-            logger.info("  Merging quote_items: existing=%d, new=%d", len(existing_items), len(new_items))
-            # 简单的去重逻辑：如果产品名相同，更新数量
-            for new_item in new_items:
-                if not isinstance(new_item, dict):
-                    continue
-                product_name = new_item.get("product_package")
-                quantity = new_item.get("quantity")
-                if product_name:
-                    # 查找是否已存在
-                    found = False
-                    for existing_item in existing_items:
-                        if isinstance(existing_item, dict) and existing_item.get("product_package") == product_name:
-                            old_quantity = existing_item.get("quantity")
-                            existing_item["quantity"] = quantity
-                            found = True
-                            if old_quantity != quantity:
-                                logger.info("    Updated quantity for %s: %s -> %s", product_name, old_quantity, quantity)
-                            break
-                    if not found:
-                        existing_items.append(new_item)
-                        logger.info("    Added new product: %s x %s", product_name, quantity)
-            extracted_data["quote_items"] = existing_items
-            logger.info("  Final quote_items count: %d", len(extracted_data["quote_items"]))
-        
-        # 产品匹配（使用 quote_tools 的逻辑）
-        if extracted_data.get("quote_items") and products:
-            logger.info("🔍 Matching products with available products...")
-            from quote_tools import _find_best_product_match
-            matched_items = []
-            for item in extracted_data["quote_items"]:
-                if not isinstance(item, dict):
-                    continue
-                user_product = item.get("product_package")
-                quantity = item.get("quantity")
-                if user_product:
-                    matched_product = _find_best_product_match(user_product, products)
-                    if matched_product:
-                        if matched_product != user_product:
-                            logger.info("    Matched '%s' -> '%s'", user_product, matched_product)
-                        matched_items.append({
-                            "product_package": matched_product,
-                            "quantity": quantity or 1
-                        })
-                    else:
-                        logger.warning("    No match found for '%s' (keeping original)", user_product)
-                        matched_items.append({
-                            "product_package": user_product,
-                            "quantity": quantity or 1
-                        })
-            extracted_data["quote_items"] = matched_items
-            logger.info("  Product matching completed: %d items", len(matched_items))
-        
-        # 邮箱标准化
-        if extracted_data.get("contact_info"):
-            from quote_tools import normalize_email
-            original_contact = extracted_data["contact_info"]
-            normalized_email = normalize_email(str(original_contact))
-            if normalized_email:
-                if normalized_email != original_contact:
-                    logger.info("📧 Normalized email: '%s' -> '%s'", original_contact, normalized_email)
-                extracted_data["contact_info"] = normalized_email
-            else:
-                logger.warning("⚠️  Could not normalize contact info: '%s'", original_contact)
-        
-        # 确定缺失字段
-        logger.info("📊 Validating extracted data...")
-        missing_fields = []
-        if not extracted_data.get("customer_name"):
-            missing_fields.append("customer_name")
-            logger.info("    Missing: customer_name")
-        if not extracted_data.get("contact_info"):
-            missing_fields.append("contact_info")
-            logger.info("    Missing: contact_info")
-        
-        # 检查 quote_items
-        quote_items = extracted_data.get("quote_items", [])
-        valid_items = [
-            item for item in quote_items 
-            if isinstance(item, dict) and 
-               item.get("product_package") and 
-               item.get("quantity") is not None and 
-               item.get("quantity") > 0
-        ]
-        if not valid_items:
-            missing_fields.append("quote_items")
-            logger.info("    Missing: quote_items (or invalid)")
-        else:
-            logger.info("    Valid quote_items: %d items", len(valid_items))
-        
-        is_complete = len(missing_fields) == 0
-        logger.info("✅ Extraction result: is_complete=%s, missing_fields=%s", is_complete, missing_fields)
-        
-        result = {
-            "extracted": extracted_data,
-            "missing_fields": missing_fields,
-            "products_available": product_names,
-            "is_complete": is_complete,
-        }
+        extracted_data = normalize_and_match_quote_extracted_data(
+            extracted_data,
+            new_extracted,
+            products,
+            replace_quote_items=False,
+        )
+        result = build_quote_state(extracted_data, product_names)
+        logger.info(
+            "✅ Extraction result: is_complete=%s, missing_fields=%s",
+            result.get("is_complete"),
+            result.get("missing_fields"),
+        )
         logger.info("📋 Final quote state: %s", json.dumps(result, ensure_ascii=False, default=str)[:400])
         return result
         
@@ -1765,25 +2180,7 @@ Merge with current extracted data - only update fields where new information is 
 
 def _generate_quote_collection_response(missing_fields: list, quote_state: dict) -> str:
     """根据缺失字段生成收集报价信息的回答"""
-    extracted = quote_state.get("extracted", {})
-    products_available = quote_state.get("products_available", [])
-    
-    if "customer_name" in missing_fields:
-        return "I'd be happy to help you with a quote. May I have your name, please?"
-    
-    if "contact_info" in missing_fields:
-        customer_name = extracted.get("customer_name", "")
-        if customer_name:
-            return f"Thank you, {customer_name}. What's your email address or phone number?"
-        return "What's your email address or phone number?"
-    
-    if "quote_items" in missing_fields:
-        if products_available:
-            products_text = ", ".join(products_available[:5])  # 只列出前 5 个
-            return f"Which product would you like a quote for? Available products include: {products_text}. And how many would you need?"
-        return "Which product would you like a quote for, and how many would you need?"
-    
-    return "I need a bit more information for your quote. Could you provide the missing details?"
+    return shared_generate_quote_collection_response(missing_fields, quote_state)
 
 
 async def create_quote_from_state(call_connection_id: str, quote_state: dict) -> Optional[dict]:
@@ -1815,90 +2212,21 @@ async def create_quote_from_state(call_connection_id: str, quote_state: dict) ->
                         customer_name, contact_info, quote_items)
             return None
         
-        # 调用 Salesforce 创建报价
-        from email_service import send_quote_email
-        from salesforce_service import get_salesforce_service
-        
-        sf_service = get_salesforce_service()
-        if not sf_service.is_available():
-            logger.error("Salesforce service not available")
-            return None
-        
-        # 创建或获取 Account
-        logger.info("📊 Creating/getting Account in Salesforce...")
-        account_id = sf_service.create_or_get_account(customer_name, contact_info)
-        if not account_id:
-            logger.warning("⚠️  Failed to create/get Account, will create Quote without Account association")
-        else:
-            logger.info("✅ Account ID: %s", account_id)
-        
-        # 创建或获取 Contact
-        contact_id = None
-        if account_id:
-            logger.info("👤 Creating/getting Contact in Salesforce...")
-            contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
-            if contact_id:
-                logger.info("✅ Contact ID: %s", contact_id)
-        
-        # 创建 Opportunity（可选）
-        opportunity_id = None
-        if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true" and account_id:
-            logger.info("💼 Creating Opportunity in Salesforce...")
-            opportunity_id = sf_service.create_opportunity(
-                account_id,
-                f"Opportunity for {customer_name}"
-            )
-            if opportunity_id:
-                logger.info("✅ Opportunity ID: %s", opportunity_id)
-        
-        # 创建 Quote
-        logger.info("📋 Creating Quote in Salesforce...")
-        quote_result = sf_service.create_quote(
-            account_id=account_id,
-            opportunity_id=opportunity_id,
-            customer_name=customer_name,
-            quote_items=quote_items,
-            expected_start_date=expected_start_date,
-            notes=notes
-        )
-        
+        quote_result = await create_quote_from_extracted(extracted, fallback_to_mock=False)
         if not quote_result:
             logger.error("❌ Failed to create quote in Salesforce")
             return None
-        
+
         logger.info("✅ Quote created successfully:")
         logger.info("    - Quote ID: %s", quote_result.get("quote_id"))
         logger.info("    - Quote Number: %s", quote_result.get("quote_number"))
         logger.info("    - Quote URL: %s", quote_result.get("quote_url"))
-        
-        # 发送邮件通知
-        if "@" in contact_info:
-            try:
-                logger.info("📧 Sending quote email notification...")
-                product_summary = ", ".join([
-                    f"{item.get('product_package')} (x{item.get('quantity')})" 
-                    for item in quote_items
-                ])
-                total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
-                email_sent = await send_quote_email(
-                    to_email=contact_info,
-                    customer_name=customer_name,
-                    quote_url=quote_result["quote_url"],
-                    product_package=product_summary,
-                    quantity=str(total_quantity),
-                    expected_start_date=expected_start_date,
-                    notes=notes
-                )
-                if email_sent:
-                    logger.info("✅ Quote email sent successfully to %s", contact_info)
-                else:
-                    logger.warning("⚠️  Quote email sending returned False for %s", contact_info)
-            except Exception as e:
-                logger.error("❌ Error sending quote email: %s", str(e))
-                import traceback
-                logger.error("Traceback: %s", traceback.format_exc())
+        if quote_result.get("email_sent"):
+            logger.info("✅ Quote email sent successfully to %s", contact_info)
+        elif quote_result.get("email_error"):
+            logger.warning("⚠️  Quote email failed: %s", quote_result.get("email_error"))
         else:
-            logger.info("ℹ️  Contact info is not an email address, skipping email notification")
+            logger.info("ℹ️  Quote email not sent")
         
         logger.info("=" * 80)
         logger.info("✅ QUOTE CREATION COMPLETED SUCCESSFULLY")

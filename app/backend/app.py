@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from ragtools import attach_rag_tools
 from rtmt import RTMiddleTier
 from quote_tools import attach_quote_extraction_tool, attach_quote_management_tools, attach_user_registration_tool
+from quote_workflow import create_quote_from_extracted, fetch_available_products
 from teams_calling import TeamsCaller
 
 from openai import AzureOpenAI
@@ -104,9 +105,9 @@ async def create_app():
             - After calling it, use the returned state to confirm the new values or ask only for any remaining missing fields.
 
             ROLE OF 'send_quote_email':
-            - Use this when the quote details are already complete and the user explicitly asks you to send, resend, or email the quote.
-            - This tool creates the quote from the current collected state and sends the quote email to the customer.
-            - After success, tell the user the quote has been created and the email has been sent.
+            - Use this only when the user explicitly asks you to resend or re-email an already prepared quote email.
+            - Do NOT use this for the initial confirmation after the confirmation dialog is shown; the client confirmation flow handles the first create/send action.
+            - After success, tell the user the quote email has been sent or resent.
             
             WHEN TO CALL THE TOOL:
             - If the user mentions anything about quotes/pricing (quote, quotation, price estimate, price, cost, pricing, estimate, get/need/want a quote), immediately call 'extract_quote_info'. Do not ask questions before the first call.
@@ -127,8 +128,8 @@ async def create_app():
             - If is_complete = true: First restate all collected quote details (customer_name, contact_info, each quote_items product + quantity, expected_start_date, notes), then tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
             
             CONFIRMATION:
-            - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, proceed with sending the quote.
-            - If the user explicitly asks you to email or resend the quote and the quote is complete, call 'send_quote_email'.
+            - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, acknowledge the confirmation, but do not call 'send_quote_email' for the initial send because the client confirmation flow handles it.
+            - If the user explicitly asks you to resend the quote email and the quote is complete, call 'send_quote_email'.
             
             KNOWLEDGE BASE:
             - For non-quote questions, first use the 'search' tool. If info is found, cite with 'report_grounding'. If not found, politely say it’s not in the knowledge base. Do not invent information.
@@ -165,6 +166,7 @@ async def create_app():
         session_id: str | None,
         user_data: dict | None = None,
         quote_data: dict | None = None,
+        quote_delivery: dict | None = None,
     ) -> None:
         if not rtmt or not session_id:
             return
@@ -216,6 +218,7 @@ async def create_app():
                 "missing_fields": missing_fields,
                 "products_available": rtmt._quote_states.get(session_id, {}).get("products_available", []),
                 "is_complete": len(missing_fields) == 0,
+                "delivery": quote_delivery or rtmt._quote_states.get(session_id, {}).get("delivery", {}),
             }
             product_summary = ", ".join(
                 [f"{item.get('product_package')} x{item.get('quantity')}" for item in extracted["quote_items"] if isinstance(item, dict)]
@@ -355,122 +358,32 @@ async def create_app():
         expected_start_date = payload.get("expected_start_date")
         notes = payload.get("notes")
 
-        # Try to create quote in Salesforce
-        from salesforce_service import get_salesforce_service
-        from email_service import send_quote_email
-        
-        sf_service = get_salesforce_service()
-        quote_result = None
-        
-        if sf_service.is_available():
-            try:
-                # Create or get Account
-                account_id = sf_service.create_or_get_account(customer_name, contact_info)
-                if not account_id:
-                    logger.warning("Failed to create/get Account, will create Quote without Account association")
-                else:
-                    logger.info("Account ID obtained: %s for customer: %s", account_id, customer_name)
-                    # Create or get Contact
-                    contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
-                    
-                    # Create Opportunity (optional)
-                    opportunity_id = None
-                    if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true":
-                        opportunity_id = sf_service.create_opportunity(
-                            account_id,
-                            f"Opportunity for {customer_name}"
-                        )
-                
-                # Try to create Quote even if account_id is None
-                # The create_quote method can handle None account_id
-                logger.info("Creating Quote - Account ID: %s, Quote Items: %s", account_id, len(quote_items))
-                quote_result = sf_service.create_quote(
-                    account_id=account_id,  # Can be None
-                    opportunity_id=opportunity_id,
-                    customer_name=customer_name,
-                    quote_items=quote_items,  # Pass quote_items array
-                    expected_start_date=expected_start_date,
-                    notes=notes
-                )
-                if quote_result:
-                    logger.info("Quote created successfully: ID=%s, Number=%s", quote_result.get("quote_id"), quote_result.get("quote_number"))
-            except Exception as e:
-                logger.error("Error creating quote in Salesforce: %s", str(e))
-                import traceback
-                logger.error("Traceback: %s", traceback.format_exc())
-        
-        # Fallback to mock if Salesforce is not available or failed
+        quote_result = await create_quote_from_extracted(
+            {
+                "customer_name": customer_name,
+                "contact_info": contact_info,
+                "quote_items": quote_items,
+                "expected_start_date": expected_start_date,
+                "notes": notes,
+            },
+            fallback_to_mock=True,
+        )
         if not quote_result:
-            product_summary = ", ".join([f"{item.get('product_package')} (x{item.get('quantity')})" for item in quote_items])
-            logger.warning("Quote creation failed or Salesforce unavailable. Using mock quote URL. Customer: %s, Products: %s", customer_name, product_summary)
-            quote_id = str(uuid4())
-            quote_url = f"https://example.com/quotes/{quote_id}"
-            logger.info("Mock quote created: id=%s, customer=%s", quote_id, customer_name)
-            quote_result = {
-                "quote_id": quote_id,
-                "quote_number": quote_id[:8],
-                "quote_url": quote_url
-            }
-        
-        # Send email notification
-        email_sent = False
-        email_error = None
-        if "@" in contact_info:  # Only send if contact_info looks like an email
-            try:
-                logger.info("Attempting to send email to: %s", contact_info)
-                # For email, use first product or create summary
-                product_summary = ", ".join([f"{item.get('product_package')} (x{item.get('quantity')})" for item in quote_items])
-                total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
-                email_sent = await send_quote_email(
-                    to_email=contact_info,
-                    customer_name=customer_name,
-                    quote_url=quote_result["quote_url"],
-                    product_package=product_summary,  # Use summary for email
-                    quantity=str(total_quantity),  # Use total quantity
-                    expected_start_date=expected_start_date,
-                    notes=notes
-                )
-                if email_sent:
-                    logger.info("Email sent successfully to %s", contact_info)
-                else:
-                    logger.warning("Email sending returned False for %s", contact_info)
-            except Exception as e:
-                logger.error("Error sending email: %s", str(e))
-                email_error = str(e)
+            return web.json_response({"error": "Failed to create quote"}, status=500)
         
         response_data = {
             "quote_id": quote_result.get("quote_id"),
             "quote_number": quote_result.get("quote_number"),
             "quote_url": quote_result["quote_url"],
-            "email_sent": email_sent,
-            "email_error": email_error if not email_sent else None
+            "email_sent": quote_result.get("email_sent", False),
+            "email_error": quote_result.get("email_error"),
         }
         
         return web.json_response(response_data)
 
     async def handle_get_products(request: web.Request) -> web.Response:
         """Get list of products from Salesforce."""
-        from salesforce_service import get_salesforce_service
-        
-        sf_service = get_salesforce_service()
-        products = []
-        
-        if sf_service.is_available():
-            try:
-                # Query active products
-                result = sf_service.sf.query(
-                    "SELECT Id, Name FROM Product2 WHERE IsActive = true ORDER BY Name LIMIT 100"
-                )
-                
-                if result["totalSize"] > 0:
-                    products = [
-                        {"id": record["Id"], "name": record["Name"]}
-                        for record in result["records"]
-                    ]
-            except Exception as e:
-                logger.error("Error fetching products from Salesforce: %s", str(e))
-        
-        return web.json_response({"products": products})
+        return web.json_response({"products": fetch_available_products()})
     
     async def handle_register_user(request: web.Request) -> web.Response:
         """Register user to Salesforce - creates or gets Account and Contact."""
@@ -585,85 +498,38 @@ async def create_app():
                     status=400
                 )
         
-        # Reuse the quote creation logic
-        from salesforce_service import get_salesforce_service
-        from email_service import send_quote_email
-        
-        sf_service = get_salesforce_service()
-        quote_result = None
-        
-        if sf_service.is_available():
-            try:
-                account_id = sf_service.create_or_get_account(customer_name, contact_info)
-                if not account_id:
-                    logger.warning("Failed to create/get Account, will create Quote without Account association")
-                else:
-                    contact_id = sf_service.create_or_get_contact(account_id, customer_name, contact_info)
-                    
-                    opportunity_id = None
-                    if os.environ.get("SALESFORCE_CREATE_OPPORTUNITY", "false").lower() == "true":
-                        opportunity_id = sf_service.create_opportunity(
-                            account_id,
-                            f"Opportunity for {customer_name}"
-                        )
-                
-                # Try to create Quote even if account_id is None
-                # The create_quote method can handle None account_id
-                quote_result = sf_service.create_quote(
-                    account_id=account_id,  # Can be None
-                    opportunity_id=opportunity_id,
-                    customer_name=customer_name,
-                    quote_items=quote_items,  # Pass quote_items array
-                    expected_start_date=expected_start_date,
-                    notes=notes
-                )
-            except Exception as e:
-                logger.error("Error creating quote in Salesforce: %s", str(e))
-                import traceback
-                logger.error("Traceback: %s", traceback.format_exc())
-        
+        quote_result = await create_quote_from_extracted(
+            {
+                "customer_name": customer_name,
+                "contact_info": contact_info,
+                "quote_items": quote_items,
+                "expected_start_date": expected_start_date,
+                "notes": notes,
+            },
+            fallback_to_mock=True,
+        )
         if not quote_result:
-            product_summary = ", ".join([f"{item.get('product_package')} (x{item.get('quantity')})" for item in quote_items])
-            logger.warning("Quote creation failed or Salesforce unavailable. Using mock quote URL. Customer: %s, Products: %s", customer_name, product_summary)
-            quote_id = str(uuid4())
-            quote_url = f"https://example.com/quotes/{quote_id}"
-            logger.info("Mock quote created: id=%s, customer=%s", quote_id, customer_name)
-            quote_result = {
-                "quote_id": quote_id,
-                "quote_number": quote_id[:8],
-                "quote_url": quote_url
-            }
+            return web.json_response({"error": "Failed to create quote"}, status=500)
         
-        # Send email
-        email_sent = False
-        email_error = None
-        if "@" in contact_info:
-            try:
-                # For email, use first product or create summary
-                product_summary = ", ".join([f"{item.get('product_package')} (x{item.get('quantity')})" for item in quote_items])
-                total_quantity = sum([int(item.get("quantity", 0)) for item in quote_items])
-                email_sent = await send_quote_email(
-                    to_email=contact_info,
-                    customer_name=customer_name,
-                    quote_url=quote_result["quote_url"],
-                    product_package=product_summary,  # Use summary for email
-                    quantity=str(total_quantity),  # Use total quantity
-                    expected_start_date=expected_start_date,
-                    notes=notes
-                )
-            except Exception as e:
-                logger.error("Error sending email: %s", str(e))
-                email_error = str(e)
-        
-        _sync_realtime_session_state(session_id, quote_data=quote_data)
+        _sync_realtime_session_state(
+            session_id,
+            quote_data=quote_data,
+            quote_delivery={
+                "quote_id": quote_result.get("quote_id"),
+                "quote_number": quote_result.get("quote_number"),
+                "quote_url": quote_result.get("quote_url"),
+                "email_sent": quote_result.get("email_sent", False),
+                "email_error": quote_result.get("email_error"),
+            },
+        )
 
         return web.json_response({
             "success": True,
             "quote_id": quote_result.get("quote_id"),
             "quote_number": quote_result.get("quote_number"),
             "quote_url": quote_result["quote_url"],
-            "email_sent": email_sent,
-            "email_error": email_error if not email_sent else None
+            "email_sent": quote_result.get("email_sent", False),
+            "email_error": quote_result.get("email_error"),
         })
 
     # Initialize Teams Caller if configuration is available
