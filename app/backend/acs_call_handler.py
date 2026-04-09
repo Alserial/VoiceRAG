@@ -9,11 +9,13 @@ Azure Communication Services (ACS) Call Automation Handler
 4. 记录通话状态
 
 环境变量配置：
+- VOICE_ENTRY_MODE: 语音入口模式，'web'（浏览器，默认）或 'acs'（电话）。两者互斥，不能同时启用。
 - ACS_CONNECTION_STRING: Azure Communication Services 连接字符串
 - ACS_CALLBACK_URL: 你的公网可访问的回调 URL (例如: https://yourapp.com/api/acs/calls/events)
 - ACS_PHONE_NUMBER: 你的 ACS 电话号码 (例如: +1234567890)
 - ACS_REALTIME_WS_URL: 可选，显式指定媒体桥接 WebSocket 地址（默认根据 ACS_CALLBACK_URL 推导为 wss://<host>/realtime）
-- ACS_USE_LEGACY_RECOGNIZE: 可选，默认 true；控制是否使用旧版 ACS 识别+TTS 流程
+- ACS_USE_LEGACY_RECOGNIZE: 可选；当 VOICE_ENTRY_MODE=acs 时默认 false（使用 Realtime 桥接）；
+  当 VOICE_ENTRY_MODE=web 时默认 true（向后兼容）。显式设置为 true 可强制启用 legacy 识别+TTS 流程作为 fallback。
 """
 
 import asyncio
@@ -214,8 +216,18 @@ _active_acs_calls: dict[str, dict[str, Any]] = {}
 _acs_client: Optional[CallAutomationClient] = None
 
 def _use_legacy_acs_recognize_flow() -> bool:
-    """是否启用旧版 ACS 识别+TTS 逻辑（默认开启）。"""
-    return os.environ.get("ACS_USE_LEGACY_RECOGNIZE", "true").strip().lower() in {"1", "true", "yes", "on"}
+    """是否启用旧版 ACS 识别+TTS 逻辑。
+
+    当 VOICE_ENTRY_MODE=acs 时，默认走 GPT Realtime 音频桥接（legacy 关闭）。
+    如需强制启用 legacy 流程作为 fallback，请显式设置 ACS_USE_LEGACY_RECOGNIZE=true。
+
+    当 VOICE_ENTRY_MODE=web（或未设置）时，为向后兼容保留 legacy 默认开启行为。
+    """
+    voice_mode = os.environ.get("VOICE_ENTRY_MODE", "web").strip().lower()
+    # acs 模式：默认使用 Realtime 桥接，legacy 关闭
+    # web 模式或未设置：保持旧默认值（legacy 开启）以向后兼容
+    default_legacy = "false" if voice_mode == "acs" else "true"
+    return os.environ.get("ACS_USE_LEGACY_RECOGNIZE", default_legacy).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _use_acs_realtime_bridge() -> bool:
@@ -3327,7 +3339,7 @@ async def handle_hangup_call(request: web.Request) -> web.Response:
 def register_acs_routes(app: web.Application) -> None:
     """
     注册 ACS 相关的路由到 aiohttp 应用
-    
+
     使用示例：
         from acs_call_handler import register_acs_routes
         register_acs_routes(app)
@@ -3335,11 +3347,27 @@ def register_acs_routes(app: web.Application) -> None:
     # 非常显眼的日志，用于验证是否被调用
     logger.error("### ACS ROUTES REGISTER() CALLED ###")
     logger.info("Registering ACS call handler routes...")
-    
+
     # 加载环境变量
     if not os.environ.get("RUNNING_IN_PRODUCTION"):
         load_dotenv()
-    
+
+    # ── 打印当前语音入口模式和 legacy fallback 状态 ──────────────────────────
+    _voice_mode = os.environ.get("VOICE_ENTRY_MODE", "web").strip().lower()
+    logger.info("Voice entry mode: %s", _voice_mode)
+    _legacy_enabled = _use_legacy_acs_recognize_flow()
+    if _legacy_enabled:
+        logger.info(
+            "ACS legacy recognize fallback: enabled "
+            "(ACS Recognize → transcript → intent → TTS pipeline is active)"
+        )
+    else:
+        logger.info(
+            "ACS legacy recognize fallback: disabled "
+            "(ACS audio bridged directly to GPT Realtime — lower latency path)"
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     # 初始化 ACS 客户端（如果配置了）
     get_acs_client()
     

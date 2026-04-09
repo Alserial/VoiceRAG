@@ -38,6 +38,20 @@ async def create_app():
         logger.info("Running in development mode, loading from .env file")
         load_dotenv()
 
+    # ── Voice entry mode ──────────────────────────────────────────────────────
+    # Controls which voice entry point is active: 'web' (browser) or 'acs' (phone).
+    # Only one mode can be active at a time. Both cannot run simultaneously as they
+    # would compete for the same GPT Realtime voice pipeline.
+    _voice_entry_mode = os.environ.get("VOICE_ENTRY_MODE", "web").strip().lower()
+    if _voice_entry_mode not in {"web", "acs"}:
+        raise RuntimeError(
+            f"VOICE_ENTRY_MODE={_voice_entry_mode!r} is invalid. "
+            "Accepted values: 'web' or 'acs'. "
+            "Fix the configuration and restart the server."
+        )
+    logger.info("Voice entry mode: %s", _voice_entry_mode)
+    # ─────────────────────────────────────────────────────────────────────────
+
     llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
     search_key = os.environ.get("AZURE_SEARCH_API_KEY")
 
@@ -722,28 +736,37 @@ async def create_app():
 
     app.add_routes(routes)
     
-    # 注册 ACS Call Automation 路由（在 add_static 之前，避免路由冲突）
-    if _acs_handler_available and register_acs_routes:
-        try:
-            logger.info("About to call register_acs_routes(app)...")
-            register_acs_routes(app)
-            logger.info("ACS call handler routes registered successfully")
-            
-            # 验证路由是否真的被添加
-            acs_routes_found = []
-            for route in app.router.routes():
-                route_str = str(route)
-                if '/api/acs' in route_str:
-                    acs_routes_found.append(route_str)
-            logger.info("Verified ACS routes in app.router: %s", acs_routes_found)
-        except Exception as e:
-            logger.error("Failed to register ACS routes: %s", str(e))
-            import traceback
-            logger.error("Traceback: %s", traceback.format_exc())
+    # 注册 ACS Call Automation 路由（仅在 VOICE_ENTRY_MODE=acs 时启用）
+    if _voice_entry_mode == "acs":
+        if _acs_handler_available and register_acs_routes:
+            try:
+                logger.info("About to call register_acs_routes(app)...")
+                register_acs_routes(app)
+                logger.info("ACS call handler routes registered successfully")
+
+                # 验证路由是否真的被添加
+                acs_routes_found = []
+                for route in app.router.routes():
+                    route_str = str(route)
+                    if '/api/acs' in route_str:
+                        acs_routes_found.append(route_str)
+                logger.info("Verified ACS routes in app.router: %s", acs_routes_found)
+            except Exception as e:
+                logger.error("Failed to register ACS routes: %s", str(e))
+                import traceback
+                logger.error("Traceback: %s", traceback.format_exc())
+        else:
+            logger.warning(
+                "VOICE_ENTRY_MODE=acs but ACS handler is not available — "
+                "phone calls will not be handled. "
+                "_acs_handler_available=%s",
+                _acs_handler_available,
+            )
     else:
-        logger.info("ACS call handler not available, skipping route registration")
-        logger.info("  _acs_handler_available: %s", _acs_handler_available)
-        logger.info("  register_acs_routes is None: %s", register_acs_routes is None)
+        logger.info(
+            "VOICE_ENTRY_MODE=web: ACS call routes not registered "
+            "(set VOICE_ENTRY_MODE=acs to enable phone call handling)."
+        )
     
     # 静态文件路由放在最后（避免覆盖 API 路由）
     app.router.add_static('/', path=current_directory / 'static', name='static')
@@ -757,13 +780,25 @@ if __name__ == "__main__":
     logger.info("Starting VoiceRAG server...")
     logger.info("Server URL: http://%s:%s", host, port)
     logger.info("Quote API: http://%s:%s/api/quotes", host, port)
-    
+
+    # Print voice entry mode before starting so it's visible in the console
+    _startup_voice_mode = os.environ.get("VOICE_ENTRY_MODE", "web").strip().lower()
+    logger.info("Voice entry mode: %s", _startup_voice_mode)
+    if _startup_voice_mode == "acs":
+        _legacy = os.environ.get("ACS_USE_LEGACY_RECOGNIZE", "false").strip().lower()
+        _legacy_on = _legacy in {"1", "true", "yes", "on"}
+        logger.info(
+            "ACS legacy recognize fallback: %s",
+            "enabled (legacy recognize+TTS)" if _legacy_on else "disabled (GPT Realtime bridge)",
+        )
+        logger.info("ACS events endpoint: http://%s:%s/api/acs/calls/events", host, port)
+
     # Check Teams configuration status
     if os.environ.get("TEAMS_CLIENT_ID") or (os.environ.get("TEAMS_TENANT_ID") and os.environ.get("TEAMS_CLIENT_SECRET")):
         logger.info("Teams Calling API: http://%s:%s/api/teams/calls", host, port)
         logger.info("Teams Callbacks: http://%s:%s/api/teams/callbacks", host, port)
     else:
         logger.info("Teams Calling: Not configured (set TEAMS_* env vars to enable)")
-    
+
     logger.info("=" * 50)
     web.run_app(create_app(), host=host, port=port)
