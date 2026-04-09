@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -154,9 +155,6 @@ def generate_quote_collection_response(missing_fields: list[str], quote_state: d
         return "What's your email address or phone number?"
 
     if "quote_items" in missing_fields:
-        if products_available:
-            products_text = ", ".join(products_available[:5])
-            return f"Which product would you like a quote for? Available products include: {products_text}. And how many would you need?"
         return "Which product would you like a quote for, and how many would you need?"
 
     return "I need a bit more information for your quote. Could you provide the missing details?"
@@ -208,6 +206,112 @@ def build_quote_targeted_recap(quote_state: dict[str, Any], requested_fields: li
         parts.append(f"notes {extracted.get('notes') or 'none'}")
 
     return "Let me recap: " + ", ".join(parts) + "." if parts else build_quote_confirmation_recap(quote_state)
+
+
+async def extract_quote_from_conversation(
+    conversation_history: list[dict],
+    current_state: dict,
+) -> dict[str, Any]:
+    """
+    Shared LLM-based extraction of quote info from conversation history.
+    Used by both the web chat (RTMiddleTier) and the ACS phone paths.
+
+    Args:
+        conversation_history: list of {"role": ..., "content": ...} dicts
+        current_state: existing quote state dict (may be empty)
+
+    Returns:
+        quote state dict with keys: extracted, missing_fields, products_available, is_complete
+    """
+    from openai import AzureOpenAI
+    from azure.core.credentials import AzureKeyCredential
+    from azure.identity import DefaultAzureCredential
+
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    extracted_data: dict[str, Any] = {
+        "customer_name": None,
+        "contact_info": None,
+        "quote_items": [],
+        "expected_start_date": None,
+        "notes": None,
+        **dict(current_state.get("extracted") or {}),
+    }
+
+    if not openai_endpoint or not openai_deployment:
+        logger.warning("OpenAI config unavailable for quote extraction")
+        return {
+            "extracted": extracted_data,
+            "missing_fields": ["customer_name", "contact_info", "quote_items"],
+            "products_available": [],
+            "is_complete": False,
+        }
+
+    products = fetch_available_products()
+    product_names = [p["name"] for p in products]
+    product_list_text = ", ".join(product_names) if product_names else "No products available"
+
+    conversation_text = "\n".join(
+        f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
+        for msg in (conversation_history or [])[-10:]
+        if isinstance(msg, dict)
+    )
+
+    extraction_prompt = (
+        "Extract quote information from the following conversation.\n"
+        "Return a JSON object with the following fields:\n"
+        "- customer_name: Customer's name (if mentioned)\n"
+        "- contact_info: Email address or phone number (if mentioned)\n"
+        "- quote_items: Array of items, each with {\"product_package\": \"product name\", \"quantity\": number}.\n"
+        "  Support multiple products - if user mentions multiple products, include all of them.\n"
+        "- expected_start_date: Expected start date in format YYYY-MM-DD (if mentioned)\n"
+        "- notes: Any additional notes or requirements mentioned\n\n"
+        f"Available products: {product_list_text}\n\n"
+        f"Conversation:\n{conversation_text}\n\n"
+        "Current extracted data (merge - only update fields where new information is found):\n"
+        f"{json.dumps(extracted_data, ensure_ascii=False)}\n\n"
+        "Return ONLY a valid JSON object. Use null for missing fields, [] for quote_items if none mentioned."
+    )
+
+    try:
+        if llm_key:
+            client = AzureOpenAI(api_key=llm_key, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+        else:
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(api_key=token, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {"role": "system", "content": "You extract structured quote information from conversations. Return valid JSON only."},
+                {"role": "user", "content": extraction_prompt},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        new_extracted = json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error("Quote extraction LLM call failed: %s", str(e))
+        return {
+            "extracted": extracted_data,
+            "missing_fields": ["customer_name", "contact_info", "quote_items"],
+            "products_available": product_names,
+            "is_complete": False,
+        }
+
+    merged = normalize_and_match_quote_extracted_data(
+        extracted_data,
+        new_extracted,
+        products,
+        replace_quote_items=False,
+    )
+    return build_quote_state(merged, product_names)
 
 
 async def create_quote_from_extracted(

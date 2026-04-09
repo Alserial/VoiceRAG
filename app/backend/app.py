@@ -111,7 +111,8 @@ async def create_app():
             
             WHEN TO CALL THE TOOL:
             - If the user mentions anything about quotes/pricing (quote, quotation, price estimate, price, cost, pricing, estimate, get/need/want a quote), immediately call 'extract_quote_info'. Do not ask questions before the first call.
-            - After each user reply, call the tool again to re-evaluate state until is_complete = true.
+            - After each user reply that provides or updates quote-related information (name, email, product, quantity, date, notes), call 'extract_quote_info' again to re-evaluate state.
+            - If the user asks an unrelated question (e.g., company info, general knowledge) while a quote is in progress, answer it normally using 'search', then remind the user you are still collecting their quote information.
             - If the user says they want to change/update a specific quote field (e.g., email/contact info/product/quantity/start date/notes), gather that field only, then call 'update_quote_info'. Do NOT re-ask already known fields unless the user says they also need to change them.
             
             HOW TO USE THE RESULT:

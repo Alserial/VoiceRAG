@@ -40,14 +40,35 @@ from quote_workflow import (
     build_quote_state,
     build_quote_targeted_recap as shared_build_quote_targeted_recap,
     create_quote_from_extracted,
+    extract_quote_from_conversation,
     fetch_available_products,
     generate_quote_collection_response as shared_generate_quote_collection_response,
     normalize_and_match_quote_extracted_data,
+)
+from receptionist_config import (
+    DEPARTMENTS,
+    INFO_TOPICS,
+    RECEPTIONIST_INTENTS,
+    WELCOME_MESSAGE,
+    build_company_info_answer,
+    build_name_acknowledgement,
+    build_receptionist_prompt,
+    build_routing_prompt,
+    build_transfer_message,
+    format_department_label,
+    get_contact_for_department,
+    get_sales_rep_contact,
+    to_e164_au,
 )
 
 # 先获取 logger，供后续导入失败时使用
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voicerag")
+
+_TEST_TRANSFER_LOG_PREFIX = "TEST_TRANSFER"
+_TEST_FLOW_LOG_PREFIX = "TEST_FLOW"
+_ACS_TTS_VOICE = os.environ.get("ACS_TTS_VOICE", "en-AU-NatashaNeural")
+_ACS_TTS_LOCALE = os.environ.get("ACS_TTS_LOCALE", "en-AU")
 
 # 延迟导入 ACS SDK，避免导入失败导致模块无法加载
 try:
@@ -132,6 +153,303 @@ def _build_realtime_ws_url(session_key: str) -> str:
     return urlunparse((ws_scheme, parsed.netloc, realtime_path, "", f"session={quote(session_key)}", ""))
 
 
+def _get_pending_receptionist_route(call_connection_id: Optional[str]) -> dict[str, Any]:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return {}
+    return dict(_active_acs_calls[call_connection_id].get("pending_receptionist_route") or {})
+
+
+def _set_pending_receptionist_route(call_connection_id: Optional[str], route_state: dict[str, Any]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id]["pending_receptionist_route"] = route_state
+
+
+def _clear_pending_receptionist_route(call_connection_id: Optional[str]) -> None:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return
+    _active_acs_calls[call_connection_id].pop("pending_receptionist_route", None)
+
+
+def _resolve_receptionist_route(
+    call_connection_id: Optional[str],
+    department: Optional[str],
+    company_name: Optional[str],
+    architectural_firm: bool = False,
+) -> Optional[str]:
+    pending_route = _get_pending_receptionist_route(call_connection_id)
+    department = department or pending_route.get("department")
+    company_name = company_name or pending_route.get("company_name")
+    architectural_firm = bool(architectural_firm or pending_route.get("architectural_firm", False))
+
+    logger.info(
+        "%s Route resolution start: call=%s, pending_route=%s, department=%s, company_name=%s, architectural_firm=%s",
+        _TEST_TRANSFER_LOG_PREFIX,
+        call_connection_id,
+        pending_route,
+        department,
+        company_name,
+        architectural_firm,
+    )
+
+    if not pending_route and not department and not company_name:
+        logger.info("%s Route resolution skipped: no pending route and no routing entities extracted.", _TEST_TRANSFER_LOG_PREFIX)
+        return None
+
+    if not department:
+        _set_pending_receptionist_route(
+            call_connection_id,
+            {
+                "department": None,
+                "architectural_firm": architectural_firm,
+                "company_name": company_name,
+            },
+        )
+        logger.info(
+            "%s Route resolution waiting for department: call=%s, saved_state=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            _get_pending_receptionist_route(call_connection_id),
+        )
+        return build_routing_prompt()
+
+    if not company_name:
+        _set_pending_receptionist_route(
+            call_connection_id,
+            {
+                "department": department,
+                "architectural_firm": architectural_firm,
+                "company_name": None,
+            },
+        )
+        logger.info(
+            "%s Route resolution waiting for company name: call=%s, department=%s, saved_state=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            department,
+            _get_pending_receptionist_route(call_connection_id),
+        )
+        return build_routing_prompt(department, missing_company_name=True)
+
+    if call_connection_id and call_connection_id in _active_acs_calls:
+        _active_acs_calls[call_connection_id]["caller_company"] = company_name
+
+    _clear_pending_receptionist_route(call_connection_id)
+
+    contact = get_sales_rep_contact() if architectural_firm else get_contact_for_department(department)
+    logger.info(
+        "%s Route target selected: call=%s, department=%s, company_name=%s, architectural_firm=%s, contact=%s",
+        _TEST_TRANSFER_LOG_PREFIX,
+        call_connection_id,
+        department,
+        company_name,
+        architectural_firm,
+        contact,
+    )
+    transfer_succeeded = False
+    if contact:
+        transfer_succeeded = _try_transfer_to_reception_contact(call_connection_id, contact["phone"], contact["name"])
+
+    if transfer_succeeded:
+        logger.info(
+            "%s ACS transfer reported started: call=%s, department=%s, contact_name=%s, contact_phone=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            department,
+            contact["name"] if contact else None,
+            contact["phone"] if contact else None,
+        )
+        return build_transfer_message(department, architectural_firm=architectural_firm)
+
+    logger.warning(
+        "%s Transfer not started, falling back to verbal routing: call=%s, department=%s, company_name=%s, architectural_firm=%s, contact=%s",
+        _TEST_TRANSFER_LOG_PREFIX,
+        call_connection_id,
+        department,
+        company_name,
+        architectural_firm,
+        contact,
+    )
+    if architectural_firm:
+        return (
+            f"Thanks. I understand you're calling from {company_name}. "
+            f"I'll connect you with {contact['name']} on {contact['phone']}."
+            if contact
+            else "I'll have our sales team help with that enquiry."
+        )
+
+    return (
+        f"Thanks. For {format_department_label(department)}, the best contact is {contact['name']} on {contact['phone']}."
+        if contact
+        else "I can connect you with our main office on 03 8652 8000."
+    )
+
+
+def _try_transfer_to_reception_contact(
+    call_connection_id: Optional[str],
+    phone_number: str,
+    contact_name: str,
+) -> bool:
+    logger.info(
+        "%s ACS transfer attempt: call=%s, contact_name=%s, raw_phone=%s",
+        _TEST_TRANSFER_LOG_PREFIX,
+        call_connection_id,
+        contact_name,
+        phone_number,
+    )
+    if not call_connection_id:
+        logger.warning("%s ACS transfer blocked: missing call_connection_id.", _TEST_TRANSFER_LOG_PREFIX)
+        return False
+
+    acs_client = get_acs_client()
+    if not acs_client:
+        logger.warning("%s ACS transfer blocked: ACS client unavailable.", _TEST_TRANSFER_LOG_PREFIX)
+        return False
+
+    if not PhoneNumberIdentifier:
+        logger.warning("%s ACS transfer blocked: PhoneNumberIdentifier unavailable in current SDK.", _TEST_TRANSFER_LOG_PREFIX)
+        return False
+
+    e164_number = to_e164_au(phone_number)
+    if not e164_number:
+        logger.warning("%s ACS transfer blocked: failed to convert phone number to E.164. raw_phone=%s", _TEST_TRANSFER_LOG_PREFIX, phone_number)
+        return False
+
+    logger.info(
+        "%s ACS transfer prerequisites passed: call=%s, contact_name=%s, e164_phone=%s",
+        _TEST_TRANSFER_LOG_PREFIX,
+        call_connection_id,
+        contact_name,
+        e164_number,
+    )
+
+    try:
+        call_connection_client = acs_client.get_call_connection(call_connection_id)
+        transfer_method = getattr(call_connection_client, "transfer_call_to_participant", None)
+        if not callable(transfer_method):
+            logger.warning(
+                "%s ACS transfer blocked: CallConnectionClient has no transfer_call_to_participant. client_type=%s",
+                _TEST_TRANSFER_LOG_PREFIX,
+                type(call_connection_client).__name__,
+            )
+            return False
+
+        operation_context = f"reception-transfer-{contact_name.lower().replace(' ', '-')}"
+        logger.info(
+            "%s Invoking ACS transfer: call=%s, contact_name=%s, e164_phone=%s, operation_context=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            contact_name,
+            e164_number,
+            operation_context,
+        )
+        transfer_method(
+            PhoneNumberIdentifier(e164_number),
+            operation_context=operation_context,
+        )
+        logger.info(
+            "%s ACS transfer invocation returned without exception: call=%s, contact_name=%s, e164_phone=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            contact_name,
+            e164_number,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "%s ACS transfer raised exception: call=%s, contact_name=%s, raw_phone=%s, error=%s",
+            _TEST_TRANSFER_LOG_PREFIX,
+            call_connection_id,
+            contact_name,
+            phone_number,
+            str(e),
+        )
+        return False
+
+
+async def _classify_receptionist_intent_with_llm(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    pending_route: dict[str, Any],
+) -> dict[str, Any]:
+    recent_history = [
+        {
+            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+    payload = {
+        "pending_route": pending_route,
+        "recent_history": recent_history,
+        "latest_user_text": user_text,
+        "supported_info_topics": sorted(INFO_TOPICS),
+        "supported_departments": sorted(DEPARTMENTS),
+    }
+    logger.info(
+        "%s Intent classification request: latest_user_text=%s, pending_route=%s, recent_history_count=%d",
+        _TEST_TRANSFER_LOG_PREFIX,
+        user_text,
+        pending_route,
+        len(recent_history),
+    )
+    prompt = (
+        "Classify the caller's latest turn for a phone receptionist workflow. "
+        "Return JSON only. "
+        "Allowed intent values: caller_intro, company_info, routing_request, general_qa. "
+        "If the user is asking for company details, set intent=company_info and choose one info_topic from: "
+        "company_summary, office_address, office_hours, warehouse_address, warehouse_hours, website, email, office_phone. "
+        "If the user wants to be connected, transferred, routed, or asks for a department or person, set intent=routing_request. "
+        "For routing_request also extract department when clear using one of: flooring, panels, glass, fibreglass. "
+        "Also extract company_name if the caller states who they are from. "
+        "Set is_architectural_firm=true only when the caller clearly says they are from an architect, architectural, design, or similar firm. "
+        "If the caller is simply introducing themself, set intent=caller_intro and extract caller_name. "
+        "If unclear, set intent=general_qa. "
+        "Schema: {"
+        "\"intent\":\"...\","
+        "\"info_topic\":null|\"...\","
+        "\"department\":null|\"...\","
+        "\"caller_name\":null|\"...\","
+        "\"company_name\":null|\"...\","
+        "\"is_architectural_firm\":true|false"
+        "}."
+    )
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=160,
+        )
+        content = (response.choices[0].message.content or "{}").strip()
+        logger.info("%s Intent classification raw response: %s", _TEST_TRANSFER_LOG_PREFIX, content[:500])
+        result = json.loads(content)
+    except Exception as e:
+        logger.warning("Receptionist intent classification failed: %s", str(e))
+        return {"intent": "general_qa"}
+
+    intent = result.get("intent")
+    info_topic = result.get("info_topic")
+    department = result.get("department")
+    normalized = {
+        "intent": intent if intent in RECEPTIONIST_INTENTS else "general_qa",
+        "info_topic": info_topic if info_topic in INFO_TOPICS else None,
+        "department": department if department in DEPARTMENTS else None,
+        "caller_name": (result.get("caller_name") or None),
+        "company_name": (result.get("company_name") or None),
+        "is_architectural_firm": bool(result.get("is_architectural_firm", False)),
+    }
+    logger.info("%s Receptionist intent classification: %s", _TEST_TRANSFER_LOG_PREFIX, normalized)
+    return normalized
+
+
 def _default_quote_delivery() -> dict[str, Any]:
     return {
         "quote_id": None,
@@ -178,6 +496,9 @@ def _append_assistant_message(call_connection_id: Optional[str], answer_text: st
         conversation_history = conversation_history[-10:]
     _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
     _active_acs_calls[call_connection_id]["last_answer"] = answer_text
+
+    transcript = _active_acs_calls[call_connection_id].setdefault("call_transcript", [])
+    transcript.append({"role": "assistant", "content": answer_text})
 
 
 def _get_pending_quote_update(call_connection_id: Optional[str]) -> dict[str, Any]:
@@ -250,11 +571,19 @@ def _reset_empty_recognition_count(call_connection_id: Optional[str]) -> None:
     _set_empty_recognition_count(call_connection_id, 0)
 
 
-def _build_acs_progress_summary(call_connection_id: str) -> str:
+def _build_acs_progress_summary(call_connection_id: str, *, full_transcript: bool = False) -> str:
     call_info = _active_acs_calls.get(call_connection_id, {})
     quote_state = _enrich_quote_state_with_delivery(call_info.get("quote_state"))
     extracted = quote_state.get("extracted", {})
-    conversation_history = call_info.get("conversation_history", [])
+
+    # Use full unbounded transcript when available (end-of-call email); fall back to
+    # the windowed conversation_history for mid-call progress snapshots.
+    if full_transcript and call_info.get("call_transcript"):
+        messages = call_info["call_transcript"]
+        conversation_label = "Full call transcript:"
+    else:
+        messages = call_info.get("conversation_history", [])[-10:]
+        conversation_label = "Recent conversation (last 10 turns):"
 
     lines = [
         f"ACS call progress summary for call {call_connection_id}",
@@ -281,11 +610,11 @@ def _build_acs_progress_summary(call_connection_id: str) -> str:
             f"- notes: {extracted.get('notes') or 'not provided'}",
             f"- missing_fields: {', '.join(quote_state.get('missing_fields', [])) or 'none'}",
             "",
-            "Recent conversation:",
+            conversation_label,
         ]
     )
 
-    for message in conversation_history[-10:]:
+    for message in messages:
         if isinstance(message, dict):
             role = str(message.get("role", "unknown")).upper()
             content = str(message.get("content", "")).strip()
@@ -295,23 +624,108 @@ def _build_acs_progress_summary(call_connection_id: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-async def _send_acs_progress_email_if_available(call_connection_id: str) -> bool:
+async def _send_transcript_email_from_snapshot(
+    call_connection_id: str,
+    call_snapshot: dict,
+) -> None:
+    """Send the end-of-call transcript email using a pre-captured state snapshot.
+
+    Called via asyncio.create_task after _active_acs_calls has already been
+    popped, so it must not read from _active_acs_calls.
+    """
+    quote_state = _enrich_quote_state_with_delivery(call_snapshot.get("quote_state"))
+    contact_info = str(quote_state.get("extracted", {}).get("contact_info") or "").strip()
+    if "@" not in contact_info:
+        logger.info(
+            "Skipping end-of-call transcript email: no valid email for call %s", call_connection_id
+        )
+        return
+
+    # Build summary directly from snapshot without touching _active_acs_calls.
+    extracted = quote_state.get("extracted", {})
+    messages = call_snapshot.get("call_transcript") or call_snapshot.get("conversation_history", [])
+
+    lines = [
+        f"ACS call transcript for call {call_connection_id}",
+        "",
+        "Collected quote details:",
+        f"- customer_name: {extracted.get('customer_name') or 'not provided'}",
+        f"- contact_info: {extracted.get('contact_info') or 'not provided'}",
+    ]
+    quote_items = extracted.get("quote_items") or []
+    if quote_items:
+        lines.append("- quote_items:")
+        for item in quote_items:
+            if isinstance(item, dict):
+                lines.append(
+                    f"  - {item.get('product_package') or 'unknown product'}"
+                    f" x {item.get('quantity') or 'unknown quantity'}"
+                )
+    else:
+        lines.append("- quote_items: not provided")
+    lines.extend([
+        f"- expected_start_date: {extracted.get('expected_start_date') or 'not provided'}",
+        f"- notes: {extracted.get('notes') or 'not provided'}",
+        f"- missing_fields: {', '.join(quote_state.get('missing_fields', [])) or 'none'}",
+        "",
+        "Full call transcript:",
+    ])
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = str(msg.get("role", "unknown")).upper()
+            content = str(msg.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+
+    summary_text = "\n".join(lines).strip() + "\n"
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
+            f.write(summary_text)
+            temp_path = f.name
+        sent = await send_conversation_email(contact_info, temp_path, call_connection_id)
+        logger.info("End-of-call transcript email send result for %s: %s", call_connection_id, sent)
+    except Exception as e:
+        logger.error("Failed to send transcript email for %s: %s", call_connection_id, str(e))
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                logger.warning("Failed to remove transcript temp file: %s", temp_path)
+
+
+async def _send_acs_progress_email_if_available(
+    call_connection_id: str,
+    *,
+    full_transcript: bool = False,
+) -> bool:
     call_info = _active_acs_calls.get(call_connection_id, {})
     quote_state = _enrich_quote_state_with_delivery(call_info.get("quote_state"))
     contact_info = str(quote_state.get("extracted", {}).get("contact_info") or "").strip()
     if "@" not in contact_info:
-        logger.info("Skipping ACS progress email because no valid email is available for call %s", call_connection_id)
+        logger.info(
+            "Skipping ACS %s email: no valid email for call %s",
+            "transcript" if full_transcript else "progress",
+            call_connection_id,
+        )
         return False
 
     temp_path = None
     try:
-        summary_text = _build_acs_progress_summary(call_connection_id)
+        summary_text = _build_acs_progress_summary(call_connection_id, full_transcript=full_transcript)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as temp_file:
             temp_file.write(summary_text)
             temp_path = temp_file.name
 
         sent = await send_conversation_email(contact_info, temp_path, call_connection_id)
-        logger.info("ACS progress email send result for %s: %s", call_connection_id, sent)
+        logger.info(
+            "ACS %s email send result for %s: %s",
+            "transcript" if full_transcript else "progress",
+            call_connection_id,
+            sent,
+        )
         return sent
     except Exception as e:
         logger.error("Failed to send ACS progress email for %s: %s", call_connection_id, str(e))
@@ -356,6 +770,57 @@ def _is_explicit_quote_confirmation(user_text: str) -> bool:
         return False
 
     return normalized in {"confirm", "yes"}
+
+
+def _wrap_chat_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize internal tool schema to chat.completions tool format."""
+    if not isinstance(schema, dict):
+        return schema
+    if schema.get("function") and schema.get("type") == "function":
+        return schema
+
+    function_schema = dict(schema)
+    function_schema.pop("type", None)
+    return {
+        "type": "function",
+        "function": function_schema,
+    }
+
+
+def _sanitize_tts_text(text: str, max_len: int = 350) -> str:
+    sanitized = re.sub(r"\s+", " ", str(text or "")).strip()
+    sanitized = sanitized.replace("&", "and")  # & is invalid in SSML XML; replace for natural speech
+    sanitized = sanitized.replace("*", "").replace("#", "")
+    sanitized = re.sub(r"[<>`]", "", sanitized)
+    if len(sanitized) > max_len:
+        sanitized = sanitized[: max_len - 3].rstrip() + "..."
+    return sanitized
+
+
+def _build_acs_text_source(text: str, context_tag: str) -> Any:
+    sanitized_text = _sanitize_tts_text(text)
+    if not sanitized_text:
+        sanitized_text = "I'm sorry, I don't have a response right now."
+        logger.warning("TTS text was empty after sanitization (context=%s); using fallback.", context_tag)
+    logger.info(
+        "TEST_TTS Building TextSource: context=%s, locale=%s, voice=%s, text_len=%d, text=%s",
+        context_tag,
+        _ACS_TTS_LOCALE,
+        _ACS_TTS_VOICE,
+        len(sanitized_text),
+        sanitized_text,
+    )
+
+    try:
+        from azure.communication.callautomation import TextSource
+    except ImportError:
+        from azure.communication.callautomation.models import TextSource  # type: ignore
+
+    return TextSource(
+        text=sanitized_text,
+        voice_name=_ACS_TTS_VOICE,
+        source_locale=_ACS_TTS_LOCALE,
+    )
 
 
 def _create_media_streaming_options(stream_url: str) -> Any:
@@ -619,7 +1084,8 @@ async def handle_incoming_call_event(event_data: dict[str, Any]) -> dict[str, An
                 "recipient_raw_id": recipient_raw_id,
                 "caller_session_key": _extract_caller_id(event_data),
                 "status": "answered",
-                "started_at": time.time()
+                "started_at": time.time(),
+                "call_transcript": [],  # unbounded full-call transcript (never pruned)
             }
             
             logger.info("✅ Call answered successfully!")
@@ -684,8 +1150,17 @@ async def handle_call_disconnected_event(event_data: dict[str, Any]) -> None:
         logger.info("   Reason: %s", disconnect_reason)
         
         if call_connection_id and call_connection_id in _active_acs_calls:
+            # Snapshot call state before the pop so the async email task has stable data.
+            call_snapshot = dict(_active_acs_calls[call_connection_id])
             _active_acs_calls.pop(call_connection_id)
             logger.info("   Removed call from active calls: %s", call_connection_id)
+
+            # Fire-and-forget: send transcript email without blocking call teardown.
+            logger.info("   Scheduling end-of-call transcript email for %s", call_connection_id)
+            asyncio.create_task(
+                _send_transcript_email_from_snapshot(call_connection_id, call_snapshot),
+                name=f"transcript-email-{call_connection_id}",
+            )
         else:
             logger.warning("   Call connection ID not found in active calls")
         
@@ -702,35 +1177,23 @@ async def handle_play_completed_event(event_data: dict[str, Any]) -> None:
         call_connection_id = event_data_obj.get("callConnectionId")
         operation_context = event_data_obj.get("operationContext")
         
-        logger.info("🎵 Play Completed - Connection ID: %s, Operation Context: %s", call_connection_id, operation_context)
+        logger.info("%s Play completed: call=%s context=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, operation_context)
         
         if call_connection_id and call_connection_id in _active_acs_calls:
             if operation_context == "welcome-tts":
                 # 欢迎语播放完成，启动第一次语音识别
                 _active_acs_calls[call_connection_id]["welcome_played"] = True
-                logger.info("Welcome message playback completed, starting first speech recognition...")
+                logger.info("%s Welcome playback finished; starting recognition. call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
                 await start_speech_recognition(call_connection_id)
             elif operation_context == "answer-tts":
                 # 回答播放完成，重新启动识别，实现多轮对话
                 if _active_acs_calls[call_connection_id].get("hangup_after_playback"):
-                    logger.info("Answer playback completed and hangup_after_playback is set; ending call.")
+                    logger.info("%s Answer playback finished; hanging up call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
                     await _hang_up_acs_call(call_connection_id)
                 else:
-                    logger.info("Answer playback completed, restarting speech recognition for next question...")
+                    logger.info("%s Answer playback finished; restarting recognition. call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
                     await start_speech_recognition(call_connection_id)
-            elif operation_context == "answer-tts-stream":
-                # 流式回答的一段播完，播下一段或结束并重新启动识别
-                logger.info("[STREAM] PlayCompleted (answer-tts-stream), call=%s", call_connection_id)
-                if call_connection_id in _active_acs_calls:
-                    _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
-                started = await _play_next_answer_chunk(call_connection_id)
-                if not started:
-                    logger.info("[STREAM] No more chunks, restarting speech recognition for next turn")
-                    await start_speech_recognition(call_connection_id)
-            else:
-                # 其他播放完成事件（可能是错误提示等），不重新启动识别
-                logger.info("Play completed for context: %s (not restarting recognition)", operation_context)
-        
+
     except Exception as e:
         logger.error("Error handling play completed event: %s", str(e))
         import traceback
@@ -742,20 +1205,20 @@ async def handle_play_failed_event(event_data: dict[str, Any]) -> None:
     try:
         data = event_data.get("data", {}) or {}
         call_connection_id = data.get("callConnectionId") or event_data.get("callConnectionId")
+        operation_context = data.get("operationContext")
 
         result_info = data.get("resultInformation", {}) or {}
-        logger.warning("🔊 Play failed - call=%s", call_connection_id)
-        logger.warning("resultInformation=%s", json.dumps(result_info, ensure_ascii=False))
+        logger.warning("TEST_TTS Play failed - call=%s, operation_context=%s", call_connection_id, operation_context)
+        logger.warning(
+            "TEST_TTS Play failed summary: code=%s, subCode=%s, message=%s",
+            result_info.get("code"),
+            result_info.get("subCode"),
+            result_info.get("message"),
+        )
 
         # 有时更深一层 details 里还有具体的 speechErrorCode / subcode
         if isinstance(result_info, dict) and "details" in result_info:
             logger.warning("resultInformation.details=%s", json.dumps(result_info["details"], ensure_ascii=False))
-
-        # 为了能完整还原问题，这里暂时把整个 event 打出来（截断到 5000 字符）
-        try:
-            logger.warning("raw event=%s", json.dumps(event_data, ensure_ascii=False)[:5000])
-        except Exception:
-            logger.warning("raw event=<unserializable>")
 
     except Exception as e:
         logger.error("Error handling play failed event: %s", str(e))
@@ -775,8 +1238,7 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
         data = event_data.get("data", {}) or {}
         call_connection_id = data.get("callConnectionId")
 
-        logger.info("🗣️ RecognizeCompleted for call: %s", call_connection_id)
-        logger.info("Recognize event data: %s", json.dumps(data, ensure_ascii=False))
+        logger.info("%s RecognizeCompleted received: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
 
         # 不同版本 / 模式下，识别结果可能挂在不同字段上，这里尽量兼容性查找
         recognize_result = (
@@ -822,18 +1284,18 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
         user_text = (user_text or "").strip()
 
         if not user_text:
-            logger.warning("RecognizeCompleted received but no transcript text found.")
+            logger.warning("%s No transcript extracted: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
             if call_connection_id:
                 empty_count = _get_empty_recognition_count(call_connection_id) + 1
                 _set_empty_recognition_count(call_connection_id, empty_count)
-                logger.info("Transcript was empty; consecutive empty recognition count=%d", empty_count)
+                logger.info("%s Empty transcript count=%d for call=%s", _TEST_FLOW_LOG_PREFIX, empty_count, call_connection_id)
                 if empty_count >= 10:
                     await _end_call_after_repeated_empty_input(call_connection_id)
                 else:
                     await play_answer_message(call_connection_id, "I didn't catch that. Could you please say that again?")
             return
 
-        logger.info("User said (transcript): %s", user_text)
+        logger.info("%s Transcript extracted: call=%s text=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, user_text[:160])
         _reset_empty_recognition_count(call_connection_id)
 
         # 初始化通话的报价状态（如果还没有）
@@ -841,8 +1303,9 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             _active_acs_calls[call_connection_id] = {
                 "call_connection_id": call_connection_id,
                 "status": "active",
+                "call_transcript": [],
             }
-            logger.info("📞 Initialized new call state for: %s", call_connection_id)
+            logger.info("%s Initialized missing call state: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
         
         # 处理报价逻辑
         if call_connection_id:
@@ -850,36 +1313,18 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             quote_state = call_info.get("quote_state", {})
             conversation_history = call_info.get("conversation_history", [])
             
-            # 打印当前对话历史
-            logger.info("=" * 80)
-            logger.info("📝 CONVERSATION HISTORY (call: %s, messages: %d)", call_connection_id, len(conversation_history))
-            for idx, msg in enumerate(conversation_history[-5:], 1):  # 只打印最近 5 条
-                role = msg.get("role", "unknown")
-                content = msg.get("content", "")[:100]  # 截断到 100 字符
-                logger.info("  [%d] %s: %s", idx, role.upper(), content)
-            logger.info("=" * 80)
+            logger.info(
+                "%s Pre-answer state: call=%s history_len=%d has_quote=%s quote_complete=%s missing=%s",
+                _TEST_FLOW_LOG_PREFIX,
+                call_connection_id,
+                len(conversation_history),
+                bool(quote_state),
+                bool(quote_state.get("is_complete")),
+                quote_state.get("missing_fields", []),
+            )
             
-            # 打印当前报价状态
-            if quote_state:
-                logger.info("📋 CURRENT QUOTE STATE (call: %s)", call_connection_id)
-                extracted = quote_state.get("extracted", {})
-                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
-                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
-                quote_items = extracted.get("quote_items", [])
-                if quote_items:
-                    logger.info("  - Quote Items (%d):", len(quote_items))
-                    for item in quote_items:
-                        logger.info("      * %s x %s", item.get("product_package", "N/A"), item.get("quantity", "N/A"))
-                else:
-                    logger.info("  - Quote Items: NOT SET")
-                logger.info("  - Expected Start Date: %s", extracted.get("expected_start_date") or "NOT SET")
-                logger.info("  - Notes: %s", extracted.get("notes") or "NOT SET")
-                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
-                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
-            else:
-                logger.info("📋 NO QUOTE STATE (call: %s) - Regular conversation", call_connection_id)
-            
-            # 先更新报价状态（提取信息）；普通问答为流式播报，返回 already_played 表示是否已边生成边播
+            # 先更新报价状态（提取信息）；回答文本生成完成后再一次性播报
+            logger.info("%s Generating answer: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
             answer_text, quote_updated, already_played = await generate_answer_text_with_gpt(
                 user_text, call_connection_id
             )
@@ -889,47 +1334,26 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             quote_state = updated_call_info.get("quote_state", {})
             updated_conversation = updated_call_info.get("conversation_history", [])
             
-            # 打印更新后的对话历史
-            if len(updated_conversation) > len(conversation_history):
-                logger.info("📝 UPDATED CONVERSATION HISTORY (call: %s, total messages: %d)", 
-                          call_connection_id, len(updated_conversation))
-                for idx, msg in enumerate(updated_conversation[-3:], len(updated_conversation) - 2):
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")[:100]
-                    logger.info("  [%d] %s: %s", idx, role.upper(), content)
-            
-            # 打印更新后的报价状态
-            if quote_state:
-                logger.info("📋 UPDATED QUOTE STATE (call: %s)", call_connection_id)
-                extracted = quote_state.get("extracted", {})
-                logger.info("  - Customer Name: %s", extracted.get("customer_name") or "NOT SET")
-                logger.info("  - Contact Info: %s", extracted.get("contact_info") or "NOT SET")
-                quote_items = extracted.get("quote_items", [])
-                if quote_items:
-                    logger.info("  - Quote Items (%d):", len(quote_items))
-                    for item in quote_items:
-                        logger.info("      * %s x %s", item.get("product_package", "N/A"), item.get("quantity", "N/A"))
-                logger.info("  - Missing Fields: %s", quote_state.get("missing_fields", []))
-                logger.info("  - Is Complete: %s", quote_state.get("is_complete", False))
-            
             logger.info(
-                "🔍 ACS response generated via tool-planned flow or regular Q&A - quote_updated=%s, quote_complete=%s",
+                "%s Answer generated: call=%s answer_len=%d already_played=%s quote_updated=%s quote_complete=%s history_len=%d",
+                _TEST_FLOW_LOG_PREFIX,
+                call_connection_id,
+                len(answer_text or ""),
+                already_played,
                 quote_updated,
                 quote_state.get("is_complete", False),
+                len(updated_conversation),
             )
         else:
             logger.info("➡️  BRANCH: Entering SIMPLE MODE branch (no call_connection_id)")
             # 没有 call_connection_id，使用简单模式
             answer_text, _, already_played = await generate_answer_text_with_gpt(user_text, None)
-            already_played = False  # 简单模式无流式播报
+            already_played = False
 
-        # 播放回答（流式分支已在 generate 中边生成边播，此处跳过）
+        # 播放回答：ACS 现在统一等完整文本生成后再一次性 TTS 播报
         if call_connection_id and not already_played:
-            queued = _queue_answer_text_for_tts(call_connection_id, answer_text)
-            if not queued:
-                await play_answer_message(call_connection_id, answer_text)
-        elif call_connection_id and already_played:
-            logger.info("[STREAM] Answer already played via stream, skipping play_answer_message")
+            logger.info("%s Handing answer to TTS: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            await play_answer_message(call_connection_id, answer_text)
         elif not call_connection_id:
             logger.warning("No call_connection_id in RecognizeCompleted event; cannot play answer.")
 
@@ -970,105 +1394,6 @@ async def handle_recognize_failed_event(event_data: dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-# 流式回答分块：按句或按长度切分，减少首字延迟
-_STREAM_MIN_CHUNK_LEN = 25
-_STREAM_MAX_CHUNK_LEN = 80
-_SENTENCE_END_RE = re.compile(r"[.!?]\s*")
-
-
-def _flush_stream_buffer(buffer: str, call_connection_id: Optional[str]) -> str:
-    """
-    将 buffer 中可播报的句子/片段取出，加入队列并触发播放，返回剩余部分。
-    """
-    if not call_connection_id or call_connection_id not in _active_acs_calls:
-        return buffer
-    remainder = buffer
-    while True:
-        remainder = remainder.lstrip()
-        if len(remainder) < _STREAM_MIN_CHUNK_LEN:
-            return remainder
-        # 优先在句号、问号、感叹号处切分
-        match = _SENTENCE_END_RE.search(remainder)
-        if match:
-            end = match.end()
-            chunk = remainder[:end].strip()
-            remainder = remainder[end:]
-            if len(chunk) >= _STREAM_MIN_CHUNK_LEN:
-                _ensure_answer_stream_state(call_connection_id)
-                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(chunk)
-                qlen = len(_active_acs_calls[call_connection_id]["answer_chunk_queue"])
-                logger.info("[STREAM] Flush chunk (sentence) -> queue len=%d, text=%s", qlen, chunk[:60] + ("..." if len(chunk) > 60 else ""))
-                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
-                continue
-        # 无句号则按长度在空格处切
-        if len(remainder) >= _STREAM_MAX_CHUNK_LEN:
-            idx = remainder.rfind(" ", _STREAM_MIN_CHUNK_LEN, _STREAM_MAX_CHUNK_LEN + 1)
-            if idx <= 0:
-                idx = min(_STREAM_MAX_CHUNK_LEN, len(remainder))
-            chunk = remainder[: idx + 1 if idx > 0 else idx].strip()
-            remainder = remainder[idx + 1 if idx > 0 else idx :].lstrip()
-            if chunk:
-                _ensure_answer_stream_state(call_connection_id)
-                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(chunk)
-                qlen = len(_active_acs_calls[call_connection_id]["answer_chunk_queue"])
-                logger.info("[STREAM] Flush chunk (length) -> queue len=%d, text=%s", qlen, chunk[:60] + ("..." if len(chunk) > 60 else ""))
-                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
-            continue
-        return remainder
-
-
-def _chunk_text_for_tts(answer_text: str) -> list[str]:
-    """将完整回答切成较短 TTS 片段，优先按句切分。"""
-    remainder = (answer_text or "").strip()
-    if not remainder:
-        return []
-
-    chunks: list[str] = []
-    while remainder:
-        remainder = remainder.lstrip()
-        if not remainder:
-            break
-
-        match = _SENTENCE_END_RE.search(remainder)
-        if match and match.end() <= _STREAM_MAX_CHUNK_LEN:
-            chunk = remainder[:match.end()].strip()
-            remainder = remainder[match.end():]
-            if chunk:
-                chunks.append(chunk)
-            continue
-
-        if len(remainder) <= _STREAM_MAX_CHUNK_LEN:
-            chunks.append(remainder)
-            break
-
-        idx = remainder.rfind(" ", _STREAM_MIN_CHUNK_LEN, _STREAM_MAX_CHUNK_LEN + 1)
-        if idx <= 0:
-            idx = _STREAM_MAX_CHUNK_LEN
-        chunk = remainder[:idx].strip()
-        remainder = remainder[idx:].lstrip()
-        if chunk:
-            chunks.append(chunk)
-
-    return chunks
-
-
-def _queue_answer_text_for_tts(call_connection_id: str, answer_text: str) -> bool:
-    """将回答加入 TTS 队列，实现旧版 ACS 链路的分块即时播报。"""
-    if call_connection_id not in _active_acs_calls:
-        return False
-
-    chunks = _chunk_text_for_tts(answer_text)
-    if not chunks:
-        return False
-
-    _ensure_answer_stream_state(call_connection_id)
-    _active_acs_calls[call_connection_id]["answer_chunk_queue"] = chunks
-    _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
-    logger.info("[STREAM] Queued %d TTS chunk(s) for call=%s", len(chunks), call_connection_id)
-    asyncio.create_task(_play_next_answer_chunk(call_connection_id))
-    return True
-
-
 async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool, bool]:
     """
     使用 Azure OpenAI 根据用户语音转成的文本生成回答（电话版 Q&A 核心逻辑）。
@@ -1078,10 +1403,10 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
     - 收集报价信息
     - 生成自然对话回答
     
-    普通问答分支使用流式输出，边生成边加入 TTS 队列播报，降低首字延迟。
+    ACS 电话分支统一先生成完整回答，再一次性播报。
     
     Returns:
-        tuple[str, bool, bool]: (回答文本, 报价状态是否更新, 是否已通过流式播报无需再 play_answer_message)
+        tuple[str, bool, bool]: (回答文本, 报价状态是否更新, 是否已提前播报)
     """
     # 如果 GPT 不可用，就回个固定文案，避免电话静音
     fallback = "I am sorry, I could not process your question. Please try again later."
@@ -1103,8 +1428,6 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
     llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
 
     # 立即输出使用的模型信息
-    logger.info("🤖 GPT Model Configuration - Deployment: %s, Endpoint: %s", openai_deployment, openai_endpoint or "NOT SET")
-
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using fallback answer.")
         return fallback, False, False
@@ -1138,21 +1461,29 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             conversation_history = call_info.get("conversation_history", [])
         
         # 添加当前用户消息到历史（如果还没有添加）
+        # call_transcript is an audit log — always append, no deduplication.
+        if call_connection_id and call_connection_id in _active_acs_calls:
+            transcript = _active_acs_calls[call_connection_id].setdefault("call_transcript", [])
+            transcript.append({"role": "user", "content": user_text})
         if not conversation_history or conversation_history[-1].get("content") != user_text:
             conversation_history.append({"role": "user", "content": user_text})
-            logger.info("💬 Added user message to conversation history (total: %d messages)", len(conversation_history))
         # 只保留最近 10 条消息
         if len(conversation_history) > 10:
             conversation_history = conversation_history[-10:]
-            logger.info("💬 Trimmed conversation history to last 10 messages")
-        
+
         # 更新通话状态中的对话历史
         if call_connection_id and call_connection_id in _active_acs_calls:
             _active_acs_calls[call_connection_id]["conversation_history"] = conversation_history
-            logger.info("💾 Saved conversation history to call state (call: %s, messages: %d)", 
-                       call_connection_id, len(conversation_history))
 
         quote_state = _enrich_quote_state_with_delivery(quote_state) if quote_state else {}
+        logger.info(
+            "%s Enter generate_answer_text_with_gpt: call=%s history_len=%d has_quote=%s quote_complete=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            call_connection_id,
+            len(conversation_history),
+            bool(quote_state),
+            bool(quote_state.get("is_complete")),
+        )
         if (
             call_connection_id
             and quote_state.get("is_complete")
@@ -1284,6 +1615,58 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             logger.info("Answer text from pending-update follow-up: %s", answer_text)
             return answer_text, False, False
         
+        # ── TOP-LEVEL INTENT GATE ──────────────────────────────────────────────
+        # Classify the current utterance BEFORE touching the quote planner.
+        # Non-quote intents (company_info, routing, general_qa) bypass quote
+        # tools entirely and route straight to the receptionist path.
+        top_intent = await _classify_top_level_intent(
+            client,
+            openai_deployment,
+            user_text,
+            conversation_history,
+            has_active_quote_state=bool(quote_state),
+            quote_complete=bool(quote_state.get("is_complete")),
+        )
+        logger.info(
+            "%s Top intent: call=%s primary=%s secondary=%s enter_quote=%s preserve=%s reason=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            call_connection_id,
+            top_intent["primary_intent"],
+            top_intent["secondary_intents"],
+            top_intent["should_enter_quote_flow"],
+            top_intent["should_preserve_quote_state"],
+            top_intent["reason"],
+        )
+
+        if not top_intent["should_enter_quote_flow"]:
+            logger.info("➡️  BRANCH: Non-quote intent (%s) — routing to receptionist path",
+                        top_intent["primary_intent"])
+            answer_text, already_played = await _run_receptionist_path(
+                client,
+                openai_deployment,
+                openai_endpoint,
+                user_text,
+                conversation_history,
+                call_connection_id,
+            )
+            # If a quote is in progress, append a brief continuation reminder
+            # (only when the answer wasn't already sent via streaming)
+            if (
+                top_intent["should_preserve_quote_state"]
+                and quote_state
+                and not quote_state.get("is_complete")
+                and not already_played
+            ):
+                missing = quote_state.get("missing_fields", [])
+                if missing:
+                    reminder = _generate_quote_collection_response(missing, quote_state)
+                    # lower-case the first letter so it reads naturally after a period
+                    answer_text = f"{answer_text} Also, {reminder[0].lower() + reminder[1:]}"
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("%s Non-quote path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            return answer_text, False, already_played
+        # ── END TOP-LEVEL INTENT GATE ──────────────────────────────────────────
+
         planned_tool_call = await _plan_acs_quote_tool_call(
             client,
             openai_deployment,
@@ -1294,7 +1677,7 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         quote_updated = False
 
         if planned_tool_call and call_connection_id:
-            logger.info("➡️  BRANCH: Entering ACS TOOL-CALLING quote flow")
+            logger.info("%s Quote planner selected tool: call=%s tool=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, planned_tool_call["name"])
             tool_result = await _execute_acs_quote_tool_call(
                 planned_tool_call["name"],
                 planned_tool_call.get("arguments", {}),
@@ -1473,7 +1856,7 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             logger.info("Answer text from GPT recall flow: %s", answer_text)
             return answer_text, False, False
 
-        if quote_state and not quote_state.get("is_complete"):
+        if quote_state and not quote_state.get("is_complete") and behavior != "general_qa":
             logger.info("➡️  BRANCH: Quote state exists but no tool call was planned; ask for remaining missing info")
             _clear_awaiting_quote_confirmation(call_connection_id)
             answer_text = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
@@ -1482,73 +1865,19 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             return answer_text, False, False
 
         else:
-            logger.info("➡️  SUB-BRANCH: Regular Q&A (no quote_state or quote_state is complete)")
-            # 普通问答
-            system_prompt = (
-                "You are a helpful support assistant speaking on a phone call. "
-                "Answer briefly and clearly in natural English. "
-                "Keep each answer under 3 sentences. "
-                "If the user asks about quotes, pricing, or estimates, help them request a quote."
+            # quote_state is complete or was never started — plain receptionist turn
+            logger.info("➡️  SUB-BRANCH: Regular Q&A (quote_state complete or absent)")
+            answer_text, already_played = await _run_receptionist_path(
+                client,
+                openai_deployment,
+                openai_endpoint,
+                user_text,
+                conversation_history,
+                call_connection_id,
             )
-
-            logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
-            logger.info("Calling Azure OpenAI to generate phone answer using deployment: %s", openai_deployment)
-            context_messages = [
-                {"role": "system", "content": system_prompt},
-                *[
-                    {
-                        "role": "assistant" if m.get("role") == "assistant" else "user",
-                        "content": m.get("content", ""),
-                    }
-                    for m in conversation_history[-6:]
-                    if isinstance(m, dict) and m.get("content")
-                ],
-                {"role": "user", "content": user_text},
-            ]
-            # 普通问答：流式输出，边生成边加入 TTS 队列播报，降低首字延迟
-            logger.info("[STREAM] Starting GPT stream for call=%s (regular Q&A)", call_connection_id)
-            stream = client.chat.completions.create(
-                model=openai_deployment,
-                messages=context_messages,
-                temperature=0.4,
-                max_tokens=128,
-                stream=True,
-            )
-            full_parts: list[str] = []
-            buffer = ""
-            chunk_count = 0
-            for chunk in stream:
-                delta = (chunk.choices[0].delta.content or "") if chunk.choices else ""
-                if not delta:
-                    continue
-                chunk_count += 1
-                if chunk_count <= 3 or chunk_count % 20 == 0:
-                    logger.info("[STREAM] GPT delta #%d: %s", chunk_count, repr(delta[:40]) + ("..." if len(delta) > 40 else ""))
-                full_parts.append(delta)
-                buffer += delta
-                buffer = _flush_stream_buffer(buffer, call_connection_id)
-            full_text = "".join(full_parts).strip()
-            total_chunks = len(_active_acs_calls.get(call_connection_id, {}).get("answer_chunk_queue", []))
-            logger.info("[STREAM] GPT stream finished: total_deltas=%d, full_len=%d, queue_chunks_so_far=%d", chunk_count, len(full_text), total_chunks)
-            # 剩余 buffer 作为最后一段播报
-            if buffer.strip():
-                _ensure_answer_stream_state(call_connection_id)
-                _active_acs_calls[call_connection_id]["answer_chunk_queue"].append(buffer.strip())
-                logger.info("[STREAM] Last buffer queued: %s", buffer.strip()[:60] + ("..." if len(buffer.strip()) > 60 else ""))
-                asyncio.create_task(_play_next_answer_chunk(call_connection_id))
-            if not full_text:
-                logger.warning("GPT stream returned empty answer text, using fallback.")
-                return fallback, False, False
-            # 更新对话历史（流式已播报，不需要再 play_answer_message）
-            if call_connection_id and call_connection_id in _active_acs_calls:
-                conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
-                conv.append({"role": "assistant", "content": full_text})
-                if len(conv) > 10:
-                    conv = conv[-10:]
-                _active_acs_calls[call_connection_id]["conversation_history"] = conv
-                _active_acs_calls[call_connection_id]["last_answer"] = full_text
-            logger.info("[STREAM] Returning streamed answer (already_played=True), full_text=%s", full_text[:80] + ("..." if len(full_text) > 80 else ""))
-            return full_text, quote_updated, True
+            _append_assistant_message(call_connection_id, answer_text)
+            logger.info("%s Receptionist path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            return answer_text, quote_updated, already_played
 
         logger.info("Answer text from GPT: %s", answer_text)
         return answer_text, quote_updated, False
@@ -1799,7 +2128,11 @@ async def _plan_acs_quote_tool_call(
 ) -> Optional[dict[str, Any]]:
     """Ask the model to decide whether the ACS quote workflow should call a tool."""
     state = _enrich_quote_state_with_delivery(quote_state)
-    tools = [_quote_extraction_tool_schema, _update_quote_info_tool_schema, _send_quote_email_tool_schema]
+    tools = [
+        _wrap_chat_tool_schema(_quote_extraction_tool_schema),
+        _wrap_chat_tool_schema(_update_quote_info_tool_schema),
+        _wrap_chat_tool_schema(_send_quote_email_tool_schema),
+    ]
     recent_history = [
         {
             "role": ("assistant" if msg.get("role") == "assistant" else "user"),
@@ -1808,6 +2141,7 @@ async def _plan_acs_quote_tool_call(
         for msg in (conversation_history or [])[-8:]
         if isinstance(msg, dict) and msg.get("content")
     ]
+    logger.info("%s Quote planner start: has_quote=%s history_len=%d", _TEST_FLOW_LOG_PREFIX, bool(state), len(recent_history))
     payload = {
         "current_quote_state": state,
         "recent_history": recent_history,
@@ -2043,137 +2377,244 @@ async def _classify_user_behavior_with_llm(
     return "general_qa"
 
 
-async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:
+async def _classify_top_level_intent(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    has_active_quote_state: bool,
+    quote_complete: bool,
+) -> dict[str, Any]:
     """
-    从对话历史中提取报价信息（电话端版本）
-    
-    复用 quote_tools 的逻辑，但适配电话端的对话格式
+    Top-level intent gate that must be cleared before entering the quote workflow.
+
+    Classifies the CURRENT utterance into one of:
+      quote | company_info | routing | general_qa
+
+    Returns a dict with:
+      primary_intent        – dominant intent of this turn
+      secondary_intents     – list of additional intents in this turn
+      should_enter_quote_flow  – True only when primary_intent == "quote"
+      should_preserve_quote_state – True when caller asked a side-question mid-quote
+      reason                – brief LLM explanation (for logging)
     """
+    recent_history = [
+        {
+            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+
+    prompt = (
+        "You are a top-level intent classifier for an AI phone receptionist.\n"
+        "Classify the caller's CURRENT utterance and return JSON only with these keys:\n"
+        "  primary_intent, secondary_intents, should_enter_quote_flow, should_preserve_quote_state, reason\n\n"
+        "Intent categories:\n"
+        "- quote: The caller is actively requesting a price quote or cost estimate, OR is directly providing\n"
+        "  information for an in-progress quote (name, email, product choice, quantity, start date).\n"
+        "  Only classify as quote if the CURRENT utterance clearly relates to quoting.\n"
+        "- company_info: The caller asks about fixed company information — office address, business hours,\n"
+        "  website, phone number, email address, or a general company description.\n"
+        "- routing: The caller wants to be transferred to a department or person, or describes a service\n"
+        "  need that implies they want to speak to someone specific.\n"
+        "- general_qa: Anything else — general knowledge, clarifications, or unclear intent.\n\n"
+        "Rules (STRICTLY FOLLOW):\n"
+        "1. Classify based on the SEMANTIC MEANING of the CURRENT utterance only.\n"
+        "2. Do NOT classify as quote just because 'quote', 'price', or 'cost' appeared earlier in history.\n"
+        "3. If the utterance is clearly company_info or routing, do NOT classify it as quote.\n"
+        "4. If the utterance contains two or more distinct intents, set primary_intent to the most dominant\n"
+        "   and list the others in secondary_intents (array of strings).\n"
+        "5. If intent is unclear, prefer general_qa rather than quote.\n"
+        "6. Set should_enter_quote_flow=true ONLY when primary_intent is 'quote'.\n"
+        "7. Set should_preserve_quote_state=true when has_active_quote_state=true AND the current intent\n"
+        "   is non-quote (the caller asked a side-question while mid-quote).\n"
+        "8. If secondary_intents contains 'quote' and has_active_quote_state=true, also set\n"
+        "   should_preserve_quote_state=true.\n"
+        "Example: caller says 'what are your office hours?' during a quote flow\n"
+        "  → primary_intent=company_info, should_enter_quote_flow=false, should_preserve_quote_state=true"
+    )
+
+    payload = {
+        "latest_user_text": user_text,
+        "recent_history": recent_history,
+        "has_active_quote_state": has_active_quote_state,
+        "quote_complete": quote_complete,
+    }
+
+    default: dict[str, Any] = {
+        "primary_intent": "general_qa",
+        "secondary_intents": [],
+        "should_enter_quote_flow": False,
+        "should_preserve_quote_state": has_active_quote_state and not quote_complete,
+        "reason": "classifier fallback",
+    }
+
     try:
-        logger.info("🔍 EXTRACTING QUOTE INFO FROM CONVERSATION")
-        logger.info("  Conversation history length: %d messages", len(conversation_history))
-        logger.info("  Current state: %s", json.dumps(current_state, ensure_ascii=False, default=str)[:200])
-        
-        # 构建对话文本
-        conversation_text = "\n".join([
-            f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
-            for msg in conversation_history[-10:]
-        ])
-        logger.info("  Conversation text length: %d characters", len(conversation_text))
-        
-        # 获取可用产品
-        products = fetch_available_products()
-        product_names = [p["name"] for p in products]
-        if products:
-            logger.info("  Found %d available products", len(products))
-            logger.info("  Sample products: %s", ", ".join(product_names[:5]))
-        else:
-            logger.warning("  No products found in Salesforce")
-        
-        # 使用 GPT 提取信息
-        from azure.core.credentials import AzureKeyCredential
-        from azure.identity import DefaultAzureCredential
-        from openai import AzureOpenAI
-        
-        openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-        openai_deployment = (
-            os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
-            or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-            or "gpt-4o-mini"
-        )
-        llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
-        
-        if not openai_endpoint or not openai_deployment:
-            return {
-                "extracted": current_state.get("extracted", {}),
-                "missing_fields": ["customer_name", "contact_info", "quote_items"],
-                "is_complete": False,
-            }
-        
-        if llm_key:
-            credential = AzureKeyCredential(llm_key)
-        else:
-            credential = DefaultAzureCredential()
-        
-        product_list_text = ", ".join(product_names) if product_names else "No products available"
-        
-        # 合并当前已提取的信息
-        extracted_data = current_state.get("extracted", {}).copy()
-        
-        extraction_prompt = f"""Extract quote information from the following conversation. 
-Return a JSON object with the following fields:
-- customer_name: Customer's name (if mentioned)
-- contact_info: Email address or phone number (if mentioned)
-- quote_items: Array of items, each with {{"product_package": "product name", "quantity": number}}. 
-  Support multiple products - if user mentions multiple products, include all of them.
-- expected_start_date: Expected start date in format YYYY-MM-DD (if mentioned)
-- notes: Any additional notes or requirements mentioned
-
-Available products: {product_list_text}
-
-Conversation:
-{conversation_text}
-
-Current extracted data (update only if new information is found):
-{json.dumps(extracted_data, ensure_ascii=False)}
-
-Return ONLY a valid JSON object, no other text. If a field is not found, use null for that field (use [] for quote_items if no products mentioned).
-Merge with current extracted data - only update fields where new information is found."""
-        
-        if isinstance(credential, AzureKeyCredential):
-            client = AzureOpenAI(
-                api_key=credential.key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint
-            )
-        else:
-            token = credential.get_token("https://cognitiveservices.azure.com/.default").token
-            client = AzureOpenAI(
-                api_key=token,
-                api_version="2024-02-15-preview",
-                azure_endpoint=openai_endpoint
-            )
-        
-        logger.info("🤖 Calling GPT for quote extraction (deployment: %s)", openai_deployment)
-        logger.info("  Prompt length: %d characters", len(extraction_prompt))
-        
         response = client.chat.completions.create(
-            model=openai_deployment,
+            model=deployment,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that extracts structured information from conversations. Always return valid JSON only."},
-                {"role": "user", "content": extraction_prompt}
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            temperature=0.1,
-            response_format={"type": "json_object"}
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=200,
         )
-        
-        logger.info("✅ GPT extraction response received")
-        new_extracted = json.loads(response.choices[0].message.content)
-        logger.info("  Extracted data: %s", json.dumps(new_extracted, ensure_ascii=False, default=str)[:300])
-        
-        logger.info("🔄 Merging extracted data with current state...")
-        extracted_data = normalize_and_match_quote_extracted_data(
-            extracted_data,
-            new_extracted,
-            products,
-            replace_quote_items=False,
+        raw = json.loads((response.choices[0].message.content or "{}").strip())
+
+        primary = raw.get("primary_intent", "general_qa")
+        if primary not in {"quote", "company_info", "routing", "general_qa"}:
+            primary = "general_qa"
+
+        secondary = [
+            i for i in (raw.get("secondary_intents") or [])
+            if isinstance(i, str)
+            and i in {"quote", "company_info", "routing", "general_qa"}
+            and i != primary
+        ]
+
+        should_enter_quote = primary == "quote"
+        should_preserve = bool(
+            raw.get("should_preserve_quote_state",
+                    has_active_quote_state and not quote_complete and not should_enter_quote)
         )
-        result = build_quote_state(extracted_data, product_names)
+
+        return {
+            "primary_intent": primary,
+            "secondary_intents": secondary,
+            "should_enter_quote_flow": should_enter_quote,
+            "should_preserve_quote_state": should_preserve,
+            "reason": str(raw.get("reason", ""))[:200],
+        }
+    except Exception as e:
+        logger.warning("Top-level intent classification failed, defaulting to general_qa: %s", str(e))
+        return default
+
+
+async def _run_receptionist_path(
+    client,
+    deployment: str,
+    endpoint: str,
+    user_text: str,
+    conversation_history: list,
+    call_connection_id: Optional[str],
+) -> tuple[str, bool]:
+    """
+    Handle a non-quote turn: company_info, routing, caller_intro, or general_qa.
+
+    Returns (answer_text, already_played).
+    already_played is always False here (non-streaming path).
+    """
+    fallback = "I am sorry, I could not process your question. Please try again later."
+
+    pending_route = _get_pending_receptionist_route(call_connection_id)
+    logger.info(
+        "%s Receptionist path start: call=%s pending_route=%s",
+        _TEST_FLOW_LOG_PREFIX,
+        call_connection_id,
+        pending_route,
+    )
+
+    receptionist_intent = await _classify_receptionist_intent_with_llm(
+        client,
+        deployment,
+        user_text,
+        conversation_history,
+        pending_route,
+    )
+
+    caller_name = receptionist_intent.get("caller_name")
+    company_name = receptionist_intent.get("company_name")
+    if call_connection_id and call_connection_id in _active_acs_calls:
+        if caller_name:
+            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
+        if company_name:
+            _active_acs_calls[call_connection_id]["caller_company"] = company_name
+
+    if receptionist_intent.get("intent") == "caller_intro" and caller_name:
+        logger.info("%s Receptionist intent resolved: call=%s intent=caller_intro", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+        return build_name_acknowledgement(caller_name), False
+
+    if receptionist_intent.get("intent") == "company_info" and receptionist_intent.get("info_topic"):
+        answer = build_company_info_answer(receptionist_intent["info_topic"])
+        if answer:
+            logger.info("%s Receptionist intent resolved: call=%s intent=company_info topic=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, receptionist_intent.get("info_topic"))
+            return answer, False
+
+    if receptionist_intent.get("intent") == "routing_request" or pending_route:
+        logger.info("%s Receptionist intent resolved: call=%s intent=routing_request", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+        answer = _resolve_receptionist_route(
+            call_connection_id,
+            receptionist_intent.get("department"),
+            company_name,
+            receptionist_intent.get("is_architectural_firm", False),
+        )
+        if answer:
+            return answer, False
+
+    # General Q&A fallback
+    system_prompt = build_receptionist_prompt()
+    context_messages = [
+        {"role": "system", "content": system_prompt},
+        *[
+            {
+                "role": "assistant" if m.get("role") == "assistant" else "user",
+                "content": m.get("content", ""),
+            }
+            for m in (conversation_history or [])[-6:]
+            if isinstance(m, dict) and m.get("content")
+        ],
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        logger.info("%s Receptionist GPT fallback start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=context_messages,
+            temperature=0.4,
+            max_tokens=128,
+        )
+        full_text = (response.choices[0].message.content or "").strip()
+        if not full_text:
+            logger.warning("GPT returned empty answer in receptionist path, using fallback.")
+            return fallback, False
+        if call_connection_id and call_connection_id in _active_acs_calls:
+            conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
+            conv.append({"role": "assistant", "content": full_text})
+            if len(conv) > 10:
+                conv = conv[-10:]
+            _active_acs_calls[call_connection_id]["conversation_history"] = conv
+            _active_acs_calls[call_connection_id]["last_answer"] = full_text
+        logger.info("%s Receptionist GPT fallback done: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(full_text))
+        return full_text, False
+    except Exception as e:
+        logger.error("GPT call failed in receptionist path: %s", str(e))
+        return fallback, False
+
+
+async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:
+    """Extract quote info from phone call conversation. Delegates to shared quote_workflow logic."""
+    logger.info(
+        "🔍 EXTRACTING QUOTE INFO FROM CONVERSATION (phone): %d messages, state=%s",
+        len(conversation_history or []),
+        json.dumps(current_state, ensure_ascii=False, default=str)[:200],
+    )
+    try:
+        result = await extract_quote_from_conversation(conversation_history, current_state)
         logger.info(
-            "✅ Extraction result: is_complete=%s, missing_fields=%s",
+            "✅ Phone extraction: is_complete=%s, missing=%s",
             result.get("is_complete"),
             result.get("missing_fields"),
         )
-        logger.info("📋 Final quote state: %s", json.dumps(result, ensure_ascii=False, default=str)[:400])
         return result
-        
     except Exception as e:
-        logger.error("Error extracting quote info: %s", str(e))
-        import traceback
-        logger.error("Traceback: %s", traceback.format_exc())
+        logger.error("Error extracting quote info (phone): %s", str(e))
         return {
-            "extracted": current_state.get("extracted", {}),
+            "extracted": dict(current_state.get("extracted") or {}),
             "missing_fields": ["customer_name", "contact_info", "quote_items"],
+            "products_available": [],
             "is_complete": False,
         }
 
@@ -2252,7 +2693,7 @@ async def generate_welcome_text_with_gpt() -> str:
     
     如果环境变量未配置或调用失败，则回退到固定文案。
     """
-    default_text = "Hello, thanks for calling. Please hold for a moment."
+    default_text = WELCOME_MESSAGE
 
     try:
         # 延迟导入，避免在没装 openai 包时直接崩溃
@@ -2300,10 +2741,9 @@ async def generate_welcome_text_with_gpt() -> str:
             )
 
         prompt = (
-            "You are a helpful call center assistant. "
-            "Generate one short, friendly English greeting sentence for an incoming phone call. "
-            "The caller just dialed a support number. "
-            "Return ONLY the sentence, without quotes, explanations or extra text."
+            "Generate one short English phone greeting for George Fethers reception. "
+            f"Use this exact sentence: {WELCOME_MESSAGE} "
+            "Return only the sentence."
         )
 
         logger.info("🤖 Using GPT model: %s (endpoint: %s)", openai_deployment, openai_endpoint)
@@ -2354,42 +2794,19 @@ async def play_welcome_message(call_connection_id: str) -> None:
         
         # 🎯 最小可行 TTS 测试：先用固定的简短英文欢迎语，排除 GPT 文本 / 字符集等因素
         # 如果这一步通过，再切回 GPT 生成文本
-        welcome_text = "Hi, I'm your voice assistant how can I help you today?"
+        welcome_text = WELCOME_MESSAGE
         
-        logger.info("🎵 Playing welcome message using TTS...")
-        logger.info("   Text: %s", welcome_text)
-        logger.info("   Connection ID: %s", call_connection_id)
+        logger.info("%s Starting welcome TTS: call=%s text_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(welcome_text))
         
         # 使用 TextSource 直接播放文本（官方推荐方式）
         # 根据 SDK 版本，TextSource 可能在不同的位置
-        text_source = None
-        
-        # 方法 1: 尝试从主模块导入（最常见）
         try:
-            from azure.communication.callautomation import TextSource
-            text_source = TextSource(
-                text=welcome_text,
-                voice_name="en-US-JennyNeural",
-                source_locale="en-US",
-            )
-            logger.info("   Using TextSource from main module")
+            text_source = _build_acs_text_source(welcome_text, "welcome")
         except ImportError:
-            # 方法 2: 尝试从 models 导入（某些 SDK 版本可能在这里）
-            try:
-                from azure.communication.callautomation.models import (
-                    TextSource,  # type: ignore
-                )
-                text_source = TextSource(
-                    text=welcome_text,
-                    voice_name="en-US-JennyNeural",
-                    source_locale="en-US",
-                )
-                logger.info("   Using TextSource from models")
-            except ImportError:
-                logger.error("❌ TextSource not found in SDK")
-                logger.error("   Please ensure azure-communication-callautomation is installed")
-                logger.error("   Run: pip install azure-communication-callautomation")
-                return
+            logger.error("❌ TextSource not found in SDK")
+            logger.error("   Please ensure azure-communication-callautomation is installed")
+            logger.error("   Run: pip install azure-communication-callautomation")
+            return
         
         # 执行播放
         # ✅ 关键：play_source 作为第一个位置参数传入，不是关键字参数
@@ -2399,10 +2816,9 @@ async def play_welcome_message(call_connection_id: str) -> None:
             operation_context="welcome-tts"
         )
         
-        logger.info("✅ Welcome message playback initiated")
-        logger.info("   Voice: en-AU-NatashaNeural (Australian accent)")
+        logger.info("%s Welcome TTS started: call=%s voice=%s locale=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, _ACS_TTS_VOICE, _ACS_TTS_LOCALE)
         if hasattr(play_result, 'operation_id'):
-            logger.info("   Operation ID: %s", play_result.operation_id)
+            logger.info("%s Welcome TTS operation_id=%s", _TEST_FLOW_LOG_PREFIX, play_result.operation_id)
         
         # 更新通话状态
         if call_connection_id in _active_acs_calls:
@@ -2458,7 +2874,7 @@ async def start_speech_recognition(call_connection_id: str) -> None:
 
         # 使用真正的电话号码构造 PhoneNumberIdentifier（不能用 rawId）
         caller_identifier = PhoneNumberIdentifier(caller_phone)  # type: ignore[call-arg]
-        logger.info("🎧 Starting speech recognition for call %s, caller_phone=%s", call_connection_id, caller_phone)
+        logger.info("%s Starting recognition: call=%s caller_phone=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, caller_phone)
 
         call_connection.start_recognizing_media(
             RecognizeInputType.SPEECH,  # type: ignore[name-defined]
@@ -2468,7 +2884,7 @@ async def start_speech_recognition(call_connection_id: str) -> None:
             end_silence_timeout=2,  # 停顿多久算一句结束
             operation_context="user-speech",
         )
-        logger.info("✅ Speech recognition started (waiting for RecognizeCompleted event)")
+        logger.info("%s Recognition started: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
 
     except Exception as e:
         logger.error("❌ Error in start_speech_recognition: %s", str(e))
@@ -2489,113 +2905,37 @@ async def play_answer_message(call_connection_id: str, answer_text: str) -> None
     try:
         call_connection = acs_client.get_call_connection(call_connection_id)
 
-        logger.info("🎵 Playing answer message using TTS...")
-        logger.info("   Text: %s", answer_text)
-        logger.info("   Connection ID: %s", call_connection_id)
+        logger.info("%s Starting answer TTS: call=%s text_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
 
-        text_source = None
         try:
-            from azure.communication.callautomation import TextSource
-            text_source = TextSource(
-                text=answer_text,
-                voice_name="en-US-JennyNeural",
-                source_locale="en-US",
-            )
-            logger.info("   Using TextSource from main module for answer")
+            text_source = _build_acs_text_source(answer_text, "answer")
         except ImportError:
-            try:
-                from azure.communication.callautomation.models import (
-                    TextSource,  # type: ignore
-                )
-                text_source = TextSource(
-                    text=answer_text,
-                    voice_name="en-US-JennyNeural",
-                    source_locale="en-US",
-                )
-                logger.info("   Using TextSource from models for answer")
-            except ImportError:
-                logger.error("❌ TextSource not found in SDK (answer)")
-                logger.error("   Please ensure azure-communication-callautomation is installed")
-                return
+            logger.error("❌ TextSource not found in SDK (answer)")
+            logger.error("   Please ensure azure-communication-callautomation is installed")
+            return
 
         play_result = call_connection.play_media(
             text_source,
             operation_context="answer-tts",
         )
 
-        logger.info("✅ Answer message playback initiated")
+        logger.info("%s Answer TTS started: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
         if hasattr(play_result, "operation_id"):
-            logger.info("   Answer Operation ID: %s", play_result.operation_id)
+            logger.info("%s Answer TTS operation_id=%s", _TEST_FLOW_LOG_PREFIX, play_result.operation_id)
 
         if call_connection_id in _active_acs_calls:
             _active_acs_calls[call_connection_id]["last_answer"] = answer_text
 
     except Exception as e:
-        logger.error("❌ Error in play_answer_message: %s", str(e))
-        import traceback
-        logger.error("Traceback: %s", traceback.format_exc())
-
-
-def _ensure_answer_stream_state(call_connection_id: str) -> None:
-    """确保通话有流式回答队列和播放状态（用于 GPT 流式 + 分块播报）。"""
-    if call_connection_id not in _active_acs_calls:
-        return
-    if "answer_chunk_queue" not in _active_acs_calls[call_connection_id]:
-        _active_acs_calls[call_connection_id]["answer_chunk_queue"] = []
-    if "answer_stream_playing" not in _active_acs_calls[call_connection_id]:
-        _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
-
-
-async def _play_next_answer_chunk(call_connection_id: str) -> bool:
-    """
-    从 answer_chunk_queue 取出一段并播放（用于流式回答边收边播）。
-    若队列为空或正在播放则直接返回。
-    Returns True 表示已开始播放一段，False 表示未播放（队列空或正在播）。
-    """
-    acs_client = get_acs_client()
-    if not acs_client:
-        return False
-    if call_connection_id not in _active_acs_calls:
-        return False
-    call_info = _active_acs_calls[call_connection_id]
-    queue = call_info.get("answer_chunk_queue", [])
-    if call_info.get("answer_stream_playing"):
-        logger.debug("[STREAM] _play_next_answer_chunk skipped: already playing")
-        return False
-    if not queue:
-        logger.debug("[STREAM] _play_next_answer_chunk skipped: queue empty")
-        return False
-    chunk = queue.pop(0).strip()
-    if not chunk:
-        return await _play_next_answer_chunk(call_connection_id)
-    try:
-        call_connection = acs_client.get_call_connection(call_connection_id)
-        try:
-            from azure.communication.callautomation import TextSource
-            text_source = TextSource(
-                text=chunk,
-                voice_name="en-US-JennyNeural",
-                source_locale="en-US",
+        if "8501" in str(e):
+            logger.warning(
+                "⚠️  play_answer_message skipped: call=%s is no longer in Established state (transferred or ended).",
+                call_connection_id,
             )
-        except ImportError:
-            from azure.communication.callautomation.models import TextSource  # type: ignore
-            text_source = TextSource(
-                text=chunk,
-                voice_name="en-US-JennyNeural",
-                source_locale="en-US",
-            )
-        call_connection.play_media(
-            text_source,
-            operation_context="answer-tts-stream",
-        )
-        _active_acs_calls[call_connection_id]["answer_stream_playing"] = True
-        queue_left = len(_active_acs_calls[call_connection_id].get("answer_chunk_queue", []))
-        logger.info("[STREAM] Playing chunk (queue left=%d): %s", queue_left, chunk[:50] + ("..." if len(chunk) > 50 else ""))
-        return True
-    except Exception as e:
-        logger.error("❌ Error playing stream chunk: %s", str(e))
-        _active_acs_calls[call_connection_id]["answer_stream_playing"] = False
-        return False
+        else:
+            logger.error("❌ Error in play_answer_message: %s", str(e))
+            import traceback
+            logger.error("Traceback: %s", traceback.format_exc())
 
 
 async def speak_error_message(call_connection_id: Optional[str], debug_tag: str = "") -> None:
@@ -2618,25 +2958,10 @@ async def speak_error_message(call_connection_id: Optional[str], debug_tag: str 
         logger.info("📢 Speaking error message (tag=%s) on call %s", debug_tag, call_connection_id)
 
         try:
-            from azure.communication.callautomation import TextSource
-            text_source = TextSource(
-                text=error_text,
-                voice_name="en-US-JennyNeural",
-                source_locale="en-US",
-            )
+            text_source = _build_acs_text_source(error_text, f"error-{debug_tag or 'generic'}")
         except ImportError:
-            try:
-                from azure.communication.callautomation.models import (
-                    TextSource,  # type: ignore
-                )
-                text_source = TextSource(
-                    text=error_text,
-                    voice_name="en-US-JennyNeural",
-                    source_locale="en-US",
-                )
-            except ImportError:
-                logger.error("❌ TextSource not available when trying to speak error (tag=%s)", debug_tag)
-                return
+            logger.error("❌ TextSource not available when trying to speak error (tag=%s)", debug_tag)
+            return
 
         try:
             call_connection.play_media(
@@ -2645,9 +2970,12 @@ async def speak_error_message(call_connection_id: Optional[str], debug_tag: str 
             )
             logger.info("✅ Error message playback started (tag=%s)", debug_tag)
         except Exception as play_err:
-            logger.error("Failed to play error message (tag=%s): %s", debug_tag, str(play_err))
-            import traceback
-            logger.error("Traceback: %s", traceback.format_exc())
+            if "8501" in str(play_err):
+                logger.warning("⚠️  speak_error_message skipped: call no longer Established (tag=%s).", debug_tag)
+            else:
+                logger.error("Failed to play error message (tag=%s): %s", debug_tag, str(play_err))
+                import traceback
+                logger.error("Traceback: %s", traceback.format_exc())
 
     except Exception as e:
         logger.error("❌ speak_error_message failed (tag=%s): %s", debug_tag, str(e))
@@ -2672,7 +3000,7 @@ async def handle_acs_webhook(request: web.Request) -> web.Response:
             if not events:
                 logger.warning("Received empty event array")
                 return web.json_response({"status": "received", "message": "Empty event array"}, status=200)
-            logger.info("📞 Received ACS Event Array with %d event(s)", len(events))
+            logger.info("%s Webhook batch received: count=%d", _TEST_FLOW_LOG_PREFIX, len(events))
         else:
             events = [raw_data]
         
@@ -2680,10 +3008,7 @@ async def handle_acs_webhook(request: web.Request) -> web.Response:
             # 记录收到的事件
             # Event Grid 使用 eventType，ACS Call Automation 使用 type 或 kind
             event_type = event_data.get("eventType") or event_data.get("type") or event_data.get("kind") or "Unknown"
-            logger.info("=" * 60)
-            logger.info("📞 Received ACS Event: %s", event_type)
-            logger.info("Event data: %s", json.dumps(event_data, indent=2, ensure_ascii=False))
-            logger.info("=" * 60)
+            logger.info("%s Webhook event: type=%s", _TEST_FLOW_LOG_PREFIX, event_type)
             
             # 处理 Event Grid 订阅验证事件（重要！）
             if event_type == "Microsoft.EventGrid.SubscriptionValidationEvent":

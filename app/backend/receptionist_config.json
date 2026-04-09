@@ -1,0 +1,38 @@
+{
+  "company_name": "George Fethers",
+  "welcome_message": "Welcome to George Fethers, how can I assist you today?",
+  "company_summary": "For over 150 years, George Fethers & Co. has helped shape Australia's built environment through a commitment to material excellence and design integrity. We supply premium architectural surfaces including natural timber pre-finished veneers, high-performance laminates, engineered timber flooring, and facade solutions.",
+  "office_address": "6/331 Ingles Street, Port Melbourne VIC 3207",
+  "office_hours": "Monday to Friday, 8:30 AM to 4:30 PM",
+  "warehouse_address": "6/212 Turner Street, Port Melbourne VIC 3207",
+  "warehouse_hours": "Monday to Friday, 7:00 AM to 3:30 PM",
+  "website_url": "https://gfethers.com.au/",
+  "general_email": "gfethers@gfethers.com.au",
+  "office_phone": "03 8652 8000",
+  "sales_rep": {
+    "name": "",
+    "phone": ""
+  },
+  "routing_contacts": {
+    "flooring": {
+      "label": "flooring",
+      "name": "Julia Nardella",
+      "phone": "04 3588 2470"
+    },
+    "panels": {
+      "label": "panels and veneers",
+      "name": "Biljana Dimoska",
+      "phone": "03 7048 0357"
+    },
+    "glass": {
+      "label": "glass",
+      "name": "Shelley Reynolds",
+      "phone": "1800449804"
+    },
+    "fibreglass": {
+      "label": "fibreglass",
+      "name": "Kerry Abdula",
+      "phone": "03 8652 8012"
+    }
+  }
+}

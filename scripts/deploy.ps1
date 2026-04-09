@@ -88,6 +88,9 @@ try {
     Write-Host ""
 
     azd deploy --service backend
+    if ($LASTEXITCODE -ne 0) {
+        throw "azd deploy failed with exit code $LASTEXITCODE. If you see an AADSTS or auth error above, run 'azd auth login' and retry."
+    }
 
     Write-Host ""
     Write-Host "=== Deploy Success ===" -ForegroundColor Green
