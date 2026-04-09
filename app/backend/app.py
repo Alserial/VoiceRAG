@@ -23,11 +23,12 @@ logger = logging.getLogger("voicerag")
 
 # 延迟导入 ACS handler，避免导入失败导致应用无法启动
 try:
-    from acs_call_handler import register_acs_routes
+    from acs_call_handler import handle_realtime_acs_phone_turn, register_acs_routes
     _acs_handler_available = True
 except ImportError as e:
     logger.warning("ACS call handler not available: %s", str(e))
     _acs_handler_available = False
+    handle_realtime_acs_phone_turn = None
     register_acs_routes = None
 
 # Store active calls: call_id -> call_info
@@ -171,6 +172,13 @@ async def create_app():
         attach_user_registration_tool(rtmt)
         attach_quote_management_tools(rtmt)
         logger.info("Quote extraction tool and user registration tool attached. Available tools: %s", list(rtmt.tools.keys()))
+
+        if _voice_entry_mode == "acs" and handle_realtime_acs_phone_turn is not None:
+            rtmt.acs_phone_turn_handler = handle_realtime_acs_phone_turn
+            logger.info(
+                "ACS Realtime phone chain configured to use ACS phone business logic "
+                "(receptionist/routing/quote flow) instead of the Web VoiceRAG intent flow"
+            )
 
         rtmt.attach_to_app(app, "/realtime", acs_path="/realtime/acs")
         logger.info("RTMiddleTier initialized with Azure OpenAI")

@@ -1242,6 +1242,24 @@ async def handle_call_connected_event(event_data: dict[str, Any]) -> None:
             if _use_acs_realtime_bridge():
                 session_key = _active_acs_calls[call_connection_id].get("caller_session_key") or "unknown-caller"
                 await start_realtime_bridge(call_connection_id, str(session_key))
+                welcome_playing = bool(_active_acs_calls[call_connection_id].get("welcome_playing"))
+                welcome_played = bool(_active_acs_calls[call_connection_id].get("welcome_played"))
+                if not welcome_playing and not welcome_played:
+                    logger.info(
+                        "%s Realtime phone connected; proactively playing configured welcome message via ACS TTS. call=%s welcome=%s",
+                        _TEST_FLOW_LOG_PREFIX,
+                        call_connection_id,
+                        WELCOME_MESSAGE,
+                    )
+                    await play_welcome_message(call_connection_id)
+                else:
+                    logger.info(
+                        "%s Welcome message already in progress or completed for realtime call=%s (playing=%s played=%s)",
+                        _TEST_FLOW_LOG_PREFIX,
+                        call_connection_id,
+                        welcome_playing,
+                        welcome_played,
+                    )
             else:
                 logger.info("Legacy ACS recognize flow enabled, playing welcome message instead of starting realtime bridge")
                 await play_welcome_message(call_connection_id)
@@ -1298,10 +1316,18 @@ async def handle_play_completed_event(event_data: dict[str, Any]) -> None:
         
         if call_connection_id and call_connection_id in _active_acs_calls:
             if operation_context == "welcome-tts":
-                # 欢迎语播放完成，启动第一次语音识别
                 _active_acs_calls[call_connection_id]["welcome_played"] = True
-                logger.info("%s Welcome playback finished; starting recognition. call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
-                await start_speech_recognition(call_connection_id)
+                _active_acs_calls[call_connection_id]["welcome_playing"] = False
+                if _use_acs_realtime_bridge():
+                    logger.info(
+                        "%s Welcome playback finished for realtime bridge; waiting for caller speech via GPT Realtime transport. call=%s",
+                        _TEST_FLOW_LOG_PREFIX,
+                        call_connection_id,
+                    )
+                else:
+                    # 欢迎语播放完成，启动第一次语音识别
+                    logger.info("%s Welcome playback finished; starting recognition. call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+                    await start_speech_recognition(call_connection_id)
             elif operation_context == "answer-tts":
                 # 回答播放完成，重新启动识别，实现多轮对话
                 if _active_acs_calls[call_connection_id].get("hangup_after_playback"):
@@ -2068,6 +2094,130 @@ async def generate_answer_text_with_gpt(
         if _timer is not None:
             _timer.set_path("exception")
         return fallback, False, False
+
+
+def resolve_call_connection_id_for_realtime_phone(
+    session_id: Optional[str] = None,
+    call_connection_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the ACS call_connection_id for a Realtime phone session.
+
+    Realtime ACS websocket sessions are keyed by caller/session for continuity,
+    while ACS business logic stores state under call_connection_id. This helper
+    maps the Realtime transport session back to the ACS call state.
+    """
+    if call_connection_id and call_connection_id in _active_acs_calls:
+        return call_connection_id
+
+    if session_id:
+        for active_call_connection_id, call_info in _active_acs_calls.items():
+            if str(call_info.get("caller_session_key") or "") == str(session_id):
+                return active_call_connection_id
+
+    return call_connection_id or session_id
+
+
+async def handle_realtime_acs_phone_turn(
+    transcript: str,
+    session_id: Optional[str],
+    call_connection_id: Optional[str],
+    realtime_server_ws: Any,
+) -> None:
+    """Run ACS phone business logic on top of the Realtime phone transport.
+
+    This keeps the ACS receptionist and quote behavior as the source of truth,
+    while Realtime handles low-latency ASR/TTS transport.
+    """
+    resolved_call_connection_id = resolve_call_connection_id_for_realtime_phone(
+        session_id=session_id,
+        call_connection_id=call_connection_id,
+    )
+    user_text = (transcript or "").strip()
+
+    logger.info(
+        "%s Realtime phone turn start: session=%s call=%s transcript=%s",
+        _TEST_FLOW_LOG_PREFIX,
+        session_id,
+        resolved_call_connection_id,
+        user_text[:160],
+    )
+
+    if not user_text:
+        logger.warning(
+            "%s Realtime phone turn skipped: empty transcript session=%s call=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            session_id,
+            resolved_call_connection_id,
+        )
+        return
+
+    if resolved_call_connection_id and resolved_call_connection_id not in _active_acs_calls:
+        _active_acs_calls[resolved_call_connection_id] = {
+            "call_connection_id": resolved_call_connection_id,
+            "status": "active",
+            "caller_session_key": session_id,
+            "call_transcript": [],
+        }
+        logger.info(
+            "%s Realtime phone turn initialized missing call state: session=%s call=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            session_id,
+            resolved_call_connection_id,
+        )
+
+    if resolved_call_connection_id:
+        _reset_empty_recognition_count(resolved_call_connection_id)
+
+    turn_timer = _TurnTimer(resolved_call_connection_id or session_id or "realtime-phone").mark_asr_done()
+    turn_timer.mark_response_start()
+    answer_text, quote_updated, _already_played = await generate_answer_text_with_gpt(
+        user_text,
+        resolved_call_connection_id,
+        _timer=turn_timer,
+    )
+    turn_timer.mark_response_end()
+
+    answer_text = (answer_text or "").strip()
+    if not answer_text:
+        logger.warning(
+            "%s Realtime phone turn produced empty answer: session=%s call=%s quote_updated=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            session_id,
+            resolved_call_connection_id,
+            quote_updated,
+        )
+        return
+
+    logger.info(
+        "%s Realtime phone answer ready: session=%s call=%s answer_len=%d quote_updated=%s",
+        _TEST_FLOW_LOG_PREFIX,
+        session_id,
+        resolved_call_connection_id,
+        len(answer_text),
+        quote_updated,
+    )
+
+    logger.info(
+        "%s Realtime phone sending response.create: session=%s call=%s answer_preview=%s",
+        _TEST_FLOW_LOG_PREFIX,
+        session_id,
+        resolved_call_connection_id,
+        answer_text[:200],
+    )
+    await realtime_server_ws.send_json({
+        "type": "response.create",
+        "response": {
+            "modalities": ["audio", "text"],
+            "instructions": f"Say exactly this sentence in English: {answer_text}",
+        },
+    })
+    turn_timer.mark_tts_start().emit()
+    logger.info(
+        "%s Realtime phone response dispatched via GPT Realtime TTS: session=%s call=%s",
+        _TEST_FLOW_LOG_PREFIX,
+        session_id,
+        resolved_call_connection_id,
+    )
 
 
 def _build_quote_confirmation_recap(quote_state: dict) -> str:

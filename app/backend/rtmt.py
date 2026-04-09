@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 
 import aiohttp
@@ -77,6 +77,7 @@ class RTMiddleTier:
     _user_registered = {}    # Track user registration status per session
     _quote_states = {}       # Track structured quote state per session
     _user_states = {}        # Track structured user registration state per session
+    acs_phone_turn_handler: Optional[Callable[[str, Optional[str], Optional[str], aiohttp.ClientWebSocketResponse], Awaitable[None]]] = None
 
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
         self.endpoint = endpoint
@@ -119,17 +120,28 @@ class RTMiddleTier:
                 "threshold": 0.5,
                 "prefix_padding_ms": 300,
                 "silence_duration_ms": 1000,
-                "create_response": True,
+                # ACS phone calls use server-side ACS business logic to decide what to say next.
+                # Realtime is transport + ASR + TTS here; it must not run the web/browser intent flow.
+                "create_response": False,
             },
             "input_audio_transcription": {
                 "model": "whisper-1",
             },
             "input_audio_format": "pcm16",
             "output_audio_format": "pcm16",
+            "instructions": (
+                "You are the audio transport layer for an ACS phone call. "
+                "Do not decide the business flow yourself. "
+                "Wait for server-issued response.create instructions."
+            ),
+            "tool_choice": "none",
+            "tools": [],
         }
+        if self.voice_choice is not None:
+            session["voice"] = self.voice_choice
         return {
             "type": "session.update",
-            "session": self._apply_session_defaults(session),
+            "session": session,
         }
 
     @staticmethod
@@ -215,6 +227,8 @@ class RTMiddleTier:
     async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
+        client_source = self._get_client_source(client_ws)
+        session_id = getattr(client_ws, "session_id", None)
         if message is not None:
             # Debug: Log message types that might contain user input
             msg_type = message.get("type", "")
@@ -246,6 +260,13 @@ class RTMiddleTier:
                     }
                     # Initialize user registration status
                     self._user_registered[session_id] = False
+                    if client_source == "acs":
+                        logger.info(
+                            "ACS realtime session.created: session_id=%s upstream_session_id=%s voice=%s",
+                            session_id,
+                            session.get("id"),
+                            session.get("voice"),
+                        )
                     updated_message = json.dumps(message)
 
                 case "response.output_item.added":
@@ -316,7 +337,17 @@ class RTMiddleTier:
                                 "content": transcript,
                                 "timestamp": datetime.now().isoformat()
                             })
-                            await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
+                            if client_source == "acs" and self.acs_phone_turn_handler is not None:
+                                call_connection_id = getattr(client_ws, "call_connection_id", None)
+                                logger.info(
+                                    "Dispatching ACS phone turn to ACS business logic: session_id=%s call_connection_id=%s transcript=%s",
+                                    session_id,
+                                    call_connection_id,
+                                    transcript[:160],
+                                )
+                                await self.acs_phone_turn_handler(transcript, session_id, call_connection_id, server_ws)
+                            else:
+                                await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
                         else:
                             logger.warning("User input transcription message received but no transcript found. Message keys: %s", list(message.keys()))
                             logger.debug("Full message: %s", json.dumps(message)[:500])
@@ -391,8 +422,25 @@ class RTMiddleTier:
                                 replace = True
                         if replace:
                             updated_message = json.dumps(message)
+                    if client_source == "acs":
+                        response = message.get("response", {}) or {}
+                        outputs = response.get("output") or []
+                        output_types = [
+                            output.get("type")
+                            for output in outputs
+                            if isinstance(output, dict)
+                        ]
+                        logger.info(
+                            "ACS realtime response.done: session_id=%s status=%s output_types=%s audio_chunks=%s transcript_preview=%s",
+                            session_id,
+                            response.get("status"),
+                            output_types,
+                            getattr(client_ws, "acs_audio_delta_count", 0),
+                            getattr(client_ws, "acs_audio_transcript_preview", ""),
+                        )
+                        client_ws.acs_audio_delta_count = 0
+                        client_ws.acs_audio_transcript_preview = ""
                     # Record assistant response
-                    session_id = getattr(client_ws, "session_id", None)
                     if session_id and session_id in self._conversation_logs:
                         response_text = ""
                         if "response" in message and "output" in message["response"]:
@@ -410,7 +458,6 @@ class RTMiddleTier:
                 
                 case "response.audio_transcript.delta":
                     # Record assistant transcript delta
-                    session_id = getattr(client_ws, "session_id", None)
                     if session_id and session_id in self._conversation_logs:
                         transcript_delta = message.get("delta", "")
                         if transcript_delta:
@@ -424,6 +471,35 @@ class RTMiddleTier:
                                     "content": transcript_delta,
                                     "timestamp": datetime.now().isoformat()
                                 })
+                    if client_source == "acs":
+                        transcript_delta = message.get("delta", "")
+                        if transcript_delta:
+                            preview = f"{getattr(client_ws, 'acs_audio_transcript_preview', '')}{transcript_delta}"
+                            client_ws.acs_audio_transcript_preview = preview[:200]
+                            logger.info(
+                                "ACS realtime transcript delta: session_id=%s preview=%s",
+                                session_id,
+                                client_ws.acs_audio_transcript_preview,
+                            )
+
+                case "response.audio.delta":
+                    if client_source == "acs":
+                        chunk_count = int(getattr(client_ws, "acs_audio_delta_count", 0) or 0) + 1
+                        client_ws.acs_audio_delta_count = chunk_count
+                        if chunk_count == 1 or chunk_count % 20 == 0:
+                            logger.info(
+                                "ACS realtime response.audio.delta: session_id=%s chunk_index=%d",
+                                session_id,
+                                chunk_count,
+                            )
+
+                case "error":
+                    if client_source == "acs":
+                        logger.error(
+                            "ACS realtime upstream error event: session_id=%s payload=%s",
+                            session_id,
+                            json.dumps(message),
+                        )
 
         return updated_message
 
@@ -603,12 +679,14 @@ class RTMiddleTier:
                 logger.warning("Realtime->ACS translation failed: empty response.audio.delta session_id=%s", getattr(ws, "session_id", "unknown"))
                 return
             await ws.send_json(self._build_acs_audio_message(audio_b64))
-            logger.debug(
-                "Realtime->ACS translated event: source_type=%s target_kind=AudioData session_id=%s bytes_b64=%d",
-                msg_type,
-                getattr(ws, "session_id", "unknown"),
-                len(audio_b64),
-            )
+            chunk_count = int(getattr(ws, "acs_audio_delta_count", 0) or 0)
+            if chunk_count == 1 or chunk_count % 20 == 0:
+                logger.info(
+                    "Realtime->ACS translated audio chunk: session_id=%s chunk_index=%d bytes_b64=%d",
+                    getattr(ws, "session_id", "unknown"),
+                    chunk_count,
+                    len(audio_b64),
+                )
             return
 
         if msg_type in {"input_audio_buffer.speech_started", "response.cancelled"}:
@@ -638,6 +716,8 @@ class RTMiddleTier:
         ws.client_source = "acs"
         ws.acs_session_initialized = False
         ws.acs_buffer_has_audio = False
+        ws.acs_audio_delta_count = 0
+        ws.acs_audio_transcript_preview = ""
 
         target_ws = await self._open_realtime_target_ws(ws)
         if target_ws is None:
@@ -716,6 +796,7 @@ class RTMiddleTier:
         requested_session_id = request.query.get("session") or request.headers.get("x-ms-call-connection-id")
         if requested_session_id:
             ws.session_id = requested_session_id
+        ws.call_connection_id = request.headers.get("x-ms-call-connection-id")
         logger.info(
             "ACS media websocket connected: path=%s session=%s call_connection_id=%s correlation_id=%s operation_context=%s",
             request.path,
