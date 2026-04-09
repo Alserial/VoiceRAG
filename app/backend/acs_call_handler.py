@@ -24,6 +24,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from typing import Any, Optional
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -72,6 +73,107 @@ _ACS_TTS_LOCALE = os.environ.get("ACS_TTS_LOCALE", "en-AU")
 # Set ENABLE_QUOTE=false to disable quote generation and route all quote requests
 # to the receptionist / human-assistance path instead.
 _ENABLE_QUOTE: bool = os.environ.get("ENABLE_QUOTE", "true").strip().lower() != "false"
+
+# ── Turn latency instrumentation ────────────────────────────────────────────
+_LATENCY_LOG_PREFIX = "LATENCY"
+
+
+class _TurnTimer:
+    """Lightweight per-turn timestamp collector.
+
+    All public methods return `self` so they can be chained, but they are
+    purely additive — no existing control flow is altered.
+
+    Stages (in pipeline order):
+        asr_done          – user text received from ASR
+        classification_start / classification_end  – top-level intent gate
+        response_start / response_end              – generate_answer_text_with_gpt
+        tts_start                                  – play_answer_message dispatched
+    """
+
+    __slots__ = (
+        "call_id", "turn_id",
+        "asr_done",
+        "classification_start", "classification_end",
+        "response_start", "response_end",
+        "tts_start",
+        "path",
+    )
+
+    def __init__(self, call_id: str) -> None:
+        self.call_id = call_id
+        self.turn_id = str(uuid.uuid4())[:8]
+        self.asr_done: Optional[float] = None
+        self.classification_start: Optional[float] = None
+        self.classification_end: Optional[float] = None
+        self.response_start: Optional[float] = None
+        self.response_end: Optional[float] = None
+        self.tts_start: Optional[float] = None
+        self.path: Optional[str] = None
+
+    @staticmethod
+    def _now() -> float:
+        return time.monotonic()
+
+    def mark_asr_done(self) -> "_TurnTimer":
+        self.asr_done = self._now()
+        return self
+
+    def mark_classification_start(self) -> "_TurnTimer":
+        self.classification_start = self._now()
+        return self
+
+    def mark_classification_end(self) -> "_TurnTimer":
+        self.classification_end = self._now()
+        return self
+
+    def mark_response_start(self) -> "_TurnTimer":
+        self.response_start = self._now()
+        return self
+
+    def mark_response_end(self) -> "_TurnTimer":
+        self.response_end = self._now()
+        return self
+
+    def mark_tts_start(self) -> "_TurnTimer":
+        self.tts_start = self._now()
+        return self
+
+    def set_path(self, path: str) -> "_TurnTimer":
+        self.path = path
+        return self
+
+    @staticmethod
+    def _ms(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        return round((b - a) * 1000, 1)
+
+    def emit(self) -> None:
+        """Emit a single structured latency log entry for this turn."""
+        asr_to_classification_ms = self._ms(self.asr_done, self.classification_start)
+        classification_latency_ms = self._ms(self.classification_start, self.classification_end)
+        classification_to_response_ms = self._ms(
+            self.classification_end if self.classification_end is not None else self.asr_done,
+            self.response_start,
+        )
+        response_latency_ms = self._ms(self.response_start, self.response_end)
+        response_to_tts_ms = self._ms(self.response_end, self.tts_start)
+        total_turn_latency_ms = self._ms(self.asr_done, self.tts_start)
+
+        entry = {
+            "call_id": self.call_id,
+            "turn_id": self.turn_id,
+            "path": self.path,
+            "asr_to_classification_ms": asr_to_classification_ms,
+            "classification_latency_ms": classification_latency_ms,
+            "classification_to_response_ms": classification_to_response_ms,
+            "response_latency_ms": response_latency_ms,
+            "response_to_tts_ms": response_to_tts_ms,
+            "total_turn_latency_ms": total_turn_latency_ms,
+        }
+        logger.info("%s %s", _LATENCY_LOG_PREFIX, json.dumps(entry))
+# ── End turn latency instrumentation ────────────────────────────────────────
 
 # 延迟导入 ACS SDK，避免导入失败导致模块无法加载
 try:
@@ -1238,6 +1340,7 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
     4. 用 ACS TTS 播放回答
     """
     try:
+        _turn_timer: Optional[_TurnTimer] = None  # initialised after ASR text is confirmed
         data = event_data.get("data", {}) or {}
         call_connection_id = data.get("callConnectionId")
 
@@ -1300,6 +1403,7 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
 
         logger.info("%s Transcript extracted: call=%s text=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, user_text[:160])
         _reset_empty_recognition_count(call_connection_id)
+        _turn_timer = _TurnTimer(call_connection_id or "no-call-id").mark_asr_done()
 
         # 初始化通话的报价状态（如果还没有）
         if call_connection_id and call_connection_id not in _active_acs_calls:
@@ -1328,9 +1432,11 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
             
             # 先更新报价状态（提取信息）；回答文本生成完成后再一次性播报
             logger.info("%s Generating answer: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+            _turn_timer.mark_response_start()
             answer_text, quote_updated, already_played = await generate_answer_text_with_gpt(
-                user_text, call_connection_id
+                user_text, call_connection_id, _timer=_turn_timer
             )
+            _turn_timer.mark_response_end()
             
             # 重新获取更新后的报价状态
             updated_call_info = _active_acs_calls.get(call_connection_id, {})
@@ -1356,14 +1462,21 @@ async def handle_recognize_completed(event_data: dict[str, Any]) -> None:
         # 播放回答：ACS 现在统一等完整文本生成后再一次性 TTS 播报
         if call_connection_id and not already_played:
             logger.info("%s Handing answer to TTS: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            _turn_timer.mark_tts_start().emit()
             await play_answer_message(call_connection_id, answer_text)
+        elif call_connection_id and already_played:
+            # Answer was streamed / played inside generate_answer_text_with_gpt; no TTS here.
+            _turn_timer.set_path((_turn_timer.path or "") + "+already_played").emit()
         elif not call_connection_id:
             logger.warning("No call_connection_id in RecognizeCompleted event; cannot play answer.")
+            _turn_timer.set_path("no_call_id").emit()
 
     except Exception as e:
         logger.error("Error handling RecognizeCompleted event: %s", str(e))
         import traceback
         logger.error("Traceback: %s", traceback.format_exc())
+        if _turn_timer is not None:
+            _turn_timer.set_path("exception").emit()
         # 告诉来电者当前问答流程出了问题，方便你感知
         try:
             data = event_data.get("data", {}) or {}
@@ -1397,7 +1510,11 @@ async def handle_recognize_failed_event(event_data: dict[str, Any]) -> None:
         logger.error("Traceback: %s", traceback.format_exc())
 
 
-async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Optional[str] = None) -> tuple[str, bool, bool]:
+async def generate_answer_text_with_gpt(
+    user_text: str,
+    call_connection_id: Optional[str] = None,
+    _timer: Optional["_TurnTimer"] = None,
+) -> tuple[str, bool, bool]:
     """
     使用 Azure OpenAI 根据用户语音转成的文本生成回答（电话版 Q&A 核心逻辑）。
     
@@ -1420,6 +1537,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         from openai import AzureOpenAI
     except Exception as e:
         logger.warning("Azure OpenAI SDK not available, using fallback answer. Error: %s", str(e))
+        if _timer is not None:
+            _timer.set_path("sdk_unavailable")
         return fallback, False, False
 
     openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -1433,6 +1552,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
     # 立即输出使用的模型信息
     if not openai_endpoint or not openai_deployment:
         logger.warning("Azure OpenAI endpoint/deployment not configured. Using fallback answer.")
+        if _timer is not None:
+            _timer.set_path("no_endpoint")
         return fallback, False, False
 
     if llm_key:
@@ -1521,6 +1642,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                 answer_text = "I wasn't able to send the quote just now. Please try again in a moment."
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from explicit confirmation flow: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("quote_confirmation")
             return answer_text, False, False
 
         pending_recap = _get_pending_quote_recap(call_connection_id)
@@ -1541,6 +1664,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                 answer_text = _build_quote_recap_follow_up(pending_recap.get("requested_fields", []))
                 _append_assistant_message(call_connection_id, answer_text)
                 logger.info("Answer text from pending-recap follow-up: %s", answer_text)
+                if _timer is not None:
+                    _timer.set_path("pending_recap_followup")
                 return answer_text, False, False
 
             _clear_pending_quote_recap(call_connection_id)
@@ -1556,6 +1681,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                 answer_text = f"{recap} {follow_up}"
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from pending-recap resolution: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("pending_recap_resolved")
             return answer_text, False, False
 
         pending_update = _get_pending_quote_update(call_connection_id)
@@ -1594,6 +1721,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     answer_text = _build_quote_update_follow_up(remaining_fields)
                     _append_assistant_message(call_connection_id, answer_text)
                     logger.info("Answer text from partial pending-update resolution: %s", answer_text)
+                    if _timer is not None:
+                        _timer.set_path("pending_update_partial")
                     return answer_text, quote_updated, False
 
                 _clear_pending_quote_update(call_connection_id)
@@ -1610,18 +1739,24 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     _set_awaiting_quote_confirmation(call_connection_id)
                 _append_assistant_message(call_connection_id, answer_text)
                 logger.info("Answer text from pending-update resolution: %s", answer_text)
+                if _timer is not None:
+                    _timer.set_path("pending_update_resolved")
                 return answer_text, quote_updated, False
 
             _set_pending_quote_update(call_connection_id, {"requested_fields": requested_fields or pending_update.get("requested_fields", [])})
             answer_text = _build_quote_update_follow_up(requested_fields or pending_update.get("requested_fields", []))
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from pending-update follow-up: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("pending_update_followup")
             return answer_text, False, False
-        
+
         # ── TOP-LEVEL INTENT GATE ──────────────────────────────────────────────
         # Classify the current utterance BEFORE touching the quote planner.
         # Non-quote intents (company_info, routing, general_qa) bypass quote
         # tools entirely and route straight to the receptionist path.
+        if _timer is not None:
+            _timer.mark_classification_start()
         top_intent = await _classify_top_level_intent(
             client,
             openai_deployment,
@@ -1630,6 +1765,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             has_active_quote_state=bool(quote_state),
             quote_complete=bool(quote_state.get("is_complete")),
         )
+        if _timer is not None:
+            _timer.mark_classification_end()
         logger.info(
             "%s Top intent: call=%s primary=%s secondary=%s enter_quote=%s preserve=%s reason=%s",
             _TEST_FLOW_LOG_PREFIX,
@@ -1675,6 +1812,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     answer_text = f"{answer_text} Also, {reminder[0].lower() + reminder[1:]}"
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("%s Non-quote path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            if _timer is not None:
+                _timer.set_path("receptionist")
             return answer_text, False, already_played
         # ── END TOP-LEVEL INTENT GATE ──────────────────────────────────────────
 
@@ -1729,6 +1868,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
                 _append_assistant_message(call_connection_id, answer_text)
                 logger.info("Answer text from GPT tool flow: %s", answer_text)
+                if _timer is not None:
+                    _timer.set_path("quote_tool_email")
                 return answer_text, quote_updated, False
 
             missing_fields = quote_state.get("missing_fields", [])
@@ -1746,6 +1887,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from GPT tool flow: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("quote_tool_other")
             return answer_text, quote_updated, False
 
         behavior = await _classify_user_behavior_with_llm(
@@ -1791,6 +1934,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                     answer_text = _build_quote_update_follow_up(missing_requested_fields)
                     _append_assistant_message(call_connection_id, answer_text)
                     logger.info("Answer text from modify follow-up flow: %s", answer_text)
+                    if _timer is not None:
+                        _timer.set_path("quote_fallback_modify_partial")
                     return answer_text, quote_updated, False
                 tool_result = await _execute_acs_quote_tool_call(
                     "update_quote_info",
@@ -1824,6 +1969,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from fallback quote flow: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("quote_fallback")
             return answer_text, quote_updated, False
 
         if quote_state and behavior == "recall_quote_info":
@@ -1842,6 +1989,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                 answer_text = _build_quote_recap_follow_up(requested_fields)
                 _append_assistant_message(call_connection_id, answer_text)
                 logger.info("Answer text from recap clarification flow: %s", answer_text)
+                if _timer is not None:
+                    _timer.set_path("recall_clarification")
                 return answer_text, False, False
             if recap_request.get("needs_clarification") and not requested_fields:
                 _set_pending_quote_recap(
@@ -1851,6 +2000,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
                 answer_text = _build_quote_recap_follow_up([])
                 _append_assistant_message(call_connection_id, answer_text)
                 logger.info("Answer text from recap clarification flow: %s", answer_text)
+                if _timer is not None:
+                    _timer.set_path("recall_clarification_all")
                 return answer_text, False, False
             recap = _build_quote_targeted_recap(quote_state, requested_fields)
             if quote_state.get("is_complete"):
@@ -1865,6 +2016,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
 
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from GPT recall flow: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("recall_resolved")
             return answer_text, False, False
 
         if quote_state and not quote_state.get("is_complete") and behavior != "general_qa":
@@ -1873,6 +2026,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             answer_text = _generate_quote_collection_response(quote_state.get("missing_fields", []), quote_state)
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("Answer text from GPT pending-quote flow: %s", answer_text)
+            if _timer is not None:
+                _timer.set_path("pending_quote")
             return answer_text, False, False
 
         else:
@@ -1888,6 +2043,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             )
             _append_assistant_message(call_connection_id, answer_text)
             logger.info("%s Receptionist path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            if _timer is not None:
+                _timer.set_path("receptionist_qa")
             return answer_text, quote_updated, already_played
 
         logger.info("Answer text from GPT: %s", answer_text)
@@ -1896,6 +2053,8 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
         logger.error("Failed to generate answer text via Azure OpenAI: %s", str(e))
         import traceback
         logger.error("Traceback: %s", traceback.format_exc())
+        if _timer is not None:
+            _timer.set_path("exception")
         return fallback, False, False
 
 
