@@ -69,6 +69,9 @@ _TEST_TRANSFER_LOG_PREFIX = "TEST_TRANSFER"
 _TEST_FLOW_LOG_PREFIX = "TEST_FLOW"
 _ACS_TTS_VOICE = os.environ.get("ACS_TTS_VOICE", "en-AU-NatashaNeural")
 _ACS_TTS_LOCALE = os.environ.get("ACS_TTS_LOCALE", "en-AU")
+# Set ENABLE_QUOTE=false to disable quote generation and route all quote requests
+# to the receptionist / human-assistance path instead.
+_ENABLE_QUOTE: bool = os.environ.get("ENABLE_QUOTE", "true").strip().lower() != "false"
 
 # 延迟导入 ACS SDK，避免导入失败导致模块无法加载
 try:
@@ -1637,6 +1640,14 @@ async def generate_answer_text_with_gpt(user_text: str, call_connection_id: Opti
             top_intent["should_preserve_quote_state"],
             top_intent["reason"],
         )
+
+        if not _ENABLE_QUOTE and top_intent["should_enter_quote_flow"]:
+            logger.info(
+                "➡️  QUOTE DISABLED: overriding should_enter_quote_flow=True for call=%s (ENABLE_QUOTE=false)",
+                call_connection_id,
+            )
+            top_intent["should_enter_quote_flow"] = False
+            top_intent["primary_intent"] = "general_qa"
 
         if not top_intent["should_enter_quote_flow"]:
             logger.info("➡️  BRANCH: Non-quote intent (%s) — routing to receptionist path",
