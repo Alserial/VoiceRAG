@@ -172,7 +172,7 @@ async def create_app():
         attach_quote_management_tools(rtmt)
         logger.info("Quote extraction tool and user registration tool attached. Available tools: %s", list(rtmt.tools.keys()))
 
-        rtmt.attach_to_app(app, "/realtime")
+        rtmt.attach_to_app(app, "/realtime", acs_path="/realtime/acs")
         logger.info("RTMiddleTier initialized with Azure OpenAI")
     else:
         logger.warning("Azure OpenAI configuration not found. Voice features will be disabled. Quote API is still available.")

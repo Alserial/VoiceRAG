@@ -5,7 +5,7 @@ Azure Communication Services (ACS) Call Automation Handler
 这个模块实现了：
 1. 接收 ACS Call Automation 的 webhook 事件
 2. 自动接听来电
-3. 建立 ACS + /realtime WebSocket 音频桥接（mixed-mono）
+3. 建立 ACS + /realtime/acs WebSocket 音频桥接（mixed-mono）
 4. 记录通话状态
 
 环境变量配置：
@@ -13,7 +13,7 @@ Azure Communication Services (ACS) Call Automation Handler
 - ACS_CONNECTION_STRING: Azure Communication Services 连接字符串
 - ACS_CALLBACK_URL: 你的公网可访问的回调 URL (例如: https://yourapp.com/api/acs/calls/events)
 - ACS_PHONE_NUMBER: 你的 ACS 电话号码 (例如: +1234567890)
-- ACS_REALTIME_WS_URL: 可选，显式指定媒体桥接 WebSocket 地址（默认根据 ACS_CALLBACK_URL 推导为 wss://<host>/realtime）
+- ACS_REALTIME_WS_URL: 可选，显式指定媒体桥接 WebSocket 地址（默认根据 ACS_CALLBACK_URL 推导为 wss://<host>/realtime/acs）
 - ACS_USE_LEGACY_RECOGNIZE: 可选；当 VOICE_ENTRY_MODE=acs 时默认 false（使用 Realtime 桥接）；
   当 VOICE_ENTRY_MODE=web 时默认 true（向后兼容）。显式设置为 true 可强制启用 legacy 识别+TTS 流程作为 fallback。
 """
@@ -254,7 +254,7 @@ def _extract_caller_id(event_data: dict[str, Any]) -> str:
 
 
 def _build_realtime_ws_url(session_key: str) -> str:
-    """构造 ACS 媒体流目标 WebSocket（默认 /realtime，callerId 作为 session）。"""
+    """构造 ACS 媒体流目标 WebSocket（默认 /realtime/acs，callerId 作为 session）。"""
     explicit_ws_url = os.environ.get("ACS_REALTIME_WS_URL", "").strip()
     if explicit_ws_url:
         separator = "&" if "?" in explicit_ws_url else "?"
@@ -266,7 +266,7 @@ def _build_realtime_ws_url(session_key: str) -> str:
 
     parsed = urlparse(callback_url)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
-    realtime_path = "/realtime"
+    realtime_path = "/realtime/acs"
     return urlunparse((ws_scheme, parsed.netloc, realtime_path, "", f"session={quote(session_key)}", ""))
 
 
@@ -974,7 +974,7 @@ def _create_media_streaming_options(stream_url: str) -> Any:
 
 
 async def start_realtime_bridge(call_connection_id: str, session_key: str) -> None:
-    """启动 ACS -> /realtime WebSocket 媒体桥接。"""
+    """启动 ACS -> /realtime/acs WebSocket 媒体桥接。"""
     acs_client = get_acs_client()
     if not acs_client:
         logger.error("ACS client not available, cannot start realtime bridge")

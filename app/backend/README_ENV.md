@@ -23,6 +23,12 @@ ACS_CALLBACK_URL=https://your-ngrok-url.com/api/acs/calls/events
 
 **注意**：`ACS_CALLBACK_URL` 需要先启动 ngrok 获取 URL。
 
+如果你显式配置 `ACS_REALTIME_WS_URL`，请将它指向同一服务内的 ACS 专用桥接路由：
+
+```bash
+ACS_REALTIME_WS_URL=wss://your-host/realtime/acs
+```
+
 ### 3. 完整配置
 
 如果需要使用所有功能，参考 `env.example` 文件配置所有变量。

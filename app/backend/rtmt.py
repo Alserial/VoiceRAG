@@ -15,6 +15,10 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 logger = logging.getLogger("voicerag")
 
+_ACS_EXPECTED_AUDIO_ENCODING = "pcm"
+_ACS_EXPECTED_AUDIO_SAMPLE_RATE = 24000
+_ACS_EXPECTED_AUDIO_CHANNELS = 1
+
 class ToolResultDirection(Enum):
     TO_SERVER = 1
     TO_CLIENT = 2
@@ -85,6 +89,128 @@ class RTMiddleTier:
         else:
             self._token_provider = get_bearer_token_provider(credentials, "https://cognitiveservices.azure.com/.default")
             self._token_provider() # Warm up during startup so we have a token cached when the first request arrives
+
+    @staticmethod
+    def _get_client_source(ws: web.WebSocketResponse) -> str:
+        return getattr(ws, "client_source", "web")
+
+    def _client_can_receive_internal_events(self, ws: web.WebSocketResponse) -> bool:
+        return self._get_client_source(ws) == "web"
+
+    def _apply_session_defaults(self, session: dict[str, Any]) -> dict[str, Any]:
+        if self.system_message is not None:
+            session["instructions"] = self.system_message
+        if self.temperature is not None:
+            session["temperature"] = self.temperature
+        if self.max_tokens is not None:
+            session["max_response_output_tokens"] = self.max_tokens
+        if self.disable_audio is not None:
+            session["disable_audio"] = self.disable_audio
+        if self.voice_choice is not None:
+            session["voice"] = self.voice_choice
+        session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
+        session["tools"] = [tool.schema for tool in self.tools.values()]
+        return session
+
+    def _build_acs_session_update_event(self) -> dict[str, Any]:
+        session: dict[str, Any] = {
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 1000,
+                "create_response": True,
+            },
+            "input_audio_transcription": {
+                "model": "whisper-1",
+            },
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+        }
+        return {
+            "type": "session.update",
+            "session": self._apply_session_defaults(session),
+        }
+
+    @staticmethod
+    def _is_acs_request(request: web.Request) -> bool:
+        header_markers = (
+            "x-ms-call-connection-id",
+            "x-ms-call-correlation-id",
+            "x-ms-call-media-streaming-operation-context",
+        )
+        if any(request.headers.get(header) for header in header_markers):
+            return True
+        return request.query.get("source", "").strip().lower() == "acs"
+
+    @staticmethod
+    def _extract_acs_value(payload: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        for key in keys:
+            if key in payload:
+                return payload[key]
+        return default
+
+    async def _open_realtime_target_ws(self, ws: web.WebSocketResponse) -> Optional[aiohttp.ClientWebSocketResponse]:
+        params = {"api-version": self.api_version, "deployment": self.deployment}
+        headers: dict[str, str]
+        if self.key is not None:
+            headers = {"api-key": self.key}
+        else:
+            headers = {"Authorization": f"Bearer {self._token_provider()}"}
+        request_headers = getattr(ws, "request_headers", {})
+        if "x-ms-client-request-id" in request_headers:
+            headers["x-ms-client-request-id"] = request_headers["x-ms-client-request-id"]
+
+        session = aiohttp.ClientSession(base_url=self.endpoint)
+        max_attempts = 4
+        try:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    target_ws = await session.ws_connect("/openai/realtime", headers=headers, params=params)
+                    target_ws._owning_session = session  # type: ignore[attr-defined]
+                    return target_ws
+                except aiohttp.WSServerHandshakeError as exc:
+                    if exc.status == 429 and attempt < max_attempts:
+                        delay_seconds = min(8, 2 ** (attempt - 1))
+                        logger.warning(
+                            "Azure OpenAI realtime handshake hit 429 (attempt %d/%d). Retrying in %ss.",
+                            attempt,
+                            max_attempts,
+                            delay_seconds,
+                        )
+                        await asyncio.sleep(delay_seconds)
+                        continue
+                    logger.error(
+                        "Failed to connect to Azure OpenAI realtime websocket: status=%s, message=%s, source=%s",
+                        exc.status,
+                        str(exc),
+                        self._get_client_source(ws),
+                    )
+                    if self._client_can_receive_internal_events(ws):
+                        await ws.send_json({
+                            "type": "extension.middle_tier_error",
+                            "error": "realtime_handshake_failed",
+                            "status": exc.status,
+                        })
+                    await ws.close(code=1013, message=b"Upstream realtime unavailable")
+                    await session.close()
+                    return None
+            await ws.close(code=1013, message=b"Upstream realtime unavailable")
+            await session.close()
+            return None
+        except Exception:
+            await session.close()
+            raise
+
+    @staticmethod
+    async def _close_realtime_target_ws(target_ws: aiohttp.ClientWebSocketResponse) -> None:
+        owning_session = getattr(target_ws, "_owning_session", None)
+        try:
+            if not target_ws.closed:
+                await target_ws.close()
+        finally:
+            if owning_session is not None and not owning_session.closed:
+                await owning_session.close()
 
     async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
@@ -234,7 +360,7 @@ class RTMiddleTier:
                                 "output": result.to_text()
                             }
                         })
-                        if result.destination == ToolResultDirection.TO_CLIENT:
+                        if result.destination == ToolResultDirection.TO_CLIENT and self._client_can_receive_internal_events(client_ws):
                             # Send tool result to client for display
                             logger.info("Sending tool result to client: tool_name=%s", item["name"])
                             await client_ws.send_json({
@@ -243,6 +369,12 @@ class RTMiddleTier:
                                 "tool_name": item["name"],
                                 "tool_result": result.to_text()
                             })
+                        elif result.destination == ToolResultDirection.TO_CLIENT:
+                            logger.info(
+                                "Tool result kept server-side for non-web client: source=%s tool_name=%s",
+                                self._get_client_source(client_ws),
+                                item["name"],
+                            )
                         updated_message = None
 
                 case "response.done":
@@ -309,19 +441,7 @@ class RTMiddleTier:
                     logger.warning("Realtime client message missing 'type': keys=%s", list(message.keys()))
                     return updated_message
                 case "session.update":
-                    session = message["session"]
-                    if self.system_message is not None:
-                        session["instructions"] = self.system_message
-                    if self.temperature is not None:
-                        session["temperature"] = self.temperature
-                    if self.max_tokens is not None:
-                        session["max_response_output_tokens"] = self.max_tokens
-                    if self.disable_audio is not None:
-                        session["disable_audio"] = self.disable_audio
-                    if self.voice_choice is not None:
-                        session["voice"] = self.voice_choice
-                    session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
-                    session["tools"] = [tool.schema for tool in self.tools.values()]
+                    session = self._apply_session_defaults(message["session"])
                     updated_message = json.dumps(message)
 
         return updated_message
@@ -329,93 +449,282 @@ class RTMiddleTier:
     async def _forward_messages(self, ws: web.WebSocketResponse):
         session_id = getattr(ws, "session_id", str(uuid4()))
         ws.session_id = session_id
+        target_ws = await self._open_realtime_target_ws(ws)
+        if target_ws is None:
+            return
 
-        async with aiohttp.ClientSession(base_url=self.endpoint) as session:
-            params = {"api-version": self.api_version, "deployment": self.deployment}
-            headers = {}
-            if "x-ms-client-request-id" in ws.headers:
-                headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
-            if self.key is not None:
-                headers = {"api-key": self.key}
-            else:
-                headers = {"Authorization": f"Bearer {self._token_provider()}"}  # NOTE: no async version of token provider, maybe refresh token on a timer?
+        try:
+            async def from_client_to_server():
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        new_msg = await self._process_message_to_server(msg, ws)
+                        if new_msg is not None:
+                            await target_ws.send_str(new_msg)
+                    else:
+                        logger.warning("Unexpected client websocket message type: %s", msg.type)
 
-            target_ws = None
-            max_attempts = 4
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    target_ws = await session.ws_connect("/openai/realtime", headers=headers, params=params)
-                    break
-                except aiohttp.WSServerHandshakeError as exc:
-                    if exc.status == 429 and attempt < max_attempts:
-                        delay_seconds = min(8, 2 ** (attempt - 1))
-                        logger.warning(
-                            "Azure OpenAI realtime handshake hit 429 (attempt %d/%d). Retrying in %ss.",
-                            attempt,
-                            max_attempts,
-                            delay_seconds,
-                        )
-                        await asyncio.sleep(delay_seconds)
-                        continue
-                    logger.error(
-                        "Failed to connect to Azure OpenAI realtime websocket: status=%s, message=%s",
-                        exc.status,
-                        str(exc),
-                    )
-                    await ws.send_json({
-                        "type": "extension.middle_tier_error",
-                        "error": "realtime_handshake_failed",
-                        "status": exc.status,
-                    })
-                    await ws.close(code=1013, message=b"Upstream realtime unavailable")
-                    return
+                logger.info("Closing Azure OpenAI realtime websocket for source=%s", self._get_client_source(ws))
+                await target_ws.close()
 
-            if target_ws is None:
-                await ws.close(code=1013, message=b"Upstream realtime unavailable")
-                return
+            async def from_server_to_client():
+                async for msg in target_ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        new_msg = await self._process_message_to_client(msg, ws, target_ws)
+                        if new_msg is not None:
+                            await ws.send_str(new_msg)
+                    else:
+                        logger.warning("Unexpected realtime server websocket message type: %s", msg.type)
 
             try:
-                async def from_client_to_server():
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_server(msg, ws)
-                            if new_msg is not None:
-                                await target_ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-
-                    print("Closing OpenAI's realtime socket connection.")
-                    await target_ws.close()
-
-                async def from_server_to_client():
-                    async for msg in target_ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_client(msg, ws, target_ws)
-                            if new_msg is not None:
-                                await ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-
-                try:
-                    await asyncio.gather(from_client_to_server(), from_server_to_client())
-                except ConnectionResetError:
-                    # Ignore the errors resulting from the client disconnecting the socket
-                    pass
-                finally:
-                    # Save conversation and send email when session ends
-                    await self._save_and_send_conversation(session_id)
+                await asyncio.gather(from_client_to_server(), from_server_to_client())
+            except ConnectionResetError:
+                pass
             finally:
-                if not target_ws.closed:
-                    await target_ws.close()
+                await self._save_and_send_conversation(session_id)
+        finally:
+            await self._close_realtime_target_ws(target_ws)
+
+    async def _send_acs_session_update(self, target_ws: aiohttp.ClientWebSocketResponse, ws: web.WebSocketResponse) -> None:
+        if getattr(ws, "acs_session_initialized", False):
+            return
+
+        session_update = self._build_acs_session_update_event()
+        await target_ws.send_json(session_update)
+        ws.acs_session_initialized = True
+        logger.info(
+            "ACS->Realtime translated event: session.update session_id=%s input_audio_format=%s output_audio_format=%s voice=%s",
+            getattr(ws, "session_id", "unknown"),
+            session_update["session"].get("input_audio_format"),
+            session_update["session"].get("output_audio_format"),
+            session_update["session"].get("voice"),
+        )
+
+    async def _translate_acs_message_to_realtime(
+        self,
+        payload: dict[str, Any],
+        ws: web.WebSocketResponse,
+        target_ws: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        kind = self._extract_acs_value(payload, "kind", "Kind", default="Unknown")
+        logger.info(
+            "ACS websocket message received: session_id=%s kind=%s keys=%s",
+            getattr(ws, "session_id", "unknown"),
+            kind,
+            list(payload.keys()),
+        )
+
+        if kind == "AudioMetadata":
+            metadata = self._extract_acs_value(payload, "audioMetadata", "AudioMetadata", default={}) or {}
+            encoding = str(self._extract_acs_value(metadata, "encoding", "Encoding", default="")).lower()
+            sample_rate = self._extract_acs_value(metadata, "sampleRate", "SampleRate", default=None)
+            channels = self._extract_acs_value(metadata, "channels", "Channels", default=None)
+            ws.acs_audio_metadata = {
+                "encoding": encoding,
+                "sample_rate": sample_rate,
+                "channels": channels,
+            }
+            logger.info(
+                "ACS audio metadata: session_id=%s encoding=%s sample_rate=%s channels=%s expected_encoding=%s expected_sample_rate=%s expected_channels=%s",
+                getattr(ws, "session_id", "unknown"),
+                encoding or "unknown",
+                sample_rate,
+                channels,
+                _ACS_EXPECTED_AUDIO_ENCODING,
+                _ACS_EXPECTED_AUDIO_SAMPLE_RATE,
+                _ACS_EXPECTED_AUDIO_CHANNELS,
+            )
+            if encoding and encoding != _ACS_EXPECTED_AUDIO_ENCODING:
+                logger.warning("ACS audio encoding mismatch: got=%s expected=%s", encoding, _ACS_EXPECTED_AUDIO_ENCODING)
+            if sample_rate not in (None, _ACS_EXPECTED_AUDIO_SAMPLE_RATE):
+                logger.warning("ACS audio sample rate mismatch: got=%s expected=%s", sample_rate, _ACS_EXPECTED_AUDIO_SAMPLE_RATE)
+            if channels not in (None, _ACS_EXPECTED_AUDIO_CHANNELS):
+                logger.warning("ACS audio channel mismatch: got=%s expected=%s", channels, _ACS_EXPECTED_AUDIO_CHANNELS)
+            await self._send_acs_session_update(target_ws, ws)
+            return
+
+        if kind == "AudioData":
+            await self._send_acs_session_update(target_ws, ws)
+            audio_wrapper = self._extract_acs_value(payload, "audioData", "AudioData", default={}) or {}
+            audio_b64 = self._extract_acs_value(audio_wrapper, "data", "Data", default="")
+            silent = self._extract_acs_value(audio_wrapper, "silent", "Silent", default=None)
+            participant = self._extract_acs_value(audio_wrapper, "participantRawID", "ParticipantRawID", default=None)
+            if not audio_b64:
+                logger.warning("ACS audio translation failed: missing audio payload session_id=%s", getattr(ws, "session_id", "unknown"))
+                return
+            ws.acs_buffer_has_audio = True
+            translated_event = {
+                "type": "input_audio_buffer.append",
+                "audio": audio_b64,
+            }
+            await target_ws.send_json(translated_event)
+            logger.debug(
+                "ACS->Realtime translated event: type=%s session_id=%s bytes_b64=%d silent=%s participant=%s",
+                translated_event["type"],
+                getattr(ws, "session_id", "unknown"),
+                len(audio_b64),
+                silent,
+                participant,
+            )
+            return
+
+        logger.info("ACS websocket message ignored: session_id=%s kind=%s", getattr(ws, "session_id", "unknown"), kind)
+
+    @staticmethod
+    def _build_acs_audio_message(audio_b64: str) -> dict[str, Any]:
+        return {
+            "Kind": "AudioData",
+            "AudioData": {
+                "Data": audio_b64,
+            },
+            "StopAudio": None,
+        }
+
+    @staticmethod
+    def _build_acs_stop_audio_message() -> dict[str, Any]:
+        return {
+            "Kind": "StopAudio",
+            "AudioData": None,
+            "StopAudio": {},
+        }
+
+    async def _translate_realtime_message_to_acs(
+        self,
+        msg: aiohttp.WSMessage,
+        ws: web.WebSocketResponse,
+        target_ws: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        await self._process_message_to_client(msg, ws, target_ws)
+        message = json.loads(msg.data)
+        msg_type = message.get("type")
+
+        if msg_type == "response.audio.delta":
+            audio_b64 = message.get("delta")
+            if not audio_b64:
+                logger.warning("Realtime->ACS translation failed: empty response.audio.delta session_id=%s", getattr(ws, "session_id", "unknown"))
+                return
+            await ws.send_json(self._build_acs_audio_message(audio_b64))
+            logger.debug(
+                "Realtime->ACS translated event: source_type=%s target_kind=AudioData session_id=%s bytes_b64=%d",
+                msg_type,
+                getattr(ws, "session_id", "unknown"),
+                len(audio_b64),
+            )
+            return
+
+        if msg_type in {"input_audio_buffer.speech_started", "response.cancelled"}:
+            await ws.send_json(self._build_acs_stop_audio_message())
+            logger.info(
+                "Realtime->ACS translated event: source_type=%s target_kind=StopAudio session_id=%s",
+                msg_type,
+                getattr(ws, "session_id", "unknown"),
+            )
+            return
+
+        if msg_type in {"input_audio_buffer.committed", "input_audio_buffer.speech_stopped"}:
+            ws.acs_buffer_has_audio = False
+            logger.info(
+                "Realtime buffer event: type=%s session_id=%s",
+                msg_type,
+                getattr(ws, "session_id", "unknown"),
+            )
+            return
+
+        if msg_type == "error":
+            logger.error("Realtime upstream error for ACS session %s: %s", getattr(ws, "session_id", "unknown"), json.dumps(message))
+
+    async def _forward_acs_messages(self, ws: web.WebSocketResponse) -> None:
+        session_id = getattr(ws, "session_id", str(uuid4()))
+        ws.session_id = session_id
+        ws.client_source = "acs"
+        ws.acs_session_initialized = False
+        ws.acs_buffer_has_audio = False
+
+        target_ws = await self._open_realtime_target_ws(ws)
+        if target_ws is None:
+            return
+
+        try:
+            async def from_acs_to_realtime():
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        logger.warning("Unexpected ACS websocket message type: %s", msg.type)
+                        continue
+                    try:
+                        payload = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        logger.warning("ACS websocket JSON parse failed: session_id=%s payload_preview=%s", session_id, msg.data[:200])
+                        continue
+                    try:
+                        await self._translate_acs_message_to_realtime(payload, ws, target_ws)
+                    except Exception as exc:
+                        logger.exception("ACS->Realtime translation failed: session_id=%s error=%s", session_id, str(exc))
+
+                if getattr(ws, "acs_buffer_has_audio", False):
+                    try:
+                        await target_ws.send_json({"type": "input_audio_buffer.commit"})
+                        logger.info("ACS->Realtime translated event: input_audio_buffer.commit session_id=%s reason=socket_closed", session_id)
+                    except Exception as exc:
+                        logger.warning("Failed to flush ACS audio buffer on close: session_id=%s error=%s", session_id, str(exc))
+                await target_ws.close()
+
+            async def from_realtime_to_acs():
+                async for msg in target_ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        logger.warning("Unexpected realtime websocket message type for ACS bridge: %s", msg.type)
+                        continue
+                    try:
+                        await self._translate_realtime_message_to_acs(msg, ws, target_ws)
+                    except Exception as exc:
+                        logger.exception("Realtime->ACS translation failed: session_id=%s error=%s", session_id, str(exc))
+
+            try:
+                await asyncio.gather(from_acs_to_realtime(), from_realtime_to_acs())
+            except ConnectionResetError:
+                pass
+            finally:
+                await self._save_and_send_conversation(session_id)
+        finally:
+            await self._close_realtime_target_ws(target_ws)
 
     async def _websocket_handler(self, request: web.Request):
+        if self._is_acs_request(request):
+            logger.info(
+                "Detected ACS websocket request on %s; routing through ACS adapter. session=%s call_connection_id=%s",
+                request.path,
+                request.query.get("session"),
+                request.headers.get("x-ms-call-connection-id"),
+            )
+            return await self._acs_websocket_handler(request)
+
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        ws.client_source = "web"
+        ws.request_headers = request.headers
+        logger.info("Web realtime websocket connected: path=%s session=%s", request.path, request.query.get("session"))
         # Allow callers (for example ACS media bridge) to pin a stable session id.
         requested_session_id = request.query.get("session")
         if requested_session_id:
             ws.session_id = requested_session_id
         await self._forward_messages(ws)
+        return ws
+
+    async def _acs_websocket_handler(self, request: web.Request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        ws.client_source = "acs"
+        ws.request_headers = request.headers
+        requested_session_id = request.query.get("session") or request.headers.get("x-ms-call-connection-id")
+        if requested_session_id:
+            ws.session_id = requested_session_id
+        logger.info(
+            "ACS media websocket connected: path=%s session=%s call_connection_id=%s correlation_id=%s operation_context=%s",
+            request.path,
+            getattr(ws, "session_id", None),
+            request.headers.get("x-ms-call-connection-id"),
+            request.headers.get("x-ms-call-correlation-id"),
+            request.headers.get("x-ms-call-media-streaming-operation-context"),
+        )
+        await self._forward_acs_messages(ws)
         return ws
 
     async def _invoke_tool(self, tool_name: str, args: Any, session_id: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse):
@@ -462,15 +771,22 @@ class RTMiddleTier:
                         "output": result_text
                     }
                 })
-                logger.info("Sending tool result to client: tool_name=%s, result_length=%d, preview: %s", 
-                           tool_name, len(result_text), result_text[:200])
-                await client_ws.send_json({
-                    "type": "extension.middle_tier_tool_response",
-                    "previous_item_id": None,
-                    "tool_name": tool_name,
-                    "tool_result": result_text
-                })
-                logger.info("Tool result sent to client successfully for tool: %s", tool_name)
+                if self._client_can_receive_internal_events(client_ws):
+                    logger.info("Sending tool result to client: tool_name=%s, result_length=%d, preview: %s", 
+                               tool_name, len(result_text), result_text[:200])
+                    await client_ws.send_json({
+                        "type": "extension.middle_tier_tool_response",
+                        "previous_item_id": None,
+                        "tool_name": tool_name,
+                        "tool_result": result_text
+                    })
+                    logger.info("Tool result sent to client successfully for tool: %s", tool_name)
+                else:
+                    logger.info(
+                        "Skipped extension.middle_tier_tool_response for non-web client: source=%s tool_name=%s",
+                        self._get_client_source(client_ws),
+                        tool_name,
+                    )
         except Exception as e:
             logger.error("Error forwarding tool result: %s", str(e))
 
@@ -551,5 +867,7 @@ class RTMiddleTier:
             if session_id in self._conversation_logs:
                 del self._conversation_logs[session_id]
     
-    def attach_to_app(self, app, path):
+    def attach_to_app(self, app, path, acs_path: Optional[str] = None):
         app.router.add_get(path, self._websocket_handler)
+        if acs_path:
+            app.router.add_get(acs_path, self._acs_websocket_handler)
