@@ -287,7 +287,7 @@ class RTMiddleTier:
                         if session_id and session_id in self._conversation_logs:
                             transcript = message["item"].get("transcript", "")
                             if transcript:
-                                logger.info("Captured user input from item: %s", transcript[:50])
+                                logger.debug("Captured user input transcription item: %s", transcript[:50])
                                 self._conversation_logs[session_id]["messages"].append({
                                     "role": "user",
                                     "content": transcript,
@@ -331,7 +331,13 @@ class RTMiddleTier:
                             transcript = find_transcript(message)
                         
                         if transcript:
-                            logger.info("Captured user input: %s", transcript[:50])
+                            logger.info(
+                                "TEST_FLOW User transcript received: source=%s session_id=%s call_connection_id=%s transcript=%s",
+                                client_source,
+                                session_id,
+                                getattr(client_ws, "call_connection_id", None),
+                                transcript[:200],
+                            )
                             self._conversation_logs[session_id]["messages"].append({
                                 "role": "user",
                                 "content": transcript,
@@ -430,16 +436,27 @@ class RTMiddleTier:
                             for output in outputs
                             if isinstance(output, dict)
                         ]
+                        assistant_reply_text = ""
+                        for output in outputs:
+                            if not isinstance(output, dict):
+                                continue
+                            if output.get("type") == "text" and output.get("text"):
+                                assistant_reply_text += str(output.get("text") or "")
+                            elif output.get("type") == "audio" and output.get("transcript"):
+                                assistant_reply_text += str(output.get("transcript") or "")
+                        if not assistant_reply_text:
+                            assistant_reply_text = str(getattr(client_ws, "acs_audio_transcript_text", "") or "")
                         logger.info(
-                            "ACS realtime response.done: session_id=%s status=%s output_types=%s audio_chunks=%s transcript_preview=%s",
+                            "TEST_FLOW AI reply completed: session_id=%s status=%s output_types=%s audio_chunks=%s text=%s",
                             session_id,
                             response.get("status"),
                             output_types,
                             getattr(client_ws, "acs_audio_delta_count", 0),
-                            getattr(client_ws, "acs_audio_transcript_preview", ""),
+                            assistant_reply_text[:500],
                         )
                         client_ws.acs_audio_delta_count = 0
                         client_ws.acs_audio_transcript_preview = ""
+                        client_ws.acs_audio_transcript_text = ""
                     # Record assistant response
                     if session_id and session_id in self._conversation_logs:
                         response_text = ""
@@ -475,23 +492,14 @@ class RTMiddleTier:
                         transcript_delta = message.get("delta", "")
                         if transcript_delta:
                             preview = f"{getattr(client_ws, 'acs_audio_transcript_preview', '')}{transcript_delta}"
+                            full_text = f"{getattr(client_ws, 'acs_audio_transcript_text', '')}{transcript_delta}"
                             client_ws.acs_audio_transcript_preview = preview[:200]
-                            logger.info(
-                                "ACS realtime transcript delta: session_id=%s preview=%s",
-                                session_id,
-                                client_ws.acs_audio_transcript_preview,
-                            )
+                            client_ws.acs_audio_transcript_text = full_text[:2000]
 
                 case "response.audio.delta":
                     if client_source == "acs":
                         chunk_count = int(getattr(client_ws, "acs_audio_delta_count", 0) or 0) + 1
                         client_ws.acs_audio_delta_count = chunk_count
-                        if chunk_count == 1 or chunk_count % 20 == 0:
-                            logger.info(
-                                "ACS realtime response.audio.delta: session_id=%s chunk_index=%d",
-                                session_id,
-                                chunk_count,
-                            )
 
                 case "error":
                     if client_source == "acs":
@@ -582,12 +590,13 @@ class RTMiddleTier:
         target_ws: aiohttp.ClientWebSocketResponse,
     ) -> None:
         kind = self._extract_acs_value(payload, "kind", "Kind", default="Unknown")
-        logger.info(
-            "ACS websocket message received: session_id=%s kind=%s keys=%s",
-            getattr(ws, "session_id", "unknown"),
-            kind,
-            list(payload.keys()),
-        )
+        if kind != "AudioData":
+            logger.info(
+                "ACS websocket control message received: session_id=%s kind=%s keys=%s",
+                getattr(ws, "session_id", "unknown"),
+                kind,
+                list(payload.keys()),
+            )
 
         if kind == "AudioMetadata":
             metadata = self._extract_acs_value(payload, "audioMetadata", "AudioMetadata", default={}) or {}
@@ -679,14 +688,6 @@ class RTMiddleTier:
                 logger.warning("Realtime->ACS translation failed: empty response.audio.delta session_id=%s", getattr(ws, "session_id", "unknown"))
                 return
             await ws.send_json(self._build_acs_audio_message(audio_b64))
-            chunk_count = int(getattr(ws, "acs_audio_delta_count", 0) or 0)
-            if chunk_count == 1 or chunk_count % 20 == 0:
-                logger.info(
-                    "Realtime->ACS translated audio chunk: session_id=%s chunk_index=%d bytes_b64=%d",
-                    getattr(ws, "session_id", "unknown"),
-                    chunk_count,
-                    len(audio_b64),
-                )
             return
 
         if msg_type in {"input_audio_buffer.speech_started", "response.cancelled"}:
@@ -718,6 +719,7 @@ class RTMiddleTier:
         ws.acs_buffer_has_audio = False
         ws.acs_audio_delta_count = 0
         ws.acs_audio_transcript_preview = ""
+        ws.acs_audio_transcript_text = ""
 
         target_ws = await self._open_realtime_target_ws(ws)
         if target_ws is None:

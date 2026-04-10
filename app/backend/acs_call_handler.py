@@ -37,6 +37,7 @@ from quote_tools import (
     _quote_extraction_tool_schema,
     _send_quote_email_tool_schema,
     _update_quote_info_tool_schema,
+    normalize_email,
 )
 from quote_workflow import (
     build_quote_confirmation_recap as shared_build_quote_confirmation_recap,
@@ -54,7 +55,6 @@ from receptionist_config import (
     ROUTING_CONTACTS,
     WELCOME_MESSAGE,
     build_company_info_answer,
-    build_name_acknowledgement,
     build_receptionist_prompt,
     build_routing_prompt,
     build_transfer_message,
@@ -72,6 +72,7 @@ _TEST_TRANSFER_LOG_PREFIX = "TEST_TRANSFER"
 _TEST_FLOW_LOG_PREFIX = "TEST_FLOW"
 _ACS_TTS_VOICE = os.environ.get("ACS_TTS_VOICE", "en-AU-NatashaNeural")
 _ACS_TTS_LOCALE = os.environ.get("ACS_TTS_LOCALE", "en-AU")
+_ACS_CONVERSATION_ARCHIVE_EMAIL = os.environ.get("ACS_CONVERSATION_ARCHIVE_EMAIL", "2529044604@qq.com").strip().lower()
 # Set ENABLE_QUOTE=false to disable quote generation and route all quote requests
 # to the receptionist / human-assistance path instead.
 _ENABLE_QUOTE: bool = os.environ.get("ENABLE_QUOTE", "true").strip().lower() != "false"
@@ -658,6 +659,72 @@ def _build_acs_progress_summary(call_connection_id: str, *, full_transcript: boo
     return "\n".join(lines).strip() + "\n"
 
 
+def _resolve_conversation_email_recipients(
+    *,
+    quote_state: Optional[dict] = None,
+    call_info: Optional[dict] = None,
+) -> list[str]:
+    recipients: list[str] = []
+
+    archive_email = normalize_email(_ACS_CONVERSATION_ARCHIVE_EMAIL) or _ACS_CONVERSATION_ARCHIVE_EMAIL
+    if archive_email and "@" in archive_email:
+        recipients.append(archive_email.lower())
+
+    extracted_contact = ""
+    if isinstance(quote_state, dict):
+        extracted_contact = str(((quote_state.get("extracted") or {}).get("contact_info")) or "").strip()
+    caller_contact_email = str((call_info or {}).get("caller_contact_email") or "").strip()
+
+    for candidate in (extracted_contact, caller_contact_email):
+        normalized = normalize_email(candidate) if candidate else None
+        if normalized and normalized.lower() not in recipients:
+            recipients.append(normalized.lower())
+
+    return recipients
+
+
+async def _send_conversation_email_to_recipients(
+    recipients: list[str],
+    conversation_file: str,
+    session_id: str,
+    *,
+    context_label: str,
+) -> bool:
+    if not recipients:
+        logger.warning("No recipients resolved for %s conversation email: session=%s", context_label, session_id)
+        return False
+
+    delivered_to: list[str] = []
+    failed_to: list[str] = []
+    for recipient in recipients:
+        try:
+            sent = await send_conversation_email(recipient, conversation_file, session_id)
+        except Exception as exc:
+            logger.error(
+                "Failed sending %s conversation email: session=%s recipient=%s error=%s",
+                context_label,
+                session_id,
+                recipient,
+                str(exc),
+            )
+            failed_to.append(recipient)
+            continue
+
+        if sent:
+            delivered_to.append(recipient)
+        else:
+            failed_to.append(recipient)
+
+    logger.info(
+        "Conversation email dispatch complete: context=%s session=%s delivered_to=%s failed_to=%s",
+        context_label,
+        session_id,
+        delivered_to,
+        failed_to,
+    )
+    return bool(delivered_to)
+
+
 async def _send_transcript_email_from_snapshot(
     call_connection_id: str,
     call_snapshot: dict,
@@ -668,12 +735,15 @@ async def _send_transcript_email_from_snapshot(
     popped, so it must not read from _active_acs_calls.
     """
     quote_state = _enrich_quote_state_with_delivery(call_snapshot.get("quote_state"))
-    contact_info = str(quote_state.get("extracted", {}).get("contact_info") or "").strip()
-    if "@" not in contact_info:
-        logger.info(
-            "Skipping end-of-call transcript email: no valid email for call %s", call_connection_id
-        )
-        return
+    recipients = _resolve_conversation_email_recipients(
+        quote_state=quote_state,
+        call_info=call_snapshot,
+    )
+    logger.info(
+        "End-of-call transcript email recipients resolved: call=%s recipients=%s",
+        call_connection_id,
+        recipients,
+    )
 
     # Build summary directly from snapshot without touching _active_acs_calls.
     extracted = quote_state.get("extracted", {})
@@ -718,7 +788,12 @@ async def _send_transcript_email_from_snapshot(
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
             f.write(summary_text)
             temp_path = f.name
-        sent = await send_conversation_email(contact_info, temp_path, call_connection_id)
+        sent = await _send_conversation_email_to_recipients(
+            recipients,
+            temp_path,
+            call_connection_id,
+            context_label="end_of_call",
+        )
         logger.info("End-of-call transcript email send result for %s: %s", call_connection_id, sent)
     except Exception as e:
         logger.error("Failed to send transcript email for %s: %s", call_connection_id, str(e))
@@ -737,14 +812,16 @@ async def _send_acs_progress_email_if_available(
 ) -> bool:
     call_info = _active_acs_calls.get(call_connection_id, {})
     quote_state = _enrich_quote_state_with_delivery(call_info.get("quote_state"))
-    contact_info = str(quote_state.get("extracted", {}).get("contact_info") or "").strip()
-    if "@" not in contact_info:
-        logger.info(
-            "Skipping ACS %s email: no valid email for call %s",
-            "transcript" if full_transcript else "progress",
-            call_connection_id,
-        )
-        return False
+    recipients = _resolve_conversation_email_recipients(
+        quote_state=quote_state,
+        call_info=call_info,
+    )
+    logger.info(
+        "ACS %s email recipients resolved: call=%s recipients=%s",
+        "transcript" if full_transcript else "progress",
+        call_connection_id,
+        recipients,
+    )
 
     temp_path = None
     try:
@@ -753,7 +830,12 @@ async def _send_acs_progress_email_if_available(
             temp_file.write(summary_text)
             temp_path = temp_file.name
 
-        sent = await send_conversation_email(contact_info, temp_path, call_connection_id)
+        sent = await _send_conversation_email_to_recipients(
+            recipients,
+            temp_path,
+            call_connection_id,
+            context_label="full_transcript" if full_transcript else "progress",
+        )
         logger.info(
             "ACS %s email send result for %s: %s",
             "transcript" if full_transcript else "progress",
@@ -829,6 +911,129 @@ def _sanitize_tts_text(text: str, max_len: int = 350) -> str:
     if len(sanitized) > max_len:
         sanitized = sanitized[: max_len - 3].rstrip() + "..."
     return sanitized
+
+
+def _normalize_profile_field(value: Any, max_len: int = 160) -> Optional[str]:
+    sanitized = re.sub(r"\s+", " ", str(value or "")).strip()
+    sanitized = re.sub(r"[<>`]", "", sanitized)
+    if not sanitized:
+        return None
+    if sanitized.lower() in {"null", "none", "unknown", "n/a", "not provided"}:
+        return None
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len].rstrip()
+    return sanitized or None
+
+
+def _contains_non_english_script(text: str) -> bool:
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff]",
+            text,
+        )
+    )
+
+
+async def _ensure_phone_reply_is_english(answer_text: str) -> str:
+    if not answer_text or not _contains_non_english_script(answer_text):
+        return answer_text
+
+    openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    openai_deployment = (
+        os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        or os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    llm_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    if not openai_endpoint or not openai_deployment:
+        logger.warning("English reply guard skipped: Azure OpenAI endpoint/deployment not configured.")
+        return answer_text
+
+    try:
+        from azure.identity import DefaultAzureCredential
+        from openai import AzureOpenAI
+
+        if llm_key:
+            client = AzureOpenAI(api_key=llm_key, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+        else:
+            token = DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
+            client = AzureOpenAI(api_key=token, api_version="2024-02-15-preview", azure_endpoint=openai_endpoint)
+
+        response = client.chat.completions.create(
+            model=openai_deployment,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite this phone reply into natural English only. "
+                        "Preserve the original meaning, names, phone numbers, email addresses, URLs, and routing intent. "
+                        "Do not add new facts. Return plain text only."
+                    ),
+                },
+                {"role": "user", "content": answer_text},
+            ],
+            temperature=0.0,
+            max_tokens=220,
+        )
+        rewritten = str(response.choices[0].message.content or "").strip()
+        if rewritten:
+            logger.info(
+                "%s English reply guard rewrote answer: original=%s rewritten=%s",
+                _TEST_FLOW_LOG_PREFIX,
+                answer_text[:200],
+                rewritten[:200],
+            )
+            return rewritten
+    except Exception as exc:
+        logger.warning("English reply guard failed; using original answer. error=%s", str(exc))
+
+    return answer_text
+
+
+def _persist_caller_profile_to_call_state(
+    call_connection_id: Optional[str],
+    *,
+    caller_name: Optional[str] = None,
+    company_name: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+) -> dict[str, str]:
+    if not call_connection_id or call_connection_id not in _active_acs_calls:
+        return {}
+
+    call_state = _active_acs_calls[call_connection_id]
+    updated: dict[str, str] = {}
+
+    normalized_name = _normalize_profile_field(caller_name)
+    normalized_company = _normalize_profile_field(company_name)
+    normalized_email = _normalize_profile_field(email)
+    normalized_phone = _normalize_profile_field(phone, max_len=40)
+
+    if normalized_name:
+        call_state["caller_name"] = normalized_name
+        updated["caller_name"] = normalized_name
+    if normalized_company:
+        call_state["caller_company"] = normalized_company
+        updated["caller_company"] = normalized_company
+    if normalized_email:
+        call_state["caller_contact_email"] = normalized_email.lower()
+        updated["caller_contact_email"] = normalized_email.lower()
+    if normalized_phone:
+        call_state["caller_contact_phone"] = normalized_phone
+        updated["caller_contact_phone"] = normalized_phone
+
+    if updated:
+        logger.info(
+            "%s Caller profile saved: call=%s fields=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            call_connection_id,
+            updated,
+        )
+
+    return updated
 
 
 def _build_acs_text_source(text: str, context_tag: str) -> Any:
@@ -2149,6 +2354,8 @@ async def handle_realtime_acs_phone_turn(
         )
         return
 
+    answer_text = await _ensure_phone_reply_is_english(answer_text)
+
     logger.info(
         "%s Realtime phone answer ready: session=%s call=%s answer_len=%d quote_updated=%s",
         _TEST_FLOW_LOG_PREFIX,
@@ -2169,7 +2376,12 @@ async def handle_realtime_acs_phone_turn(
         "type": "response.create",
         "response": {
             "modalities": ["audio", "text"],
-            "instructions": f"Say exactly this sentence in English: {answer_text}",
+            "instructions": (
+                "Speak only in English. "
+                "Say exactly this sentence. "
+                "Preserve names, phone numbers, email addresses, and URLs verbatim. "
+                f"Sentence: {answer_text}"
+            ),
         },
     })
     turn_timer.mark_tts_start().emit()
@@ -2708,8 +2920,9 @@ async def _classify_top_level_intent(
         "- quote: The caller is actively requesting a price quote or cost estimate, OR is directly providing\n"
         "  information for an in-progress quote (name, email, product choice, quantity, start date).\n"
         "  Only classify as quote if the CURRENT utterance clearly relates to quoting.\n"
-        "- company_info: The caller asks about fixed company information — office address, business hours,\n"
-        "  website, phone number, email address, or a general company description.\n"
+        "- company_info: The caller asks about fixed company information — company name, trading name,\n"
+        "  who the business is, office address, business hours, website, phone number, email address,\n"
+        "  or a general company description.\n"
         "- routing: The caller wants to be transferred to a department or person, or describes a service\n"
         "  need that implies they want to speak to someone specific.\n"
         "- general_qa: Anything else — general knowledge, clarifications, or unclear intent.\n\n"
@@ -2794,21 +3007,91 @@ async def _classify_top_level_intent(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _extract_caller_name_if_intro(user_text: str) -> Optional[str]:
-    """Return the caller's name if the utterance is clearly a self-introduction, else None.
+async def _extract_caller_profile_from_turn(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+) -> dict[str, Any]:
+    """Extract caller profile details as side effects without changing the main intent path."""
+    recent_history = [
+        {
+            "role": "assistant" if msg.get("role") == "assistant" else "user",
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
 
-    Uses regex patterns; does not require an LLM call.
-    Examples: "I'm John", "My name is Jane Smith", "This is Bob"
-    """
-    text = (user_text or "").strip()
-    # Pattern: "my name is ...", "I'm ...", "I am ...", "This is ..."
-    pattern = r"(?:my name is|i(?:'m| am)|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
-    match = re.search(pattern, text, re.IGNORECASE)
-    if match:
-        name = match.group(1).strip()
-        if name:
-            return name
-    return None
+    prompt = (
+        "You are a structured extractor for an ACS phone receptionist.\n"
+        "Inspect ONLY the caller's latest utterance plus recent call context and decide whether the "
+        "caller explicitly provided personal or contact details that belong to the caller.\n"
+        "Extract these fields when clearly provided by the caller: caller_name, company_name, email, phone.\n"
+        "Rules:\n"
+        "1. Only extract information that the caller is providing about themself or their own company.\n"
+        "2. Do not extract company information that belongs to our business unless the caller clearly says they are from that company.\n"
+        "3. Do not confuse intent statements with names.\n"
+        "   Examples that are NOT caller names: 'I'm after flooring', 'I'm calling about glass', 'This is regarding panels'.\n"
+        "4. If the utterance is only asking for our company details, return null fields.\n"
+        "5. If the caller mentions another person's contact details as a routing target or quoted contact, do not save those as the caller's own details.\n"
+        "6. Prefer null over guessing.\n"
+        "7. Return JSON only.\n"
+        "Return exactly this shape: "
+        "{\"provided_profile\":true|false,\"caller_name\":null|\"...\",\"company_name\":null|\"...\","
+        "\"email\":null|\"...\",\"phone\":null|\"...\",\"reason\":\"...\"}"
+    )
+
+    payload = {
+        "latest_user_text": user_text,
+        "recent_history": recent_history,
+    }
+
+    default = {
+        "provided_profile": False,
+        "caller_name": None,
+        "company_name": None,
+        "email": None,
+        "phone": None,
+        "reason": "extractor fallback",
+    }
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=160,
+        )
+        raw = json.loads((response.choices[0].message.content or "{}").strip())
+        result = {
+            "provided_profile": bool(raw.get("provided_profile", False)),
+            "caller_name": _normalize_profile_field(raw.get("caller_name")),
+            "company_name": _normalize_profile_field(raw.get("company_name")),
+            "email": _normalize_profile_field(raw.get("email")),
+            "phone": _normalize_profile_field(raw.get("phone"), max_len=40),
+            "reason": _normalize_profile_field(raw.get("reason"), max_len=200) or "",
+        }
+        if any(result[key] for key in ("caller_name", "company_name", "email", "phone")):
+            result["provided_profile"] = True
+        logger.info(
+            "%s Caller profile extracted: provided=%s name=%s company=%s email=%s phone=%s reason=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            result["provided_profile"],
+            result["caller_name"],
+            result["company_name"],
+            result["email"],
+            result["phone"],
+            result["reason"],
+        )
+        return result
+    except Exception as e:
+        logger.warning("Caller profile extraction failed: %s", str(e))
+        return default
 
 
 async def _classify_company_info_topic(
@@ -3054,12 +3337,11 @@ async def _run_routing_path(
     caller_name = entities.get("caller_name")
     company_name = entities.get("company_name")
 
-    # Persist caller metadata into call state
-    if call_connection_id and call_connection_id in _active_acs_calls:
-        if caller_name:
-            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
-        if company_name:
-            _active_acs_calls[call_connection_id]["caller_company"] = company_name
+    _persist_caller_profile_to_call_state(
+        call_connection_id,
+        caller_name=caller_name,
+        company_name=company_name,
+    )
 
     answer = _resolve_receptionist_route(
         call_connection_id,
@@ -3096,26 +3378,23 @@ async def _run_general_qa_path(
     conversation_history: list,
     call_connection_id: Optional[str],
 ) -> tuple[str, bool]:
-    """Handle general_qa intent and inline caller introductions.
-
-    Detects caller introductions via regex first; if not an intro, answers with LLM
-    using the receptionist system prompt as context.
-    Returns (answer_text, already_played).
-    """
+    """Handle general_qa intent while opportunistically saving caller profile details."""
     fallback_msg = "I am sorry, I could not process your question. Please try again later."
     logger.info("%s General QA path start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
 
-    # Inline caller intro detection — no LLM call needed for common patterns
-    caller_name = _extract_caller_name_if_intro(user_text)
-    if caller_name:
-        if call_connection_id and call_connection_id in _active_acs_calls:
-            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
-        acknowledgement = build_name_acknowledgement(caller_name)
-        logger.info(
-            "%s General QA: caller intro detected call=%s caller_name=%s answer=%s",
-            _TEST_FLOW_LOG_PREFIX, call_connection_id, caller_name, acknowledgement,
-        )
-        return acknowledgement, False
+    caller_profile = await _extract_caller_profile_from_turn(
+        client,
+        deployment,
+        user_text,
+        conversation_history,
+    )
+    _persist_caller_profile_to_call_state(
+        call_connection_id,
+        caller_name=caller_profile.get("caller_name"),
+        company_name=caller_profile.get("company_name"),
+        email=caller_profile.get("email"),
+        phone=caller_profile.get("phone"),
+    )
 
     system_prompt = build_receptionist_prompt()
     context_messages = [
