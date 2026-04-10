@@ -51,7 +51,7 @@ from quote_workflow import (
 from receptionist_config import (
     DEPARTMENTS,
     INFO_TOPICS,
-    RECEPTIONIST_INTENTS,
+    ROUTING_CONTACTS,
     WELCOME_MESSAGE,
     build_company_info_answer,
     build_name_acknowledgement,
@@ -482,89 +482,6 @@ def _try_transfer_to_reception_contact(
             str(e),
         )
         return False
-
-
-async def _classify_receptionist_intent_with_llm(
-    client,
-    deployment: str,
-    user_text: str,
-    conversation_history: list,
-    pending_route: dict[str, Any],
-) -> dict[str, Any]:
-    recent_history = [
-        {
-            "role": ("assistant" if msg.get("role") == "assistant" else "user"),
-            "content": msg.get("content", ""),
-        }
-        for msg in (conversation_history or [])[-6:]
-        if isinstance(msg, dict) and msg.get("content")
-    ]
-    payload = {
-        "pending_route": pending_route,
-        "recent_history": recent_history,
-        "latest_user_text": user_text,
-        "supported_info_topics": sorted(INFO_TOPICS),
-        "supported_departments": sorted(DEPARTMENTS),
-    }
-    logger.info(
-        "%s Intent classification request: latest_user_text=%s, pending_route=%s, recent_history_count=%d",
-        _TEST_TRANSFER_LOG_PREFIX,
-        user_text,
-        pending_route,
-        len(recent_history),
-    )
-    prompt = (
-        "Classify the caller's latest turn for a phone receptionist workflow. "
-        "Return JSON only. "
-        "Allowed intent values: caller_intro, company_info, routing_request, general_qa. "
-        "If the user is asking for company details, set intent=company_info and choose one info_topic from: "
-        "company_summary, office_address, office_hours, warehouse_address, warehouse_hours, website, email, office_phone. "
-        "If the user wants to be connected, transferred, routed, or asks for a department or person, set intent=routing_request. "
-        "For routing_request also extract department when clear using one of: flooring, panels, glass, fibreglass. "
-        "Also extract company_name if the caller states who they are from. "
-        "Set is_architectural_firm=true only when the caller clearly says they are from an architect, architectural, design, or similar firm. "
-        "If the caller is simply introducing themself, set intent=caller_intro and extract caller_name. "
-        "If unclear, set intent=general_qa. "
-        "Schema: {"
-        "\"intent\":\"...\","
-        "\"info_topic\":null|\"...\","
-        "\"department\":null|\"...\","
-        "\"caller_name\":null|\"...\","
-        "\"company_name\":null|\"...\","
-        "\"is_architectural_firm\":true|false"
-        "}."
-    )
-    try:
-        response = client.chat.completions.create(
-            model=deployment,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            max_tokens=160,
-        )
-        content = (response.choices[0].message.content or "{}").strip()
-        logger.info("%s Intent classification raw response: %s", _TEST_TRANSFER_LOG_PREFIX, content[:500])
-        result = json.loads(content)
-    except Exception as e:
-        logger.warning("Receptionist intent classification failed: %s", str(e))
-        return {"intent": "general_qa"}
-
-    intent = result.get("intent")
-    info_topic = result.get("info_topic")
-    department = result.get("department")
-    normalized = {
-        "intent": intent if intent in RECEPTIONIST_INTENTS else "general_qa",
-        "info_topic": info_topic if info_topic in INFO_TOPICS else None,
-        "department": department if department in DEPARTMENTS else None,
-        "caller_name": (result.get("caller_name") or None),
-        "company_name": (result.get("company_name") or None),
-        "is_architectural_firm": bool(result.get("is_architectural_firm", False)),
-    }
-    logger.info("%s Receptionist intent classification: %s", _TEST_TRANSFER_LOG_PREFIX, normalized)
-    return normalized
 
 
 def _default_quote_delivery() -> dict[str, Any]:
@@ -1825,16 +1742,34 @@ async def generate_answer_text_with_gpt(
             top_intent["primary_intent"] = "general_qa"
 
         if not top_intent["should_enter_quote_flow"]:
-            logger.info("➡️  BRANCH: Non-quote intent (%s) — routing to receptionist path",
-                        top_intent["primary_intent"])
-            answer_text, already_played = await _run_receptionist_path(
-                client,
-                openai_deployment,
-                openai_endpoint,
-                user_text,
-                conversation_history,
-                call_connection_id,
+            primary = top_intent["primary_intent"]
+            # A pending route from a prior turn always takes routing priority,
+            # even if the LLM classified the current utterance as general_qa.
+            _pending_route_now = _get_pending_receptionist_route(call_connection_id)
+            if _pending_route_now:
+                effective_path = "routing"
+            else:
+                effective_path = primary
+            logger.info(
+                "➡️  BRANCH: Non-quote intent (primary=%s effective_path=%s pending_route=%s) — routing to dedicated path",
+                primary, effective_path, bool(_pending_route_now),
             )
+            if effective_path == "company_info":
+                answer_text, already_played = await _run_company_info_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
+            elif effective_path == "routing":
+                answer_text, already_played = await _run_routing_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
+            else:
+                # general_qa (or any unrecognised intent)
+                answer_text, already_played = await _run_general_qa_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
             # If a quote is in progress, append a brief continuation reminder
             # (only when the answer wasn't already sent via streaming)
             if (
@@ -1849,9 +1784,13 @@ async def generate_answer_text_with_gpt(
                     # lower-case the first letter so it reads naturally after a period
                     answer_text = f"{answer_text} Also, {reminder[0].lower() + reminder[1:]}"
             _append_assistant_message(call_connection_id, answer_text)
-            logger.info("%s Non-quote path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            logger.info(
+                "%s Non-quote path resolved: call=%s path=%s answer_len=%d answer=%s",
+                _TEST_FLOW_LOG_PREFIX, call_connection_id, effective_path,
+                len(answer_text or ""), answer_text,
+            )
             if _timer is not None:
-                _timer.set_path("receptionist")
+                _timer.set_path(f"non_quote:{effective_path}")
             return answer_text, False, already_played
         # ── END TOP-LEVEL INTENT GATE ──────────────────────────────────────────
 
@@ -2069,20 +2008,42 @@ async def generate_answer_text_with_gpt(
             return answer_text, False, False
 
         else:
-            # quote_state is complete or was never started — plain receptionist turn
-            logger.info("➡️  SUB-BRANCH: Regular Q&A (quote_state complete or absent)")
-            answer_text, already_played = await _run_receptionist_path(
-                client,
-                openai_deployment,
-                openai_endpoint,
-                user_text,
-                conversation_history,
-                call_connection_id,
+            # quote_state is complete or was never started — plain non-quote turn.
+            # Re-use top_intent classification already computed above, but honour
+            # any pending routing state from a previous turn.
+            primary = top_intent["primary_intent"]
+            _pending_route_now = _get_pending_receptionist_route(call_connection_id)
+            if _pending_route_now:
+                effective_path = "routing"
+            else:
+                effective_path = primary
+            logger.info(
+                "➡️  SUB-BRANCH: Regular Q&A (quote_state complete or absent) primary=%s effective_path=%s",
+                primary, effective_path,
             )
+            if effective_path == "company_info":
+                answer_text, already_played = await _run_company_info_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
+            elif effective_path == "routing":
+                answer_text, already_played = await _run_routing_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
+            else:
+                answer_text, already_played = await _run_general_qa_path(
+                    client, openai_deployment, openai_endpoint,
+                    user_text, conversation_history, call_connection_id,
+                )
             _append_assistant_message(call_connection_id, answer_text)
-            logger.info("%s Receptionist path resolved: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(answer_text or ""))
+            logger.info(
+                "%s Sub-branch resolved: call=%s path=%s answer_len=%d answer=%s",
+                _TEST_FLOW_LOG_PREFIX, call_connection_id, effective_path,
+                len(answer_text or ""), answer_text,
+            )
             if _timer is not None:
-                _timer.set_path("receptionist_qa")
+                _timer.set_path(f"qa:{effective_path}")
             return answer_text, quote_updated, already_played
 
         logger.info("Answer text from GPT: %s", answer_text)
@@ -2825,7 +2786,174 @@ async def _classify_top_level_intent(
         return default
 
 
-async def _run_receptionist_path(
+# ── Dedicated intent path handlers ───────────────────────────────────────────
+# Each top-level non-quote intent routes to one of these three functions:
+#   company_info  → _run_company_info_path
+#   routing       → _run_routing_path
+#   general_qa    → _run_general_qa_path
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _extract_caller_name_if_intro(user_text: str) -> Optional[str]:
+    """Return the caller's name if the utterance is clearly a self-introduction, else None.
+
+    Uses regex patterns; does not require an LLM call.
+    Examples: "I'm John", "My name is Jane Smith", "This is Bob"
+    """
+    text = (user_text or "").strip()
+    # Pattern: "my name is ...", "I'm ...", "I am ...", "This is ..."
+    pattern = r"(?:my name is|i(?:'m| am)|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        if name:
+            return name
+    return None
+
+
+async def _classify_company_info_topic(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+) -> Optional[str]:
+    """Classify a company_info utterance into a fine-grained INFO_TOPICS sub-topic.
+
+    Returns one of the INFO_TOPICS keys or None if classification fails.
+    INFO_TOPICS = {company_name, company_summary, office_address, office_hours,
+                   warehouse_address, warehouse_hours, website, email, office_phone}
+    """
+    recent_history = [
+        {
+            "role": "assistant" if msg.get("role") == "assistant" else "user",
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-4:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+
+    topics_list = sorted(INFO_TOPICS)
+    prompt = (
+        "You are a topic classifier for an AI phone receptionist. "
+        "The caller is asking about company information. "
+        f"Choose the single most relevant topic from this list: {topics_list}.\n"
+        "Topic meanings:\n"
+        "  company_name       – the company's trading name\n"
+        "  company_summary    – what the company does, its history, products or services\n"
+        "  office_address     – the office or showroom location/address\n"
+        "  office_hours       – office or showroom opening hours\n"
+        "  warehouse_address  – the warehouse location/address\n"
+        "  warehouse_hours    – warehouse opening hours\n"
+        "  website            – the company's website URL\n"
+        "  email              – the company's contact email address\n"
+        "  office_phone       – the company's main phone number\n"
+        "Return JSON only: {\"topic\": \"<topic_name>\"}"
+    )
+
+    payload = {"latest_user_text": user_text, "recent_history": recent_history}
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=60,
+        )
+        raw = json.loads((response.choices[0].message.content or "{}").strip())
+        topic = raw.get("topic")
+        if topic in INFO_TOPICS:
+            logger.info("%s Company info topic classified: topic=%s", _TEST_FLOW_LOG_PREFIX, topic)
+            return topic
+        logger.warning(
+            "%s Company info topic not in INFO_TOPICS: raw_topic=%r (allowed=%s)",
+            _TEST_FLOW_LOG_PREFIX, topic, sorted(INFO_TOPICS),
+        )
+        return None
+    except Exception as e:
+        logger.warning("Company info topic classification failed: %s", str(e))
+        return None
+
+
+async def _classify_routing_entities(
+    client,
+    deployment: str,
+    user_text: str,
+    conversation_history: list,
+    pending_route: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract routing entities from a routing-intent utterance.
+
+    Returns dict with keys: department, company_name, caller_name, is_architectural_firm.
+    """
+    recent_history = [
+        {
+            "role": "assistant" if msg.get("role") == "assistant" else "user",
+            "content": msg.get("content", ""),
+        }
+        for msg in (conversation_history or [])[-6:]
+        if isinstance(msg, dict) and msg.get("content")
+    ]
+
+    departments_list = sorted(DEPARTMENTS)
+    payload = {
+        "pending_route": pending_route,
+        "recent_history": recent_history,
+        "latest_user_text": user_text,
+        "supported_departments": departments_list,
+    }
+
+    prompt = (
+        "Extract routing entities from the caller's utterance for an AI phone receptionist. "
+        "Return JSON only.\n"
+        f"Allowed department values: {departments_list}.\n"
+        "Extract company_name if the caller states who they are from. "
+        "Extract caller_name if the caller introduces themselves by name. "
+        "Set is_architectural_firm=true only when the caller clearly says they are from an "
+        "architect, architectural, design, or similar firm. "
+        "Schema: {"
+        "\"department\":null|\"...\","
+        "\"caller_name\":null|\"...\","
+        "\"company_name\":null|\"...\","
+        "\"is_architectural_firm\":true|false"
+        "}."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            max_tokens=120,
+        )
+        raw = json.loads((response.choices[0].message.content or "{}").strip())
+        department = raw.get("department")
+        result: dict[str, Any] = {
+            "department": department if department in DEPARTMENTS else None,
+            "caller_name": raw.get("caller_name") or None,
+            "company_name": raw.get("company_name") or None,
+            "is_architectural_firm": bool(raw.get("is_architectural_firm", False)),
+        }
+        logger.info(
+            "%s Routing entities extracted: department=%s company_name=%s caller_name=%s arch_firm=%s",
+            _TEST_FLOW_LOG_PREFIX,
+            result["department"], result["company_name"],
+            result["caller_name"], result["is_architectural_firm"],
+        )
+        return result
+    except Exception as e:
+        logger.warning("Routing entity extraction failed: %s", str(e))
+        return {"department": None, "caller_name": None, "company_name": None, "is_architectural_firm": False}
+
+
+async def _run_company_info_path(
     client,
     deployment: str,
     endpoint: str,
@@ -2833,60 +2961,40 @@ async def _run_receptionist_path(
     conversation_history: list,
     call_connection_id: Optional[str],
 ) -> tuple[str, bool]:
-    """
-    Handle a non-quote turn: company_info, routing, caller_intro, or general_qa.
+    """Handle company_info intent: classify sub-topic and return a direct static answer.
 
+    Falls back to LLM with receptionist context when the sub-topic is unrecognized
+    or has no static answer in build_company_info_answer().
     Returns (answer_text, already_played).
-    already_played is always False here (non-streaming path).
     """
-    fallback = "I am sorry, I could not process your question. Please try again later."
+    fallback_msg = "I am sorry, I could not find the information you requested. Please try again later."
+    logger.info("%s Company info path start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
 
-    pending_route = _get_pending_receptionist_route(call_connection_id)
+    topic = await _classify_company_info_topic(client, deployment, user_text, conversation_history)
     logger.info(
-        "%s Receptionist path start: call=%s pending_route=%s",
-        _TEST_FLOW_LOG_PREFIX,
-        call_connection_id,
-        pending_route,
+        "%s Company info sub-topic: call=%s topic=%s",
+        _TEST_FLOW_LOG_PREFIX, call_connection_id, topic,
     )
 
-    receptionist_intent = await _classify_receptionist_intent_with_llm(
-        client,
-        deployment,
-        user_text,
-        conversation_history,
-        pending_route,
-    )
-
-    caller_name = receptionist_intent.get("caller_name")
-    company_name = receptionist_intent.get("company_name")
-    if call_connection_id and call_connection_id in _active_acs_calls:
-        if caller_name:
-            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
-        if company_name:
-            _active_acs_calls[call_connection_id]["caller_company"] = company_name
-
-    if receptionist_intent.get("intent") == "caller_intro" and caller_name:
-        logger.info("%s Receptionist intent resolved: call=%s intent=caller_intro", _TEST_FLOW_LOG_PREFIX, call_connection_id)
-        return build_name_acknowledgement(caller_name), False
-
-    if receptionist_intent.get("intent") == "company_info" and receptionist_intent.get("info_topic"):
-        answer = build_company_info_answer(receptionist_intent["info_topic"])
+    if topic:
+        answer = build_company_info_answer(topic)
         if answer:
-            logger.info("%s Receptionist intent resolved: call=%s intent=company_info topic=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id, receptionist_intent.get("info_topic"))
+            logger.info(
+                "%s Company info path resolved via static answer: call=%s topic=%s answer_len=%d answer=%s",
+                _TEST_FLOW_LOG_PREFIX, call_connection_id, topic, len(answer), answer,
+            )
             return answer, False
-
-    if receptionist_intent.get("intent") == "routing_request" or pending_route:
-        logger.info("%s Receptionist intent resolved: call=%s intent=routing_request", _TEST_FLOW_LOG_PREFIX, call_connection_id)
-        answer = _resolve_receptionist_route(
-            call_connection_id,
-            receptionist_intent.get("department"),
-            company_name,
-            receptionist_intent.get("is_architectural_firm", False),
+        logger.warning(
+            "%s Company info topic=%s has no static answer; falling back to LLM. call=%s",
+            _TEST_FLOW_LOG_PREFIX, topic, call_connection_id,
         )
-        if answer:
-            return answer, False
+    else:
+        logger.warning(
+            "%s Company info sub-topic classification returned None; falling back to LLM. call=%s",
+            _TEST_FLOW_LOG_PREFIX, call_connection_id,
+        )
 
-    # General Q&A fallback
+    # LLM fallback — use receptionist context for unanswerable or unrecognized topics
     system_prompt = build_receptionist_prompt()
     context_messages = [
         {"role": "system", "content": system_prompt},
@@ -2901,7 +3009,6 @@ async def _run_receptionist_path(
         {"role": "user", "content": user_text},
     ]
     try:
-        logger.info("%s Receptionist GPT fallback start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
         response = client.chat.completions.create(
             model=deployment,
             messages=context_messages,
@@ -2910,20 +3017,142 @@ async def _run_receptionist_path(
         )
         full_text = (response.choices[0].message.content or "").strip()
         if not full_text:
-            logger.warning("GPT returned empty answer in receptionist path, using fallback.")
-            return fallback, False
-        if call_connection_id and call_connection_id in _active_acs_calls:
-            conv = _active_acs_calls[call_connection_id].get("conversation_history", [])
-            conv.append({"role": "assistant", "content": full_text})
-            if len(conv) > 10:
-                conv = conv[-10:]
-            _active_acs_calls[call_connection_id]["conversation_history"] = conv
-            _active_acs_calls[call_connection_id]["last_answer"] = full_text
-        logger.info("%s Receptionist GPT fallback done: call=%s answer_len=%d", _TEST_FLOW_LOG_PREFIX, call_connection_id, len(full_text))
+            return fallback_msg, False
+        logger.info(
+            "%s Company info LLM fallback resolved: call=%s topic=%s answer_len=%d answer=%s",
+            _TEST_FLOW_LOG_PREFIX, call_connection_id, topic, len(full_text), full_text,
+        )
         return full_text, False
     except Exception as e:
-        logger.error("GPT call failed in receptionist path: %s", str(e))
-        return fallback, False
+        logger.error("GPT call failed in company_info path: %s", str(e))
+        return fallback_msg, False
+
+
+async def _run_routing_path(
+    client,
+    deployment: str,
+    endpoint: str,
+    user_text: str,
+    conversation_history: list,
+    call_connection_id: Optional[str],
+) -> tuple[str, bool]:
+    """Handle routing intent: extract entities and resolve to a transfer prompt or call.
+
+    Delegates transfer execution to _resolve_receptionist_route().
+    Returns (answer_text, already_played).
+    """
+    pending_route = _get_pending_receptionist_route(call_connection_id)
+    logger.info(
+        "%s Routing path start: call=%s pending_route=%s",
+        _TEST_FLOW_LOG_PREFIX, call_connection_id, pending_route,
+    )
+
+    entities = await _classify_routing_entities(
+        client, deployment, user_text, conversation_history, pending_route,
+    )
+
+    caller_name = entities.get("caller_name")
+    company_name = entities.get("company_name")
+
+    # Persist caller metadata into call state
+    if call_connection_id and call_connection_id in _active_acs_calls:
+        if caller_name:
+            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
+        if company_name:
+            _active_acs_calls[call_connection_id]["caller_company"] = company_name
+
+    answer = _resolve_receptionist_route(
+        call_connection_id,
+        entities.get("department"),
+        company_name,
+        entities.get("is_architectural_firm", False),
+    )
+
+    if answer:
+        logger.info(
+            "%s Routing path resolved: call=%s department=%s answer_len=%d answer=%s",
+            _TEST_FLOW_LOG_PREFIX, call_connection_id, entities.get("department"), len(answer), answer,
+        )
+        return answer, False
+
+    # _resolve_receptionist_route returned None — no department and no pending route
+    available_departments = ", ".join(format_department_label(dept) for dept in ROUTING_CONTACTS)
+    fallback_prompt = (
+        f"Which area can I help with: {available_departments}? "
+        "And what company are you calling from?"
+    )
+    logger.info(
+        "%s Routing path: no route resolved, prompting for department. call=%s",
+        _TEST_FLOW_LOG_PREFIX, call_connection_id,
+    )
+    return fallback_prompt, False
+
+
+async def _run_general_qa_path(
+    client,
+    deployment: str,
+    endpoint: str,
+    user_text: str,
+    conversation_history: list,
+    call_connection_id: Optional[str],
+) -> tuple[str, bool]:
+    """Handle general_qa intent and inline caller introductions.
+
+    Detects caller introductions via regex first; if not an intro, answers with LLM
+    using the receptionist system prompt as context.
+    Returns (answer_text, already_played).
+    """
+    fallback_msg = "I am sorry, I could not process your question. Please try again later."
+    logger.info("%s General QA path start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+
+    # Inline caller intro detection — no LLM call needed for common patterns
+    caller_name = _extract_caller_name_if_intro(user_text)
+    if caller_name:
+        if call_connection_id and call_connection_id in _active_acs_calls:
+            _active_acs_calls[call_connection_id]["caller_name"] = caller_name
+        acknowledgement = build_name_acknowledgement(caller_name)
+        logger.info(
+            "%s General QA: caller intro detected call=%s caller_name=%s answer=%s",
+            _TEST_FLOW_LOG_PREFIX, call_connection_id, caller_name, acknowledgement,
+        )
+        return acknowledgement, False
+
+    system_prompt = build_receptionist_prompt()
+    context_messages = [
+        {"role": "system", "content": system_prompt},
+        *[
+            {
+                "role": "assistant" if m.get("role") == "assistant" else "user",
+                "content": m.get("content", ""),
+            }
+            for m in (conversation_history or [])[-6:]
+            if isinstance(m, dict) and m.get("content")
+        ],
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        logger.info("%s General QA LLM start: call=%s", _TEST_FLOW_LOG_PREFIX, call_connection_id)
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=context_messages,
+            temperature=0.4,
+            max_tokens=128,
+        )
+        full_text = (response.choices[0].message.content or "").strip()
+        if not full_text:
+            logger.warning("GPT returned empty answer in general_qa path; using fallback. call=%s", call_connection_id)
+            return fallback_msg, False
+        logger.info(
+            "%s General QA path resolved: call=%s answer_len=%d answer=%s",
+            _TEST_FLOW_LOG_PREFIX, call_connection_id, len(full_text), full_text,
+        )
+        return full_text, False
+    except Exception as e:
+        logger.error("GPT call failed in general_qa path: %s", str(e))
+        return fallback_msg, False
+
+
+# ── End dedicated intent path handlers ───────────────────────────────────────
 
 
 async def _extract_quote_info_phone(conversation_history: list, current_state: dict) -> dict:

@@ -96,6 +96,7 @@ ROUTING_CONTACTS: dict[str, dict[str, str]] = {
 }
 
 INFO_TOPICS = {
+    "company_name",
     "company_summary",
     "office_address",
     "office_hours",
@@ -198,6 +199,8 @@ def build_receptionist_prompt() -> str:
 
 
 def build_company_info_answer(info_topic: str) -> Optional[str]:
+    if info_topic == "company_name":
+        return f"The company name is {COMPANY_NAME}."
     if info_topic == "company_summary":
         return COMPANY_SUMMARY
     if info_topic == "office_address":
