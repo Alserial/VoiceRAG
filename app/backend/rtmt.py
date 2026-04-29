@@ -69,7 +69,6 @@ class RTMiddleTier:
     max_tokens: Optional[int] = None
     disable_audio: Optional[bool] = None
     voice_choice: Optional[str] = None
-    api_version: str = "2024-10-01-preview"
     _tools_pending = {}
     _token_provider = None
     _conversation_logs = {}  # Store conversation logs per session
@@ -77,9 +76,16 @@ class RTMiddleTier:
     _user_registered = {}    # Track user registration status per session
     _quote_states = {}       # Track structured quote state per session
     _user_states = {}        # Track structured user registration state per session
+    intent_classifier: Optional[Callable[["RTMiddleTier", Optional[str], str], dict[str, Any]]] = None
     acs_phone_turn_handler: Optional[Callable[[str, Optional[str], Optional[str], aiohttp.ClientWebSocketResponse], Awaitable[None]]] = None
 
-    def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
+    def __init__(
+        self,
+        endpoint: str,
+        deployment: str,
+        credentials: AzureKeyCredential | DefaultAzureCredential,
+        voice_choice: Optional[str] = None,
+    ):
         self.endpoint = endpoint
         self.deployment = deployment
         self.voice_choice = voice_choice
@@ -99,46 +105,43 @@ class RTMiddleTier:
         return self._get_client_source(ws) == "web"
 
     def _apply_session_defaults(self, session: dict[str, Any]) -> dict[str, Any]:
+        session["type"] = "realtime"
         if self.system_message is not None:
             session["instructions"] = self.system_message
         if self.temperature is not None:
             session["temperature"] = self.temperature
         if self.max_tokens is not None:
             session["max_response_output_tokens"] = self.max_tokens
-        if self.disable_audio is not None:
-            session["disable_audio"] = self.disable_audio
         if self.voice_choice is not None:
-            session["voice"] = self.voice_choice
+            session.setdefault("audio", {}).setdefault("output", {})["voice"] = self.voice_choice
+        # GA Realtime does not support turn_detection or disable_audio — strip them if present
+        session.pop("turn_detection", None)
+        session.pop("disable_audio", None)
         session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
         session["tools"] = [tool.schema for tool in self.tools.values()]
         return session
 
     def _build_acs_session_update_event(self) -> dict[str, Any]:
         session: dict[str, Any] = {
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 1000,
-                # ACS phone calls use server-side ACS business logic to decide what to say next.
-                # Realtime is transport + ASR + TTS here; it must not run the web/browser intent flow.
-                "create_response": False,
-            },
-            "input_audio_transcription": {
-                "model": "whisper-1",
-            },
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
+            "type": "realtime",
             "instructions": (
                 "You are the audio transport layer for an ACS phone call. "
                 "Do not decide the business flow yourself. "
                 "Wait for server-issued response.create instructions."
             ),
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                },
+            },
             "tool_choice": "none",
             "tools": [],
         }
         if self.voice_choice is not None:
-            session["voice"] = self.voice_choice
+            session["audio"]["output"]["voice"] = self.voice_choice
         return {
             "type": "session.update",
             "session": session,
@@ -163,7 +166,7 @@ class RTMiddleTier:
         return default
 
     async def _open_realtime_target_ws(self, ws: web.WebSocketResponse) -> Optional[aiohttp.ClientWebSocketResponse]:
-        params = {"api-version": self.api_version, "deployment": self.deployment}
+        params = {"model": self.deployment}
         headers: dict[str, str]
         if self.key is not None:
             headers = {"api-key": self.key}
@@ -173,12 +176,13 @@ class RTMiddleTier:
         if "x-ms-client-request-id" in request_headers:
             headers["x-ms-client-request-id"] = request_headers["x-ms-client-request-id"]
 
+        logger.info("Realtime upstream: endpoint=%s path=/openai/v1/realtime params=%s", self.endpoint, params)
         session = aiohttp.ClientSession(base_url=self.endpoint)
         max_attempts = 4
         try:
             for attempt in range(1, max_attempts + 1):
                 try:
-                    target_ws = await session.ws_connect("/openai/realtime", headers=headers, params=params)
+                    target_ws = await session.ws_connect("/openai/v1/realtime", headers=headers, params=params)
                     target_ws._owning_session = session  # type: ignore[attr-defined]
                     return target_ws
                 except aiohttp.WSServerHandshakeError as exc:
@@ -230,8 +234,8 @@ class RTMiddleTier:
         client_source = self._get_client_source(client_ws)
         session_id = getattr(client_ws, "session_id", None)
         if message is not None:
-            # Debug: Log message types that might contain user input
             msg_type = message.get("type", "")
+            logger.info("Azure->client event: type=%s source=%s", msg_type, client_source)
             if "input_audio" in msg_type or "transcription" in msg_type:
                 logger.debug("Received message type: %s, content: %s", msg_type, json.dumps(message)[:200])
             match message.get("type"):
@@ -293,7 +297,7 @@ class RTMiddleTier:
                                     "content": transcript,
                                     "timestamp": datetime.now().isoformat()
                                 })
-                                await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
+                                await self._handle_web_intent_turn(session_id, transcript, client_ws, server_ws)
                 
                 case "conversation.item.input_audio_transcription.completed":
                     # Record user input transcription
@@ -353,7 +357,7 @@ class RTMiddleTier:
                                 )
                                 await self.acs_phone_turn_handler(transcript, session_id, call_connection_id, server_ws)
                             else:
-                                await self._maybe_trigger_quote_tool(session_id, transcript, client_ws, server_ws)
+                                await self._handle_web_intent_turn(session_id, transcript, client_ws, server_ws)
                         else:
                             logger.warning("User input transcription message received but no transcript found. Message keys: %s", list(message.keys()))
                             logger.debug("Full message: %s", json.dumps(message)[:500])
@@ -417,8 +421,13 @@ class RTMiddleTier:
                 case "response.done":
                     if len(self._tools_pending) > 0:
                         self._tools_pending.clear() # Any chance tool calls could be interleaved across different outstanding responses?
+                        followup_instructions = getattr(client_ws, "intent_followup_instructions", None)
+                        followup_response: dict[str, Any] = {"modalities": ["audio", "text"]}
+                        if followup_instructions:
+                            followup_response["instructions"] = followup_instructions
                         await server_ws.send_json({
-                            "type": "response.create"
+                            "type": "response.create",
+                            "response": followup_response,
                         })
                     if "response" in message:
                         replace = False
@@ -473,7 +482,7 @@ class RTMiddleTier:
                                 "timestamp": datetime.now().isoformat()
                             })
                 
-                case "response.audio_transcript.delta":
+                case "response.output_audio_transcript.delta":
                     # Record assistant transcript delta
                     if session_id and session_id in self._conversation_logs:
                         transcript_delta = message.get("delta", "")
@@ -496,7 +505,7 @@ class RTMiddleTier:
                             client_ws.acs_audio_transcript_preview = preview[:200]
                             client_ws.acs_audio_transcript_text = full_text[:2000]
 
-                case "response.audio.delta":
+                case "response.output_audio.delta":
                     if client_source == "acs":
                         chunk_count = int(getattr(client_ws, "acs_audio_delta_count", 0) or 0) + 1
                         client_ws.acs_audio_delta_count = chunk_count
@@ -575,12 +584,13 @@ class RTMiddleTier:
         session_update = self._build_acs_session_update_event()
         await target_ws.send_json(session_update)
         ws.acs_session_initialized = True
+        audio = session_update["session"].get("audio", {})
         logger.info(
-            "ACS->Realtime translated event: session.update session_id=%s input_audio_format=%s output_audio_format=%s voice=%s",
+            "ACS->Realtime translated event: session.update session_id=%s audio_input=%s audio_output=%s voice=%s",
             getattr(ws, "session_id", "unknown"),
-            session_update["session"].get("input_audio_format"),
-            session_update["session"].get("output_audio_format"),
-            session_update["session"].get("voice"),
+            audio.get("input", {}).get("format"),
+            audio.get("output", {}).get("format"),
+            audio.get("output", {}).get("voice"),
         )
 
     async def _translate_acs_message_to_realtime(
@@ -682,10 +692,10 @@ class RTMiddleTier:
         message = json.loads(msg.data)
         msg_type = message.get("type")
 
-        if msg_type == "response.audio.delta":
+        if msg_type == "response.output_audio.delta":
             audio_b64 = message.get("delta")
             if not audio_b64:
-                logger.warning("Realtime->ACS translation failed: empty response.audio.delta session_id=%s", getattr(ws, "session_id", "unknown"))
+                logger.warning("Realtime->ACS translation failed: empty response.output_audio.delta session_id=%s", getattr(ws, "session_id", "unknown"))
                 return
             await ws.send_json(self._build_acs_audio_message(audio_b64))
             return
@@ -872,6 +882,156 @@ class RTMiddleTier:
                     )
         except Exception as e:
             logger.error("Error forwarding tool result: %s", str(e))
+
+    async def _handle_web_intent_turn(
+        self,
+        session_id: str,
+        transcript: str,
+        client_ws: web.WebSocketResponse,
+        server_ws: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        """Classify a web utterance first, then ask realtime to run the selected handler."""
+        if self._get_client_source(client_ws) != "web":
+            return
+
+        if self.intent_classifier is None:
+            logger.warning("No intent classifier configured; falling back to realtime model response.")
+            await server_ws.send_json({"type": "response.create"})
+            return
+
+        try:
+            intent_result = self.intent_classifier(self, session_id, transcript)
+        except Exception as exc:
+            logger.exception("Intent classification failed: session_id=%s error=%s", session_id, str(exc))
+            intent_result = {
+                "intent": "unsupported_or_other",
+                "action": "unknown",
+                "confidence": 0.0,
+                "fields": {},
+                "reason": "classification_failed",
+                "session_state": {},
+            }
+
+        logger.info("Intent classified: session_id=%s result=%s", session_id, json.dumps(intent_result, default=str))
+
+        if self._client_can_receive_internal_events(client_ws):
+            await client_ws.send_json({
+                "type": "extension.intent_classification",
+                "intent": intent_result,
+                "transcript": transcript,
+            })
+
+        instructions = self._build_intent_response_instructions(intent_result)
+        client_ws.intent_followup_instructions = instructions
+        await server_ws.send_json({
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"],
+                "instructions": instructions,
+            },
+        })
+
+    def _build_intent_response_instructions(self, intent_result: dict[str, Any]) -> str:
+        intent = intent_result.get("intent")
+        action = intent_result.get("action")
+
+        common = (
+            "You are handling a routed web voice turn. "
+            "Follow the route below exactly. Keep the spoken reply in English and concise. "
+            "Never mention internal intent names, JSON, tool names, file names, or keys to the user. "
+            "If a function output is already available for this routed turn, use it to speak next and do not repeat the same function call."
+        )
+
+        if intent == "registration":
+            if action == "confirm":
+                return (
+                    f"{common}\n"
+                    "Route: registration.confirm. Acknowledge that the user confirmed their registration details. "
+                    "Do not call tools. The client confirmation flow will save the user details."
+                )
+            if action == "cancel":
+                return (
+                    f"{common}\n"
+                    "Route: registration.cancel. Acknowledge the cancellation and ask for the correct name and email if they still want to continue. "
+                    "Do not call tools."
+                )
+            if action == "status":
+                return (
+                    f"{common}\n"
+                    "Route: registration.status. Call extract_user_info to recover the current name and email from conversation history, then answer with those values if present."
+                )
+            return (
+                f"{common}\n"
+                "Route: registration. Registration is required before any other web task. "
+                "Call extract_user_info after the user's latest message. "
+                "If the result is incomplete, ask only for the missing name or email. "
+                "If complete, restate the name and email and ask the user to review the dialog on screen or say confirm/yes."
+            )
+
+        if intent == "quote":
+            if action == "confirm":
+                return (
+                    f"{common}\n"
+                    "Route: quote.confirm. Acknowledge that the user confirmed the quote details. "
+                    "Do not call send_quote_email for the first send; the client confirmation flow handles creating and sending the quote."
+                )
+            if action == "cancel":
+                return (
+                    f"{common}\n"
+                    "Route: quote.cancel. Acknowledge that the current quote was cancelled. Do not call tools."
+                )
+            if action == "resend":
+                return (
+                    f"{common}\n"
+                    "Route: quote.resend. If the current quote state is complete or already sent, call send_quote_email. "
+                    "If quote details are incomplete, call extract_quote_info and ask only for missing fields."
+                )
+            if action == "update_info":
+                return (
+                    f"{common}\n"
+                    "Route: quote.update_info. The user is changing an existing quote detail. "
+                    "Call update_quote_info with only the fields the user changed. "
+                    "Then use the returned state to confirm changed values or ask only for remaining missing fields."
+                )
+            if action == "status":
+                return (
+                    f"{common}\n"
+                    "Route: quote.status. Call extract_quote_info to recover current quote state from conversation history, then summarize collected and missing details."
+                )
+            return (
+                f"{common}\n"
+                "Route: quote.start_or_provide_info. Call extract_quote_info immediately. "
+                "If incomplete, ask only for missing_fields one at a time. "
+                "If complete, restate customer name, email, each product and quantity, expected start date, and notes, then ask the user to review the on-screen dialog and confirm."
+            )
+
+        if intent == "knowledge_question":
+            return (
+                f"{common}\n"
+                "Route: knowledge_question. Use the search tool first. "
+                "If relevant information is found, answer from the knowledge base and call report_grounding for the actual sources used. "
+                "If no relevant knowledge-base information is found, first clearly say the knowledge base does not contain relevant information, "
+                "then answer from your own general knowledge. Make it clear which part is not sourced from the knowledge base."
+            )
+
+        if intent == "conversation_control":
+            if action == "repeat":
+                return f"{common}\nRoute: conversation_control.repeat. Briefly repeat your last useful answer. Do not call tools."
+            if action == "slower":
+                return f"{common}\nRoute: conversation_control.slower. Acknowledge and continue more slowly and simply. Do not call tools."
+            if action == "restart":
+                return (
+                    f"{common}\n"
+                    "Route: conversation_control.restart. Acknowledge the restart request and ask for the user's name and email again. Do not call tools yet."
+                )
+            if action == "stop":
+                return f"{common}\nRoute: conversation_control.stop. Acknowledge that you will stop. Do not call tools."
+            return f"{common}\nRoute: conversation_control. Help the user recover the conversation briefly. Do not call tools."
+
+        return (
+            f"{common}\n"
+            "Route: unsupported_or_other. Ask one short clarifying question. Do not call tools unless the user clearly asks a supported business or knowledge-base question."
+        )
 
     async def _maybe_trigger_quote_tool(self, session_id: str, transcript: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse):
         """Trigger quote extraction tool based on keywords, only once per session."""

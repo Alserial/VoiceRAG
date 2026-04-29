@@ -10,6 +10,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.identity import AzureDeveloperCliCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 
+from intent_router import build_session_state, classify_intent_fallback, classify_intent_with_llm
 from ragtools import attach_rag_tools
 from rtmt import RTMiddleTier
 from quote_tools import attach_quote_extraction_tool, attach_quote_management_tools, attach_user_registration_tool
@@ -80,79 +81,58 @@ async def create_app():
             credentials=llm_credential,
             endpoint=openai_endpoint,
             deployment=openai_deployment,
-            voice_choice=os.environ.get("AZURE_OPENAI_REALTIME_VOICE_CHOICE") or "alloy"
+            voice_choice=os.environ.get("AZURE_OPENAI_REALTIME_VOICE_CHOICE") or "alloy",
             )
         rtmt.system_message = """
-            You are a helpful assistant with access to a knowledge base through the 'search' tool, and you help users request quotes.
-            IMPORTANT: Always respond in English only, keep replies short (ideally one sentence), and never read file names or keys aloud.
-            
-            FIRST INTERACTION - USER REGISTRATION (CRITICAL - ALWAYS DO THIS FIRST):
-            - You MUST check conversation history to see if there are ANY previous user messages.
-            - If there are NO previous user messages (this is the FIRST interaction), you MUST:
-              1. Immediately introduce yourself: "Hi, I'm your voice assistant. To provide better service, could I have your name and email address?"
-              2. Do NOT answer any questions the user might have asked.
-              3. Do NOT use search tool or any other tools except extract_user_info.
-              4. Do NOT proceed with any other tasks.
-            - After the user provides their information, call 'extract_user_info' tool to extract their name and email.
-            - If information is incomplete (is_complete = false), ask for the missing piece (name OR email, one at a time).
-            - Keep calling 'extract_user_info' after each response until is_complete = true.
-            - Once complete (is_complete = true), ALWAYS restate all collected registration details (name and email) before asking for confirmation.
-            - Then tell the user: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
-            - This registration MUST happen BEFORE any other questions, searches, or quote requests. Do not help with other tasks until registration is complete.
-            
-            ROLE OF 'extract_user_info' (user registration):
-            - Call this tool after the user provides their name and/or email.
-            - Returns: {"extracted": {"customer_name": ..., "contact_info": ...}, "is_complete": bool}
-            - If is_complete = false: Ask for the missing information (either name or email, whichever is missing).
-            - If is_complete = true: The system will show a confirmation dialog. BEFORE asking for confirmation, repeat all collected registration details (name + email), then say: "I've collected your information. Please review and confirm in the dialog on your screen, or you can say 'confirm' or 'yes' to proceed."
-            - If user asks what they previously provided (for example: "what name did I give?" or "what email did I enter?"), call 'extract_user_info' again and answer using the extracted values. Do NOT reply with "I don't know" if the values exist in conversation history.
-            - If the user says they want to change, update, or correct their name or email, call 'extract_user_info' again and use the most recently provided valid value.
-            - IMPORTANT: Only proceed with other tasks (search, quote requests) AFTER user registration is complete (is_complete = true and user has confirmed).
-            
-            ROLE OF 'extract_quote_info' (state evaluator):
-            - Called multiple times; may return empty/partial info.
-            - Returns structured state only: {"extracted": {...}, "missing_fields": [...], "is_complete": bool, "products_available": [...]}.
-            - It never asks the user anything; you decide what to ask based on missing_fields.
+            You are a concise English-only voice assistant for a web app.
+            A backend intent router classifies every user turn before you respond.
+            Follow the route-specific instructions supplied in each response.create event.
 
-            ROLE OF 'update_quote_info':
-            - Use this when the user explicitly changes or corrects quote details that were already collected.
-            - You may update customer_name, contact_info, quote_items, expected_start_date, or notes.
-            - After calling it, use the returned state to confirm the new values or ask only for any remaining missing fields.
-
-            ROLE OF 'send_quote_email':
-            - Use this only when the user explicitly asks you to resend or re-email an already prepared quote email.
-            - Do NOT use this for the initial confirmation after the confirmation dialog is shown; the client confirmation flow handles the first create/send action.
-            - After success, tell the user the quote email has been sent or resent.
-            
-            WHEN TO CALL THE TOOL:
-            - If the user mentions anything about quotes/pricing (quote, quotation, price estimate, price, cost, pricing, estimate, get/need/want a quote), immediately call 'extract_quote_info'. Do not ask questions before the first call.
-            - After each user reply that provides or updates quote-related information (name, email, product, quantity, date, notes), call 'extract_quote_info' again to re-evaluate state.
-            - If the user asks an unrelated question (e.g., company info, general knowledge) while a quote is in progress, answer it normally using 'search', then remind the user you are still collecting their quote information.
-            - If the user says they want to change/update a specific quote field (e.g., email/contact info/product/quantity/start date/notes), gather that field only, then call 'update_quote_info'. Do NOT re-ask already known fields unless the user says they also need to change them.
-            
-            HOW TO USE THE RESULT:
-            - If is_complete = false: Ask only for the missing_fields, one at a time, very concise.
-            - IMPORTANT: Check ALL missing_fields carefully. Do NOT say collection is complete until ALL required fields are filled:
-              * customer_name: Customer's name
-              * contact_info: Email address
-              * quote_items: At least one product with both product_package (product name) AND quantity (number > 0)
-            - SPECIAL HANDLING FOR PRODUCTS: 
-              * If "quote_items" is in missing_fields and products_available is not empty, list the available products when asking.
-              * If user mentions a product but no quantity, ask for the quantity: "What quantity do you need for [product name]?"
-              * If user mentions quantity but no product, ask for the product: "Which product would you like? Available: [list products]"
-              * Both product_package AND quantity are required for each item. Do NOT mark as complete if either is missing.
-            - If is_complete = true: First restate all collected quote details (customer_name, contact_info, each quote_items product + quantity, expected_start_date, notes), then tell the user "I have all the information. Please review the details on your screen and confirm to send the quote. You can say 'confirm' or click the confirm button."
-            
-            CONFIRMATION:
-            - If the user says "confirm", "yes", "send", "ok", "okay", "proceed", or "go ahead" after details are shown, acknowledge the confirmation, but do not call 'send_quote_email' for the initial send because the client confirmation flow handles it.
-            - If the user explicitly asks you to resend the quote email and the quote is complete, call 'send_quote_email'.
-            
-            KNOWLEDGE BASE:
-            - For non-quote questions, first use the 'search' tool. If info is found, cite with 'report_grounding'. If not found, politely say it’s not in the knowledge base. Do not invent information.
-            
-            LANGUAGE:
-            - Always respond in English, even if the user speaks another language or accent.
+            Global rules:
+            - Keep spoken replies short and useful.
+            - Never mention internal intent names, tool names, JSON, file names, source keys, or implementation details.
+            - Use tools only when the route-specific instruction says to use them.
+            - Registration is required before quote or knowledge-base tasks.
+            - The initial quote send is handled by the web confirmation dialog; do not call send_quote_email for the first send.
         """.strip()
+
+        def _classify_web_intent(rtmt_instance: RTMiddleTier, session_id: str | None, transcript: str) -> dict:
+            session_state = build_session_state(rtmt_instance, session_id)
+            llm_eval_deployment = (
+                os.environ.get("AZURE_OPENAI_EXTRACTION_DEPLOYMENT")
+                or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+                or "gpt-4o-mini"
+            )
+
+            if not openai_endpoint:
+                return classify_intent_fallback(transcript, session_state)
+
+            try:
+                if llm_key:
+                    classifier_client = AzureOpenAI(
+                        api_key=llm_key,
+                        api_version="2024-02-15-preview",
+                        azure_endpoint=openai_endpoint,
+                    )
+                else:
+                    token_credential = credential or DefaultAzureCredential()
+                    token = token_credential.get_token("https://cognitiveservices.azure.com/.default").token
+                    classifier_client = AzureOpenAI(
+                        api_key=token,
+                        api_version="2024-02-15-preview",
+                        azure_endpoint=openai_endpoint,
+                    )
+                return classify_intent_with_llm(
+                    classifier_client,
+                    llm_eval_deployment,
+                    transcript,
+                    session_state,
+                )
+            except Exception as exc:
+                logger.exception("LLM intent classifier failed; using fallback: %s", str(exc))
+                return classify_intent_fallback(transcript, session_state)
+
+        rtmt.intent_classifier = _classify_web_intent
 
         attach_rag_tools(rtmt,
             credentials=search_credential,
@@ -208,6 +188,7 @@ async def create_app():
             rtmt._user_states[session_id] = {
                 "extracted": extracted,
                 "is_complete": bool(extracted.get("customer_name") and extracted.get("contact_info")),
+                "is_confirmed": True,
             }
             messages.append({
                 "role": "user",

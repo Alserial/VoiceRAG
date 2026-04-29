@@ -18,9 +18,8 @@ type Parameters = {
     aoaiApiKeyOverride?: string;
     aoaiModelOverride?: string;
 
-    enableInputAudioTranscription?: boolean;
     onWebSocketOpen?: () => void;
-    onWebSocketClose?: () => void;
+    onWebSocketClose?: (event: CloseEvent) => void;
     onWebSocketError?: (event: Event) => void;
     onWebSocketMessage?: (event: MessageEvent<any>) => void;
 
@@ -38,7 +37,6 @@ export default function useRealTime({
     aoaiEndpointOverride,
     aoaiApiKeyOverride,
     aoaiModelOverride,
-    enableInputAudioTranscription,
     onWebSocketOpen,
     onWebSocketClose,
     onWebSocketError,
@@ -52,12 +50,12 @@ export default function useRealTime({
     onReceivedError
 }: Parameters) {
     const wsEndpoint = useDirectAoaiApi
-        ? `${aoaiEndpointOverride}/openai/realtime?api-key=${aoaiApiKeyOverride}&deployment=${aoaiModelOverride}&api-version=2024-10-01-preview`
+        ? `${aoaiEndpointOverride}/openai/v1/realtime?api-key=${aoaiApiKeyOverride}&model=${aoaiModelOverride}`
         : `/realtime`;
 
-    const { sendJsonMessage } = useWebSocket(wsEndpoint, {
+    const { sendJsonMessage, readyState } = useWebSocket(wsEndpoint, {
         onOpen: () => onWebSocketOpen?.(),
-        onClose: () => onWebSocketClose?.(),
+        onClose: event => onWebSocketClose?.(event),
         onError: event => onWebSocketError?.(event),
         onMessage: event => onMessageReceived(event),
         shouldReconnect: () => true
@@ -66,32 +64,24 @@ export default function useRealTime({
     const startSession = () => {
         const command: SessionUpdateCommand = {
             type: "session.update",
-            session: {
-                turn_detection: {
-                    type: "server_vad",
-                    threshold: 0.5,              // Voice detection threshold (0.0-1.0)
-                    prefix_padding_ms: 300,      // Audio before speech starts (ms)
-                    silence_duration_ms: 1000    // Silence duration to end turn (increased from default 500ms)
-                }
-            }
+            session: {}
         };
-
-        if (enableInputAudioTranscription) {
-            command.session.input_audio_transcription = {
-                model: "whisper-1"
-            };
-        }
 
         sendJsonMessage(command);
     };
 
     const addUserAudio = (base64Audio: string) => {
+        if (readyState !== WebSocket.OPEN) {
+            return false;
+        }
+
         const command: InputAudioBufferAppendCommand = {
             type: "input_audio_buffer.append",
             audio: base64Audio
         };
 
-        sendJsonMessage(command);
+        sendJsonMessage(command, false);
+        return true;
     };
 
     const inputAudioBufferClear = () => {
@@ -129,10 +119,10 @@ export default function useRealTime({
             case "response.done":
                 onReceivedResponseDone?.(message as ResponseDone);
                 break;
-            case "response.audio.delta":
+            case "response.output_audio.delta":
                 onReceivedResponseAudioDelta?.(message as ResponseAudioDelta);
                 break;
-            case "response.audio_transcript.delta":
+            case "response.output_audio_transcript.delta":
                 onReceivedResponseAudioTranscriptDelta?.(message as ResponseAudioTranscriptDelta);
                 break;
             case "input_audio_buffer.speech_started":

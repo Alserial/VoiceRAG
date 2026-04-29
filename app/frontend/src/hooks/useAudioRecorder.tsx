@@ -5,9 +5,10 @@ const BUFFER_SIZE = 9600; // Increased from 4800 to reduce audio crackling (0.2 
 
 type Parameters = {
     onAudioRecorded: (base64: string) => void;
+    onError?: (error: unknown) => void;
 };
 
-export default function useAudioRecorder({ onAudioRecorded }: Parameters) {
+export default function useAudioRecorder({ onAudioRecorded, onError }: Parameters) {
     const audioRecorder = useRef<Recorder>();
 
     let buffer = new Uint8Array();
@@ -38,8 +39,13 @@ export default function useAudioRecorder({ onAudioRecorded }: Parameters) {
         if (!audioRecorder.current) {
             audioRecorder.current = new Recorder(handleAudioData);
         }
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioRecorder.current.start(stream);
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            await audioRecorder.current.start(stream);
+        } catch (error) {
+            onError?.(error);
+            throw error;
+        }
     };
 
     const stop = async () => {

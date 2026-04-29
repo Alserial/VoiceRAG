@@ -27,6 +27,9 @@ function App() {
     const [userRegistrationData, setUserRegistrationData] = useState<UserRegistrationData | null>(null);
     const [debugMessages, setDebugMessages] = useState<DebugMessage[]>([]);
     const messageIdCounter = useRef(0);
+    const audioChunkCounter = useRef(0);
+    const audioStoppedBySocketRef = useRef(false);
+    const isRecordingRef = useRef(false);
     const quoteFlowControlsRef = useRef({
         stopAudioPlayer: () => {},
         inputAudioBufferClear: () => {},
@@ -84,7 +87,7 @@ function App() {
             addDebugMessage("error", "报价确认异常", { error: String(error) });
             throw error;
         }
-    }, [quoteData, addDebugMessage]);
+    }, [quoteData, realtimeSessionId, addDebugMessage]);
 
     const handleQuoteCancel = useCallback(() => {
         setQuoteData(null);
@@ -124,93 +127,41 @@ function App() {
             setUserRegistrationData(payload);
             throw error;
         }
-    }, [userRegistrationData, addDebugMessage]);
+    }, [userRegistrationData, realtimeSessionId, addDebugMessage]);
 
     const handleUserRegistrationCancel = useCallback(() => {
         setUserRegistrationData(null);
     }, []);
 
-    // Listen for voice state via backend LLM classifier (except very explicit confirmations)
-    const checkVoiceConfirmation = useCallback(async (transcript: string) => {
-        const lowerTranscript = transcript.toLowerCase().trim();
-        const explicitConfirmSet = new Set(["yes", "confirm"]);
-        const pendingAction = quoteData ? "quote" : userRegistrationData ? "user_registration" : "none";
-
-        if (pendingAction === "none") {
-            return;
-        }
-
-        const handleConfirmForPendingAction = () => {
-            if (quoteData) {
-                addDebugMessage("info", "检测到语音确认 - 报价", { transcript, source: "explicit_or_llm" });
-                handleQuoteConfirm().catch(err => {
-                    console.error("Error in voice quote confirmation:", err);
-                });
-                return;
-            }
-            if (userRegistrationData) {
-                addDebugMessage("info", "检测到语音确认 - 用户注册", { transcript, source: "explicit_or_llm" });
-                handleUserRegistrationConfirm().catch(err => {
-                    console.error("Error in voice user registration confirmation:", err);
-                });
-            }
-        };
-
-        const handleCancelForPendingAction = () => {
-            if (quoteData) {
-                addDebugMessage("info", "检测到语音取消 - 报价", { transcript, source: "llm" });
-                handleQuoteCancel();
-                return;
-            }
-            if (userRegistrationData) {
-                addDebugMessage("info", "检测到语音取消 - 用户注册", { transcript, source: "llm" });
-                handleUserRegistrationCancel();
-            }
-        };
-
-        // Keep explicit confirms as fast path
-        if (explicitConfirmSet.has(lowerTranscript)) {
-            handleConfirmForPendingAction();
-            return;
-        }
-
-        try {
-            const response = await fetch("/api/utterance-state", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({ transcript, pending_action: pendingAction }),
-            });
-
-            if (!response.ok) {
-                addDebugMessage("error", "语音状态识别失败", { transcript, status: response.status });
-                return;
-            }
-
-            const result = await response.json();
-            addDebugMessage("info", "语音行为状态识别结果", { transcript, result });
-
-            if (result.state === "confirm") {
-                handleConfirmForPendingAction();
-            } else if (result.state === "cancel") {
-                handleCancelForPendingAction();
-            }
-        } catch (err) {
-            console.error("Error in utterance state classification:", err);
-            addDebugMessage("error", "语音状态识别异常", { transcript, error: String(err) });
-        }
-    }, [quoteData, userRegistrationData, handleQuoteConfirm, handleQuoteCancel, handleUserRegistrationConfirm, handleUserRegistrationCancel, addDebugMessage]);
-
     const { startSession, addUserAudio, inputAudioBufferClear, speakAssistantMessage } = useRealTime({
-        enableInputAudioTranscription: true,  // Enable input audio transcription to capture user input
         onWebSocketOpen: () => {
             console.log("WebSocket connection opened");
             addDebugMessage("websocket", "WebSocket连接已打开", { status: "connected" });
         },
-        onWebSocketClose: () => {
+        onWebSocketClose: event => {
             console.log("WebSocket connection closed");
-            addDebugMessage("websocket", "WebSocket连接已关闭", { status: "disconnected" });
+            addDebugMessage("websocket", "WebSocket连接已关闭", {
+                status: "disconnected",
+                code: event.code,
+                reason: event.reason || "",
+                wasClean: event.wasClean,
+            });
+            if (isRecording && !audioStoppedBySocketRef.current) {
+                audioStoppedBySocketRef.current = true;
+                stopAudioRecording()
+                    .catch(error => {
+                        addDebugMessage("error", "WebSocket关闭后停止录音失败", { error: String(error) });
+                    })
+                    .finally(() => {
+                        stopAudioPlayer();
+                        isRecordingRef.current = false;
+                        setIsRecording(false);
+                        addDebugMessage("info", "WebSocket已断开，自动停止录音", {
+                            code: event.code,
+                            reason: event.reason || "",
+                        });
+                    });
+            }
         },
         onWebSocketError: event => {
             console.error("WebSocket error:", event);
@@ -222,44 +173,54 @@ function App() {
                 if (message.type === "session.created" && message.session?.id) {
                     setRealtimeSessionId(message.session.id);
                 }
-                // Only log important message types to avoid too much noise
-                const importantTypes = [
-                    "response.done",
-                    "response.audio_transcript.delta",
-                    "conversation.item.created",
-                    "conversation.item.input_audio_transcription.completed",
-                    "extension.middle_tier_tool_response",
-                    "error"
-                ];
-                if (importantTypes.includes(message.type) || message.type?.includes("tool") || message.type?.includes("function")) {
+                if (message.type === "response.done") {
+                    const transcript = message.response?.output?.[0]?.content?.[0]?.transcript;
+                    if (transcript) addDebugMessage("info", "AI回复", { transcript });
+                } else if (message.type === "extension.middle_tier_error") {
                     addDebugMessage("websocket", `WebSocket消息: ${message.type}`, message);
+                } else if (message.type === "error") {
+                    addDebugMessage("error", "收到错误消息", message);
+                }
+                if (message.type === "extension.intent_classification") {
+                    const classification = message.intent;
+                    const transcript = message.transcript || "";
+                    addDebugMessage("info", "意图识别", {
+                        用户说: transcript,
+                        intent: classification?.intent,
+                        action: classification?.action,
+                        confidence: classification?.confidence,
+                    });
+                    if (classification?.intent === "quote" && quoteData) {
+                        if (classification.action === "confirm") {
+                            handleQuoteConfirm().catch(err => console.error("Error in voice quote confirmation:", err));
+                        } else if (classification.action === "cancel") {
+                            handleQuoteCancel();
+                        }
+                    } else if (classification?.intent === "registration" && userRegistrationData) {
+                        if (classification.action === "confirm") {
+                            handleUserRegistrationConfirm().catch(err => console.error("Error in voice user registration confirmation:", err));
+                        } else if (classification.action === "cancel") {
+                            handleUserRegistrationCancel();
+                        }
+                    }
                 }
             } catch (e) {
                 // Ignore parse errors for non-JSON messages
             }
         },
         onReceivedError: message => {
-            console.error("error", message);
-            addDebugMessage("error", "收到错误消息", message);
+            console.error("realtime error", message);
         },
         onReceivedResponseAudioDelta: message => {
-            isRecording && playAudio(message.delta);
+            if (isRecordingRef.current) {
+                playAudio(message.delta);
+            }
         },
         onReceivedInputAudioBufferSpeechStarted: () => {
             stopAudioPlayer();
-            addDebugMessage("info", "检测到用户开始说话", {});
         },
         onReceivedInputAudioTranscriptionCompleted: message => {
-            addDebugMessage("transcription", "用户输入转录完成", {
-                transcript: message.transcript,
-                item_id: message.item_id,
-            });
-            // Check for voice confirmation when quote or user registration is pending
-            if (message.transcript && (quoteData || userRegistrationData)) {
-                checkVoiceConfirmation(message.transcript).catch(err => {
-                    console.error("Error while checking voice confirmation:", err);
-                });
-            }
+            addDebugMessage("transcription", "用户说", { transcript: message.transcript });
         },
         onReceivedExtensionMiddleTierToolResponse: message => {
             console.log("Received tool response:", message);
@@ -372,7 +333,16 @@ function App() {
     });
 
     const { reset: resetAudioPlayer, play: playAudio, stop: stopAudioPlayer } = useAudioPlayer();
-    const { start: startAudioRecording, stop: stopAudioRecording } = useAudioRecorder({ onAudioRecorded: addUserAudio });
+    const { start: startAudioRecording, stop: stopAudioRecording } = useAudioRecorder({
+        onAudioRecorded: base64Audio => {
+            const sent = addUserAudio(base64Audio);
+            if (!sent) return;
+            audioChunkCounter.current += 1;
+        },
+        onError: error => {
+            addDebugMessage("error", "录音启动失败", { error: String(error) });
+        },
+    });
 
     quoteFlowControlsRef.current.stopAudioPlayer = stopAudioPlayer;
     quoteFlowControlsRef.current.inputAudioBufferClear = inputAudioBufferClear;
@@ -380,15 +350,25 @@ function App() {
 
     const onToggleListening = async () => {
         if (!isRecording) {
-            startSession();
-            await startAudioRecording();
-            resetAudioPlayer();
-            setIsRecording(true);
-            addDebugMessage("info", "开始录音会话", {});
+            try {
+                audioChunkCounter.current = 0;
+                audioStoppedBySocketRef.current = false;
+                startSession();
+                await startAudioRecording();
+                resetAudioPlayer();
+                isRecordingRef.current = true;
+                setIsRecording(true);
+                addDebugMessage("info", "开始录音会话", {});
+            } catch (error) {
+                isRecordingRef.current = false;
+                setIsRecording(false);
+                addDebugMessage("error", "开始录音会话失败", { error: String(error) });
+            }
         } else {
             await stopAudioRecording();
             stopAudioPlayer();
             inputAudioBufferClear();
+            isRecordingRef.current = false;
             setIsRecording(false);
             addDebugMessage("info", "停止录音会话", {});
         }

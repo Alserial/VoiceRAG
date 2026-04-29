@@ -72,7 +72,7 @@ export type ResponseDone = {
 };
 
 export type ExtensionMiddleTierToolResponse = {
-    type: "extension.middle_tier_tool.response";
+    type: "extension.middle_tier_tool_response";
     previous_item_id: string;
     tool_name: string;
     tool_result: string; // JSON string that needs to be parsed into ToolResult
